@@ -64,6 +64,7 @@ from sando_py.decomp import sfc
 from sando_py.decomp.sfc import _voxel_map_occupied_points as _voxel_map_occupied_points_cached
 from sando_py.hgp import HGPPlanner
 from sando_py.core.hardware import InitPoseTransform, init_pose_from_transform_stamped
+from sando_py.core.step_timing import StepTimingRow, StepTimingWriter
 from sando_py.sim_io.msg_convert import (
     cloud_msg_to_points,
     dyn_traj_msg_to_dyn_traj,
@@ -1121,6 +1122,15 @@ class SandoNode(Node):
         self._got_enough_replanning = True
 
     def _run_pipeline_inner(self) -> bool:
+        # Stage timers — Python-end mirror of C++ ``MyTimer`` blocks in
+        # ``SANDO::replan`` (sando.cpp:622-732). The breakdown is dumped
+        # to a CSV at every "attempted replan" so a Python run can be
+        # diffed against the C++ run with the upstream plotter.
+        row = StepTimingRow()
+        total_t0 = time.perf_counter()
+
+        # --- Housekeeping (warm-up STORE + start-state pick) ---
+        t_hk = time.perf_counter()
         # Warm-up STORE happens BEFORE _find_A so the first-tick
         # zero-seed sample lands even when committed_traj_ is None
         # and _find_A short-circuits to current_state. Matches the
@@ -1134,6 +1144,9 @@ class SandoNode(Node):
         if A is None:
             # findA failed — mirrors sando.cpp:678 (++failure_count then return).
             self.replanning_failure_count_ += 1
+            row.housekeeping_ms = (time.perf_counter() - t_hk) * 1000.0
+            row.total_replan_ms = (time.perf_counter() - total_t0) * 1000.0
+            self._write_step_timing(row)
             return False
 
         # Project the terminal goal onto a sphere of radius ``horizon``
@@ -1159,16 +1172,16 @@ class SandoNode(Node):
             term_goal_planner[2] = 1.0
 
         obstacles = list(self.trajs_.values())
+        row.housekeeping_ms = (time.perf_counter() - t_hk) * 1000.0
 
+        # --- Global planning (HGP + safe-sub-goal trim) ---
+        t_gp = time.perf_counter()
         path = self.hgp_.plan(
             A, term_goal_planner, obstacles, t_now,
             cloud_points=self.latest_cloud_,
         )
 
         # Cap the global path at ``num_P + 1`` waypoints (sando.cpp:788-791).
-        # Without this the LOS-simplified path can stay arbitrarily long;
-        # the solver wants exactly num_P segments downstream and the
-        # decomp produces tighter corridors when each segment is short.
         if path is not None and self.params.num_P > 0:
             max_pts = int(self.params.num_P) + 1
             if len(path) > max_pts:
@@ -1176,14 +1189,15 @@ class SandoNode(Node):
         if path is None or len(path) < 2:
             # HGP failed / degenerate path — mirrors sando.cpp:747+828.
             self.replanning_failure_count_ += 1
+            row.global_planning_ms = (time.perf_counter() - t_gp) * 1000.0
+            row.total_replan_ms = (time.perf_counter() - total_t0) * 1000.0
+            self._write_step_timing(row)
             if self.params.debug_verbose:
                 self.get_logger().warning("HGP failed; holding previous trajectory")
             return False
 
         # If the global path is exactly 2 points, subdivide the segment
         # by inserting midpoints until size >= 3. Mirrors sando.cpp:820-824.
-        # This keeps each segment short so the ellipsoid decomp can
-        # bracket it tightly.
         if len(path) == 2:
             p0 = np.asarray(path[0], dtype=float)
             p1 = np.asarray(path[1], dtype=float)
@@ -1193,41 +1207,86 @@ class SandoNode(Node):
         vm = self.hgp_.last_voxel_map
         if vm is None:
             self.replanning_failure_count_ += 1
+            row.global_planning_ms = (time.perf_counter() - t_gp) * 1000.0
+            row.total_replan_ms = (time.perf_counter() - total_t0) * 1000.0
+            self._write_step_timing(row)
             return False  # defensive — HGP shouldn't return a path without a map
 
         # findSafeSubGoal: if the trimmed global path can't reach the
         # terminal goal because the tail crosses inflated unknown space,
         # truncate to a reachable sub-goal. C++ sando.cpp:267-413 +
-        # call site at sando.cpp:795. Keep the pre-trim path around so
-        # ``original_hgp_path_marker`` can show what HGP originally
-        # returned.
+        # call site at sando.cpp:795.
         original_path = list(path)
         path = self._find_safe_sub_goal(path, vm)
+        row.global_planning_ms = (time.perf_counter() - t_gp) * 1000.0
 
+        # --- Local trajectory optimization (cvx decomp + solver) ---
+        t_cvx = time.perf_counter()
         polys = sfc(path, vm, obstacles, self.params, t_now=t_now)
+        row.cvx_decomp_ms = (time.perf_counter() - t_cvx) * 1000.0
+
+        t_lto = time.perf_counter()
         traj_new, info = self.solver_.solve(A, path, polys)
         if not info.success:
             # v2 QP failed (infeasible / no license / timeout). Try v1.
             traj_new, info = self.solver_fallback_.solve(A, path, polys)
+        row.local_traj_opt_ms = (time.perf_counter() - t_lto) * 1000.0
+
+        # Copy the winning solver's per-stage breakdown into the CSV row.
+        tb = getattr(info, "timing", None)
+        if tb is not None:
+            row.gurobi_findDT_ms = tb.findDT_ms
+            row.gurobi_setX_ms = tb.setX_ms
+            row.gurobi_polytopes_ms = tb.polytopes_ms
+            row.gurobi_dynamic_ms = tb.dynamic_ms
+            row.gurobi_objective_setup_ms = tb.objective_ms
+            row.gurobi_mapsize_ms = tb.mapsize_ms
+            row.gurobi_callOptimizer_ms = tb.callOptimizer_ms
+            row.gurobi_postsolve_ms = tb.postsolve_ms
 
         if info.success:
+            row.successful_factor = float(getattr(info, "successful_factor", 1.0))
+            row.gurobi_objective_value = float(info.cost)
+        else:
+            # Match C++ "nan on failure" convention.
+            row.gurobi_objective_value = float("nan")
+
+        if info.success:
+            # --- Append (Python: direct commit; ~0 ms) ---
+            t_app = time.perf_counter()
             self.committed_traj_ = traj_new
-            self._publish_plan_viz(path, polys, traj_new, original_path=original_path, vm=vm)
+            row.append_ms = (time.perf_counter() - t_app) * 1000.0
+
+            self._publish_plan_viz(path, polys, traj_new,
+                                   original_path=original_path, vm=vm)
             self._publish_own_traj(traj_new)
-            # Successful replan — reset the failure counter (mirrors the
-            # implicit C++ contract: the counter only matters across
-            # *consecutive* failures, so any success drops it back).
+
+            # --- Final housekeeping (reset failure counter) ---
+            t_fh = time.perf_counter()
             self.replanning_failure_count_ = 0
+            row.final_housekeeping_ms = (time.perf_counter() - t_fh) * 1000.0
+            row.success = True
+            row.total_replan_ms = (time.perf_counter() - total_t0) * 1000.0
+            self._write_step_timing(row)
             return True
 
         if self.params.debug_verbose:
             self.get_logger().warning(
                 f"Solver failed (cost={info.cost:.2f}); holding previous trajectory"
             )
-        # Solver failure — C++ tolerates this without bumping the counter
-        # (sando.cpp doesn't ++ on the gurobi failure branch), so neither
-        # does this port.
+        # Solver failure — C++ tolerates this without bumping the counter.
+        row.total_replan_ms = (time.perf_counter() - total_t0) * 1000.0
+        self._write_step_timing(row)
         return False
+
+    def _write_step_timing(self, row: StepTimingRow) -> None:
+        """Lazy-init the step-timing writer and append ``row``. Path
+        respects the ``SANDO_PY_STEP_TIMING_CSV`` env var; unset → default
+        ``/tmp/sando_py_step_timing.csv``; set-to-empty → disabled."""
+        writer = StepTimingWriter.get()
+        if writer is None:
+            return
+        writer.write(row)
 
     def _publish_goal_cb(self) -> None:
         """Evaluate the committed trajectory at ``t_now`` and publish the

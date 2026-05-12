@@ -58,7 +58,7 @@ from sando_py.core import Parameters, PieceWisePol, Polytope, RobotState
 from .elimination import LinearCoeff, SegmentExpressions
 from .minvo import accel_minvo_cps, jerk_value, pos_minvo_cps, vel_minvo_cps
 from .time_alloc import TimeAlloc
-from .types import SolverInfo
+from .types import SolveTimingBreakdown, SolverInfo
 
 
 # Default num_N when the YAML / Parameters object hasn't set one. Picked
@@ -242,6 +242,7 @@ class GurobiSolver:
             pwp, info = solve_fn(
                 gp, GRB, A, sub_pts, parent_of_seg, polys, Ts, n_seg, t0,
             )
+            info.successful_factor = float(factor)
             if info.success:
                 self.time_alloc.on_success(factor)
             else:
@@ -299,6 +300,7 @@ class GurobiSolver:
         )
         if successful:
             best_factor, best_pwp, best_info = successful[0]
+            best_info.successful_factor = float(best_factor)
             self.time_alloc.on_success(best_factor)
             return best_pwp, best_info
 
@@ -459,7 +461,13 @@ def _solve_elim_core(
     per axis (vs ``4 * n_seg`` in the naive scheme) by encoding boundary
     + continuity constraints symbolically. Mirrors the C++
     ``createVars`` / ``computeDependentCoefficientsN*`` pipeline."""
+    timing = SolveTimingBreakdown()
     try:
+        # --- findDT: time allocation already done outside (Ts is fixed),
+        # but match the C++ stage name. The Python time_alloc call is
+        # cheap (microseconds) so we report it as 0 unless the caller
+        # routes through here.
+        t_findDT = time.perf_counter()
         # Boundary state for each axis: [P0, V0, A0, Pf, Vf, Af]
         A_pos = np.asarray(A.pos, dtype=float).reshape(3)
         A_vel = np.asarray(A.vel, dtype=float).reshape(3)
@@ -470,11 +478,12 @@ def _solve_elim_core(
                       Pf[ax], 0.0, 0.0], dtype=float)
             for ax in range(3)
         ]
+        timing.findDT_ms = (time.perf_counter() - t_findDT) * 1000.0
 
-        # Build symbolic coefficients per axis. All 3 axes share the
-        # same M_free / M_boundary matrices (they depend only on dt and
-        # N, not on boundary values), so the heavy sympy derivation
-        # runs once per unique (N, dt).
+        # --- setX: symbolic coefficient construction + variable creation
+        # + continuity encoding (continuity is baked in by elimination,
+        # so the time mostly goes to SegmentExpressions.build).
+        t_setX = time.perf_counter()
         dt = np.asarray(Ts, dtype=float)
         seg_exprs_per_axis = [
             SegmentExpressions.build(n_seg, dt, boundary_per_axis[ax])
@@ -508,6 +517,7 @@ def _solve_elim_core(
             ]
             for ax in range(3)
         ]
+        timing.setX_ms = (time.perf_counter() - t_setX) * 1000.0
 
         # Helper: LinearCoeff → Gurobi LinExpr in the per-axis free vars.
         def _le(lc: LinearCoeff, ax: int):
@@ -522,6 +532,7 @@ def _solve_elim_core(
         # Each cubic lies in conv({P0, P1, P2, P3}) — constraining every
         # CP inside the polytope is a *sufficient* condition for the
         # whole segment.
+        t_polytopes = time.perf_counter()
         cp_le_per_seg = []  # cp_le_per_seg[seg][ax][i] = LinExpr
         for seg in range(n_seg):
             T = Ts[seg]
@@ -612,8 +623,10 @@ def _solve_elim_core(
                                + a1 * cp_le[1][i]
                                + a2 * cp_le[2][i])
                         model.addConstr(lhs <= float(poly.b[row, 0]))
+        timing.polytopes_ms = (time.perf_counter() - t_polytopes) * 1000.0
 
         # ---- MINVO dynamic constraints (v, a, j) ----
+        t_dynamic = time.perf_counter()
         # Three norm types — match the C++ ``dynamic_constraint_type``:
         #   "Linf" → per-axis box  (default, smallest constraint count)
         #   "L1"   → 8-face octahedron over (vx, vy, vz)  (tighter)
@@ -702,11 +715,13 @@ def _solve_elim_core(
             _add_dyn_constraints(vel_cps, v_max)
             _add_dyn_constraints(accel_cps, a_max)
             _add_dyn_constraints(jerk_cps, j_max)
+        timing.dynamic_ms = (time.perf_counter() - t_dynamic) * 1000.0
 
         # ---- Objective: integrated jerk² ----
         # jerk(u) = 6 a (constant per segment), integral over [0, T] of
         # jerk² is 36 * a² * T. ``a`` is a LinearCoeff so a² is a
         # quadratic form in the free vars.
+        t_objective = time.perf_counter()
         obj = gp.QuadExpr()
         for seg in range(n_seg):
             T = Ts[seg]
@@ -731,14 +746,24 @@ def _solve_elim_core(
                 obj.addConstant(w * a_lc.const * a_lc.const)
 
         model.setObjective(obj, GRB.MINIMIZE)
+        timing.objective_ms = (time.perf_counter() - t_objective) * 1000.0
+
+        # mapsize_ms: Python doesn't emit explicit map-bbox constraints
+        # at this layer (handled by HGP + ellipsoid local_bbox), so 0.
+        timing.mapsize_ms = 0.0
+
+        t_call = time.perf_counter()
         model.optimize()
+        timing.callOptimizer_ms = (time.perf_counter() - t_call) * 1000.0
 
         if not _has_usable_solution(model, GRB):
             return PieceWisePol(), SolverInfo(
                 success=False, wall_time_s=time.perf_counter() - t0,
+                timing=timing,
             )
 
         # ---- Extract solution: free vars → coefficients → PieceWisePol ----
+        t_post = time.perf_counter()
         free_vals = [
             np.array([free_vars[ax][j].X for j in range(num_free)], dtype=float)
             for ax in range(3)
@@ -763,15 +788,18 @@ def _solve_elim_core(
             pwp.coeff_z.append(cz)
             t_cum += Ts[seg]
             pwp.times.append(t_cum)
+        timing.postsolve_ms = (time.perf_counter() - t_post) * 1000.0
 
         return pwp, SolverInfo(
             success=True,
             cost=float(model.ObjVal),
             wall_time_s=time.perf_counter() - t0,
+            timing=timing,
         )
     except gp.GurobiError:
         return PieceWisePol(), SolverInfo(
             success=False, wall_time_s=time.perf_counter() - t0,
+            timing=timing,
         )
 
 

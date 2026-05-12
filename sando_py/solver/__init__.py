@@ -37,12 +37,13 @@ v1 limitations (all fixed by v2)
 
 from .gurobi_solver import GurobiSolver, solve_qp
 from .min_jerk import MinJerkSolver, solve
-from .types import SolverInfo
+from .types import SolveTimingBreakdown, SolverInfo
 
 __all__ = [
     "GurobiSolver",
     "MinJerkSolver",
     "SolverInfo",
+    "SolveTimingBreakdown",
     "solve",
     "solve_qp",
 ]
