@@ -23,9 +23,9 @@ Public API
     .on_failure()        -> None             (call after exhausting window)
     .current_mean        -> float            (for logging / debug)
 
-When ``use_dynamic_factor`` is off, the adapter always yields a single
-factor (``dynamic_factor_initial_mean``, or 1.0 if unset) — the same
-behaviour you get by hard-coding the time allocation.
+When ``use_dynamic_factor`` is off, the adapter yields the same constant
+factor sweep as the C++ constructor: ``factor_initial`` to
+``factor_final`` inclusive in ``factor_constant_step_size`` increments.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ from typing import Iterable, List
 from sando_py.core import Parameters
 
 
-_FACTOR_FLOOR = 1.0   # never below the v_max cruise allocation
 _FALLBACK_INITIAL = 1.0
 
 
@@ -46,8 +45,8 @@ class TimeAlloc:
         self._initial_mean = float(params.dynamic_factor_initial_mean or _FALLBACK_INITIAL)
         self._k_radius = max(0.0, float(params.dynamic_factor_k_radius or 0.0))
         self._step = max(1e-6, float(params.factor_constant_step_size or 0.1))
-        self._lo = max(_FACTOR_FLOOR, float(params.factor_initial or _FALLBACK_INITIAL))
-        self._hi = max(self._lo + self._step, float(params.factor_final or self._lo))
+        self._lo = float(params.factor_initial or _FALLBACK_INITIAL)
+        self._hi = max(self._lo, float(params.factor_final or self._lo))
         self._use_dynamic = bool(params.use_dynamic_factor)
 
         self._current_mean = self._initial_mean
@@ -65,11 +64,15 @@ class TimeAlloc:
     def factors_to_try(self) -> Iterable[float]:
         """Yield the next batch of factors to try, lowest first.
 
-        When ``use_dynamic_factor`` is off, yields a single factor
-        (``initial_mean``) so the caller doesn't need a branch.
+        When ``use_dynamic_factor`` is off, yields the C++ constant
+        factor sweep from ``factor_initial`` to ``factor_final``.
         """
         if not self._use_dynamic:
-            yield max(_FACTOR_FLOOR, self._initial_mean)
+            n = int((self._hi - self._lo) / self._step) + 1
+            for i in range(max(1, n)):
+                f = self._lo + i * self._step
+                if f <= self._hi + 1e-9:
+                    yield f
             return
         for f in self._window:
             yield f

@@ -11,16 +11,16 @@ is a clean Python rewrite that produces the same kind of trajectory:
   fitter dropped acceleration),
 * anchored at the end to the terminal goal with zero vel and zero accel,
 * C0 / C1 / C2 continuity at every internal junction,
-* per-axis ``v_max`` / ``a_max`` / ``j_max`` bounds sampled along each
-  segment (``j_max`` is exact — jerk of a cubic is constant per segment
-  so one constraint per axis suffices),
+* per-axis ``v_max`` / ``a_max`` / ``j_max`` bounds on the same Bezier
+  derivative control points used by the C++ solver,
 * corridor membership (``A x <= b``) via the **Bezier convex-hull
   property** — 4 control points per segment per polytope row, no
   clipping possible between samples. Matches the C++
   ``SolverGurobi::setPolyConsts`` enforcement (the C++ also computes
   MINVO CPs but uses them only for *post-solve verification*, not for
   the Gurobi inequality constraints),
-* minimum integrated jerk² objective: ``sum_seg sum_axis 36·a²·T``.
+* C++ jerk-smoothness objective:
+  ``jerk_smooth_weight * sum_seg ||6a_seg||²``.
 
 The "field-for-field" promise in ``solver/README.md`` is aspirational —
 this implementation produces the same kind of output as the C++ but with
@@ -28,14 +28,12 @@ a different (simpler) variable layout. The C++ solver also features
 variable elimination, MINVO basis control points for tighter corridor
 membership, and a dynamic time-allocation factor; those are follow-ups.
 
-Sub-segmentation
-----------------
-The C++ uses ``num_N`` polynomial segments distributed over ``num_P``
-corridors (default 5 segments, 3 corridors). With only ``len(path) - 1``
-polynomial segments, the equality constraints (start + end + C0/C1/C2)
-leave no DOF for jerk minimization, so we subdivide each path edge into
-``K`` equal sub-segments where ``K`` is chosen to hit a per-axis DOF
-target of ``num_N - 3``.
+Segment Count And Time
+----------------------
+The C++ uses exactly ``num_N`` local polynomial segments. The global
+path is sampled only to seed the model; safe-corridor membership is
+handled by MIQP indicators. Segment duration is uniform:
+``factor * max(getInitialDt(), 2 * dc)``.
 
 Failure modes
 -------------
@@ -48,6 +46,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, List, Sequence, Tuple
 
@@ -56,7 +55,6 @@ import numpy as np
 from sando_py.core import Parameters, PieceWisePol, Polytope, RobotState
 
 from .elimination import LinearCoeff, SegmentExpressions
-from .minvo import accel_minvo_cps, jerk_value, pos_minvo_cps, vel_minvo_cps
 from .time_alloc import TimeAlloc
 from .types import SolveTimingBreakdown, SolverInfo
 
@@ -72,12 +70,6 @@ _T_MIN = 0.05
 # Cruise = ``_CRUISE_ALPHA * v_max`` for the per-segment time alloc
 # heuristic. Same value the v1 solver uses.
 _CRUISE_ALPHA = 0.5
-
-# Sample points per segment for dynamic (v / a) constraints. Jerk is
-# exact (cubic ⇒ constant jerk per segment, one constraint suffices) and
-# corridor membership uses the Bezier convex-hull property — no
-# sampling, no clipping between samples.
-_SAMPLES_PER_SEG = 5
 
 # Cap on parallel-search worker threads. The C++ fires one Gurobi worker
 # per factor; we mirror that but cap at this number to avoid creating
@@ -188,7 +180,7 @@ class GurobiSolver:
         self,
         A: RobotState,
         path: List[np.ndarray],
-        polys: Sequence[Polytope],
+        polys,  # Sequence[Polytope] OR Sequence[Sequence[Polytope]] (time-layered)
     ) -> Tuple[PieceWisePol, SolverInfo]:
         t0 = time.perf_counter()
 
@@ -196,27 +188,44 @@ class GurobiSolver:
             return PieceWisePol(), SolverInfo(success=False,
                                               wall_time_s=time.perf_counter() - t0)
 
-        # Import Gurobi lazily; on ImportError, fail cleanly.
+        # Import Gurobi lazily. On ImportError, log once at WARNING level
+        # so a missing ``gurobipy`` install doesn't silently fail every
+        # replan tick — the previous behaviour returned ``success=False``
+        # without any indication that the solver was never even invoked.
         try:
             if self._gp is None:
                 import gurobipy as gp
                 from gurobipy import GRB
                 self._gp = gp
                 self._GRB = GRB
-        except ImportError:
+        except ImportError as _e:
+            if not getattr(self, "_warned_no_gurobi", False):
+                import warnings
+                warnings.warn(
+                    f"GurobiSolver: gurobipy not importable ({_e}). "
+                    "Every solve() will return failure. Install gurobipy "
+                    "into the runtime Python interpreter "
+                    "(e.g. `pip install gurobipy`).",
+                    RuntimeWarning, stacklevel=2,
+                )
+                self._warned_no_gurobi = True
             return PieceWisePol(), SolverInfo(success=False,
                                               wall_time_s=time.perf_counter() - t0)
 
         gp = self._gp
         GRB = self._GRB
 
+        if polys is None:
+            polys = []
         pts = [np.asarray(p, dtype=float).reshape(3) for p in path]
 
-        # Subdivide path edges so we have enough polynomial segments.
+        # C++ uses exactly ``num_N`` local polynomial segments. Internal
+        # points are only a warm-start scaffold; the QP itself is
+        # constrained by boundary states, dynamics, map bounds, and SFC.
         sub_pts, parent_of_seg = _subdivide(pts, self.params)
         n_seg = len(sub_pts) - 1
 
-        Ts_base = _allocate_times(sub_pts, self.params)
+        Ts_base = _allocate_times(A, sub_pts[-1], n_seg, self.params)
         if any(T <= 0 for T in Ts_base):
             return PieceWisePol(), SolverInfo(success=False,
                                               wall_time_s=time.perf_counter() - t0)
@@ -231,7 +240,7 @@ class GurobiSolver:
             bool(getattr(self.params, "using_variable_elimination", True))
             and n_seg >= 4
         )
-        solve_fn = self._solve_one_elim if use_elim else self._solve_one
+        solve_fn = self._solve_one_elim if use_elim else self._solve_one_fresh
 
         # Single-factor path: keep the cached-model fast path. This is
         # the hot path when ``use_dynamic_factor`` is off, and also when
@@ -328,22 +337,17 @@ class GurobiSolver:
             _add_boundary_constraints(model, coeffs, Ts, A, sub_pts[-1])
             _add_continuity_constraints(model, coeffs, Ts)
             _add_dynamic_constraints(model, coeffs, Ts, self.params)
-            _add_corridor_constraints(model, coeffs, Ts, parent_of_seg, polys, n_seg)
+            _add_map_size_constraints(model, coeffs, Ts, self.params)
+            _add_corridor_constraints(
+                gp, GRB, model, coeffs, Ts, parent_of_seg, polys, n_seg
+            )
 
-            # Objective: integrated jerk². Jerk of a cubic = 6 * a (constant),
-            # so integral over [0, T] of jerk² = 36 * a² * T.
             obj = gp.QuadExpr()
+            jerk_w = max(0.0, float(self.params.jerk_smooth_weight or 1.0))
             for ax in range(3):
                 for seg in range(n_seg):
                     a = coeffs[ax][seg][0]
-                    obj += 36.0 * Ts[seg] * a * a
-            # Light regularization on b (avoids drift when DOFs are slack)
-            jerk_w = max(0.0, float(self.params.jerk_smooth_weight))
-            if jerk_w > 0:
-                for ax in range(3):
-                    for seg in range(n_seg):
-                        b_var = coeffs[ax][seg][1]
-                        obj += jerk_w * b_var * b_var
+                    obj += jerk_w * 36.0 * a * a
             model.setObjective(obj, GRB.MINIMIZE)
 
             model.optimize()
@@ -404,19 +408,17 @@ class GurobiSolver:
             _add_boundary_constraints(model, coeffs, Ts, A, sub_pts[-1])
             _add_continuity_constraints(model, coeffs, Ts)
             _add_dynamic_constraints(model, coeffs, Ts, self.params)
-            _add_corridor_constraints(model, coeffs, Ts, parent_of_seg, polys, n_seg)
+            _add_map_size_constraints(model, coeffs, Ts, self.params)
+            _add_corridor_constraints(
+                gp, GRB, model, coeffs, Ts, parent_of_seg, polys, n_seg
+            )
 
             obj = gp.QuadExpr()
+            jerk_w = max(0.0, float(self.params.jerk_smooth_weight or 1.0))
             for ax in range(3):
                 for seg in range(n_seg):
                     a = coeffs[ax][seg][0]
-                    obj += 36.0 * Ts[seg] * a * a
-            jerk_w = max(0.0, float(self.params.jerk_smooth_weight))
-            if jerk_w > 0:
-                for ax in range(3):
-                    for seg in range(n_seg):
-                        b_var = coeffs[ax][seg][1]
-                        obj += jerk_w * b_var * b_var
+                    obj += jerk_w * 36.0 * a * a
             model.setObjective(obj, GRB.MINIMIZE)
 
             model.optimize()
@@ -552,13 +554,28 @@ def _solve_elim_core(
                 cps_ax.append([_le(cp, ax) for cp in cps_lc])
             cp_le_per_seg.append(cps_ax)
 
-        use_miqp = bool(getattr(self.params, "use_miqp_corridor", False))
-        if use_miqp and len(polys) > 1:
-            # MIQP path: each segment selects one of the P polytopes via
-            # binary vars b[t][p], with "at least one active" enforced.
-            # Mirrors C++ ``createSafeCorridorConstraintsForPolytopeAtleastOne``
-            # (gurobi_solver.cpp:4034-4089).
-            P = len(polys)
+        # Detect time-layered polytopes: ``polys`` is ``List[List[Polytope]]``
+        # when caller passed `sfc_time_layered` output, else `List[Polytope]`.
+        is_time_layered = (
+            isinstance(polys, (list, tuple))
+            and len(polys) > 0
+            and isinstance(polys[0], (list, tuple))
+        )
+        if is_time_layered or len(polys) > 0:
+            if is_time_layered:
+                N_time = len(polys)
+                P = len(polys[0])
+
+                def _poly_at(t_sub: int, p: int):
+                    t_layer = t_sub if n_seg <= N_time else int(t_sub * N_time / n_seg)
+                    t_layer = min(max(0, t_layer), N_time - 1)
+                    return polys[t_layer][p]
+            else:
+                P = len(polys)
+
+                def _poly_at(t_sub: int, p: int):
+                    return polys[p]
+
             b_vars = [
                 [
                     model.addVar(vtype=GRB.BINARY, name=f"b_t{t}_p{p}")
@@ -573,7 +590,7 @@ def _solve_elim_core(
                     name=f"at_least_1_pol_t{t}",
                 )
                 for p in range(P):
-                    poly = polys[p]
+                    poly = _poly_at(t, p)
                     if poly.A.shape[0] == 0:
                         # Empty polytope → disable this binary so the
                         # solver can't assign to a non-existent corridor.
@@ -581,10 +598,6 @@ def _solve_elim_core(
                                         name=f"empty_t{t}_p{p}")
                         continue
                     for i in range(4):
-                        if t == 0 and i == 0:
-                            continue
-                        if t == n_seg - 1 and i == 3:
-                            continue
                         cp_le = cp_le_per_seg[t]
                         for row in range(poly.A.shape[0]):
                             a0 = float(poly.A[row, 0])
@@ -599,33 +612,9 @@ def _solve_elim_core(
                                 float(poly.b[row, 0]),
                                 f"miqp_t{t}_p{p}_face{row}_cp{i}",
                             )
-        else:
-            # QP path: segment t is hard-pinned to polytope
-            # ``parent_of_seg[t]`` (path-edge → corridor identity).
-            for seg in range(n_seg):
-                parent = parent_of_seg[seg] if seg < len(parent_of_seg) else seg
-                if parent >= len(polys):
-                    continue
-                poly = polys[parent]
-                if poly.A.shape[0] == 0:
-                    continue
-                for i in range(4):
-                    if seg == 0 and i == 0:
-                        continue
-                    if seg == n_seg - 1 and i == 3:
-                        continue
-                    cp_le = cp_le_per_seg[seg]
-                    for row in range(poly.A.shape[0]):
-                        a0 = float(poly.A[row, 0])
-                        a1 = float(poly.A[row, 1])
-                        a2 = float(poly.A[row, 2])
-                        lhs = (a0 * cp_le[0][i]
-                               + a1 * cp_le[1][i]
-                               + a2 * cp_le[2][i])
-                        model.addConstr(lhs <= float(poly.b[row, 0]))
         timing.polytopes_ms = (time.perf_counter() - t_polytopes) * 1000.0
 
-        # ---- MINVO dynamic constraints (v, a, j) ----
+        # ---- Bezier dynamic constraints (v, a, j), matching C++ getVelCP/getAccelCP/getJerkCP ----
         t_dynamic = time.perf_counter()
         # Three norm types — match the C++ ``dynamic_constraint_type``:
         #   "Linf" → per-axis box  (default, smallest constraint count)
@@ -642,19 +631,19 @@ def _solve_elim_core(
             for sx in (+1, -1) for sy in (+1, -1) for sz in (+1, -1)
         ], dtype=float)
 
-        def _add_dyn_constraints(per_axis_cps, bound: float):
+        def _add_dyn_constraints(per_axis_cps, bound: float, label: str = "dyn", seg_idx: int = -1):
             """``per_axis_cps`` is a list of length 3 (one per axis),
-            each holding a list of MINVO CPs (LinearCoeff). Add the
+            each holding a list of Bezier derivative CPs (LinearCoeff). Add the
             requested-norm constraints across all CPs."""
             if bound <= 0:
                 return
             n_cps = len(per_axis_cps[0])
             if norm_type == "Linf":
                 for ax in range(3):
-                    for cp in per_axis_cps[ax]:
+                    for k, cp in enumerate(per_axis_cps[ax]):
                         e = _le(cp, ax)
-                        model.addConstr(e <= bound)
-                        model.addConstr(e >= -bound)
+                        model.addConstr(e <= bound, name=f"{label}_s{seg_idx}_a{ax}_k{k}_hi")
+                        model.addConstr(e >= -bound, name=f"{label}_s{seg_idx}_a{ax}_k{k}_lo")
             elif norm_type == "L1":
                 # |vx|+|vy|+|vz| <= v_max  ⇔  sx*vx + sy*vy + sz*vz <= v_max
                 # for every sign tuple (8 faces).
@@ -700,7 +689,7 @@ def _solve_elim_core(
 
         for seg in range(n_seg):
             T = Ts[seg]
-            # Gather MINVO CPs per axis (each axis → list of CPs).
+            # Gather Bezier derivative CPs per axis (each axis → list of CPs).
             vel_cps = [None] * 3
             accel_cps = [None] * 3
             jerk_cps = [None] * 3
@@ -708,24 +697,46 @@ def _solve_elim_core(
                 a_lc = seg_exprs_per_axis[ax].a(seg)
                 b_lc = seg_exprs_per_axis[ax].b(seg)
                 c_lc = seg_exprs_per_axis[ax].c(seg)
-                vel_cps[ax] = vel_minvo_cps(a_lc, b_lc, c_lc, T)
-                accel_cps[ax] = accel_minvo_cps(a_lc, b_lc, T)
-                jerk_cps[ax] = [jerk_value(a_lc)]  # single jerk CP per segment
+                vel_cps[ax] = [
+                    c_lc,
+                    c_lc + b_lc * T,
+                    c_lc + b_lc * (2.0 * T) + a_lc * (3.0 * T * T),
+                ]
+                accel_cps[ax] = [
+                    b_lc * 2.0,
+                    b_lc * 2.0 + a_lc * (6.0 * T),
+                ]
+                jerk_cps[ax] = [a_lc * 6.0]
 
-            _add_dyn_constraints(vel_cps, v_max)
-            _add_dyn_constraints(accel_cps, a_max)
-            _add_dyn_constraints(jerk_cps, j_max)
+            _add_dyn_constraints(vel_cps, v_max, label="vmax", seg_idx=seg)
+            _add_dyn_constraints(accel_cps, a_max, label="amax", seg_idx=seg)
+            _add_dyn_constraints(jerk_cps, j_max, label="jmax", seg_idx=seg)
         timing.dynamic_ms = (time.perf_counter() - t_dynamic) * 1000.0
 
-        # ---- Objective: integrated jerk² ----
-        # jerk(u) = 6 a (constant per segment), integral over [0, T] of
-        # jerk² is 36 * a² * T. ``a`` is a LinearCoeff so a² is a
-        # quadratic form in the free vars.
+        # ---- Map-size constraints on all Bezier position CPs ----
+        t_map = time.perf_counter()
+        bounds = [
+            (float(self.params.x_min), float(self.params.x_max)),
+            (float(self.params.y_min), float(self.params.y_max)),
+            (float(self.params.z_min), float(self.params.z_max)),
+        ]
+        for seg in range(n_seg):
+            cp_le = cp_le_per_seg[seg]
+            for ax, (lo, hi) in enumerate(bounds):
+                if hi > lo:
+                    for i in range(4):
+                        model.addConstr(cp_le[ax][i] <= hi, name=f"map_s{seg}_a{ax}_cp{i}_hi")
+                        model.addConstr(cp_le[ax][i] >= lo, name=f"map_s{seg}_a{ax}_cp{i}_lo")
+        timing.mapsize_ms = (time.perf_counter() - t_map) * 1000.0
+
+        # ---- Objective: C++ jerk smoothness ----
+        # C++ minimizes jerk_smooth_weight * sum_t ||getJerk(t,0)||^2.
+        # There is no segment-duration multiplier.
         t_objective = time.perf_counter()
         obj = gp.QuadExpr()
+        jerk_w = max(0.0, float(self.params.jerk_smooth_weight or 1.0))
         for seg in range(n_seg):
-            T = Ts[seg]
-            w = 36.0 * T
+            w = 36.0 * jerk_w
             for ax in range(3):
                 a_lc = seg_exprs_per_axis[ax].a(seg)
                 # a²: sum_i sum_j coef[i]*coef[j]*free[i]*free[j]
@@ -748,15 +759,14 @@ def _solve_elim_core(
         model.setObjective(obj, GRB.MINIMIZE)
         timing.objective_ms = (time.perf_counter() - t_objective) * 1000.0
 
-        # mapsize_ms: Python doesn't emit explicit map-bbox constraints
-        # at this layer (handled by HGP + ellipsoid local_bbox), so 0.
-        timing.mapsize_ms = 0.0
-
         t_call = time.perf_counter()
         model.optimize()
         timing.callOptimizer_ms = (time.perf_counter() - t_call) * 1000.0
 
         if not _has_usable_solution(model, GRB):
+            _maybe_debug_infeasibility(
+                model, GRB, n_seg, Ts, polys, A, sub_pts,
+            )
             return PieceWisePol(), SolverInfo(
                 success=False, wall_time_s=time.perf_counter() - t0,
                 timing=timing,
@@ -830,42 +840,112 @@ GurobiSolver._solve_one_elim_fresh = _solve_one_elim_fresh
 def _subdivide(
     pts: List[np.ndarray], params: Parameters,
 ) -> Tuple[List[np.ndarray], List[int]]:
-    """Subdivide each path edge into ``K`` equal sub-segments so the QP
-    has enough DOF for jerk minimization.
+    """Return exactly ``num_N + 1`` warm-start points along the path.
 
-    Returns the new waypoint list and, for each sub-segment, the index
-    of the parent path edge (used to look up the corresponding corridor
-    polytope).
+    C++ fixes the local optimizer segment count to ``par.num_N``. The
+    global path is used for corridor generation/selection, not as a set
+    of hard interpolation knots. Python still needs per-segment points
+    for warm starts and for the optional non-MIQP fallback, so we sample
+    the polyline at equal arclength.
     """
     P = len(pts) - 1
     if P <= 0:
         return list(pts), []
 
-    n_target = max(_DEFAULT_NUM_N, int(params.num_N or 0))
-    # Per-axis DOF = n_target - 3 (3 start + 3 end equality constraints,
-    # 3*(n-1) continuity, 4n vars). We aim for at least 3 DOFs so the
-    # optimizer has something meaningful to do, which means n >= 6.
-    K = max(1, (n_target + P - 1) // P)
+    n_target = max(1, int(params.num_N or _DEFAULT_NUM_N))
+    lengths = np.array(
+        [float(np.linalg.norm(pts[i + 1] - pts[i])) for i in range(P)],
+        dtype=float,
+    )
+    total = float(lengths.sum())
+    if total <= 1e-9:
+        return [pts[0].copy() for _ in range(n_target + 1)], [0] * n_target
 
-    new_pts: List[np.ndarray] = [pts[0].copy()]
+    cum = np.concatenate([[0.0], np.cumsum(lengths)])
+    new_pts: List[np.ndarray] = []
     parent_of_seg: List[int] = []
-    for i in range(P):
-        p0, p1 = pts[i], pts[i + 1]
-        for k in range(1, K + 1):
-            alpha = k / K
-            new_pts.append((1.0 - alpha) * p0 + alpha * p1)
-            parent_of_seg.append(i)
+    for k in range(n_target + 1):
+        s = total * k / n_target
+        edge = int(np.searchsorted(cum, s, side="right") - 1)
+        edge = min(max(edge, 0), P - 1)
+        denom = max(lengths[edge], 1e-9)
+        alpha = (s - cum[edge]) / denom
+        new_pts.append((1.0 - alpha) * pts[edge] + alpha * pts[edge + 1])
+        if k > 0:
+            mid_s = total * (k - 0.5) / n_target
+            parent = int(np.searchsorted(cum, mid_s, side="right") - 1)
+            parent_of_seg.append(min(max(parent, 0), P - 1))
     return new_pts, parent_of_seg
 
 
-def _allocate_times(pts: List[np.ndarray], params: Parameters) -> List[float]:
-    v_max = max(0.1, float(params.v_max))
-    cruise = max(_T_MIN * v_max, _CRUISE_ALPHA * v_max)
-    Ts = []
-    for i in range(len(pts) - 1):
-        L = float(np.linalg.norm(pts[i + 1] - pts[i]))
-        Ts.append(max(_T_MIN, L / cruise))
-    return Ts
+def estimate_initial_dt(A: RobotState, goal: np.ndarray, params: Parameters,
+                        n_seg: int | None = None) -> float:
+    """C++ ``SolverGurobi::getInitialDt`` port.
+
+    It estimates total minimum time from per-axis velocity, acceleration,
+    and jerk roots, then divides by ``N``. A missing positive root
+    contributes 0, matching ``MinPositiveElement``.
+    """
+    N = max(1, int(n_seg if n_seg is not None else (params.num_N or _DEFAULT_NUM_N)))
+    x0 = np.asarray(A.pos, dtype=float).reshape(3)
+    v0 = np.asarray(A.vel, dtype=float).reshape(3)
+    a0 = np.asarray(A.accel, dtype=float).reshape(3)
+    xf = np.asarray(goal, dtype=float).reshape(3)
+    v_max = float(params.v_max)
+    a_max = float(params.a_max)
+    j_max = float(params.j_max)
+
+    candidates: List[float] = []
+    for ax in range(3):
+        delta = float(xf[ax] - x0[ax])
+        if v_max != 0.0:
+            candidates.append(abs(delta) / abs(v_max))
+
+        sign = math.copysign(1.0, delta)
+        jerk = sign * j_max
+        accel = sign * a_max
+
+        # jerk-limited: (jerk/6)t^3 + (a0/2)t^2 + v0*t + (x0-xf) = 0
+        candidates.append(_min_positive_root([
+            jerk / 6.0,
+            float(a0[ax]) / 2.0,
+            float(v0[ax]),
+            float(x0[ax] - xf[ax]),
+        ]))
+        # accel-limited: (accel/2)t^2 + v0*t + (x0-xf) = 0
+        candidates.append(_min_positive_root([
+            accel / 2.0,
+            float(v0[ax]),
+            float(x0[ax] - xf[ax]),
+        ]))
+
+    initial_dt = max(candidates, default=0.0) / float(N)
+    if initial_dt > 10000.0:
+        return 0.0
+    return float(initial_dt)
+
+
+def _allocate_times(A: RobotState, goal: np.ndarray, n_seg: int,
+                    params: Parameters) -> List[float]:
+    """C++ ``findDT`` base durations before applying the factor."""
+    initial_dt = estimate_initial_dt(A, goal, params, n_seg)
+    base_dt = max(initial_dt, 2.0 * float(params.dc or 0.0))
+    return [base_dt for _ in range(n_seg)]
+
+
+def _min_positive_root(coeff_desc: Sequence[float]) -> float:
+    coeff = [float(c) for c in coeff_desc]
+    while coeff and abs(coeff[0]) < 1e-12:
+        coeff.pop(0)
+    if not coeff:
+        return 0.0
+    roots = np.roots(coeff)
+    real_roots = sorted(
+        float(r.real)
+        for r in roots
+        if abs(float(r.imag)) < 1e-7 and float(r.real) > 0.0
+    )
+    return real_roots[0] if real_roots else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -918,51 +998,105 @@ def _add_continuity_constraints(model, coeffs, Ts) -> None:
 
 
 def _add_dynamic_constraints(model, coeffs, Ts, params) -> None:
-    """Per-axis ``v_max`` / ``a_max`` / ``j_max`` (Linf) at sampled points
-    along each segment.
-
-    Jerk of a cubic is constant per segment (= 6 * a) so one constraint
-    per segment per axis is exact, not a sample.
-    """
+    """C++ ``setDynamicConstraints`` port for the naive coefficient model."""
     v_max = max(0.0, float(params.v_max))
     a_max = max(0.0, float(params.a_max))
     j_max = max(0.0, float(params.j_max))
+    norm_type = (params.dynamic_constraint_type or "Linf").strip()
+    l1_signs = [
+        (sx, sy, sz)
+        for sx in (+1, -1) for sy in (+1, -1) for sz in (+1, -1)
+    ]
+
+    def _add(per_axis_cps, bound: float, prefix: str):
+        if bound <= 0.0:
+            return
+        n_cps = len(per_axis_cps[0])
+        if norm_type == "L1":
+            for k in range(n_cps):
+                xs = [per_axis_cps[ax][k] for ax in range(3)]
+                for s in l1_signs:
+                    model.addConstr(
+                        float(s[0]) * xs[0]
+                        + float(s[1]) * xs[1]
+                        + float(s[2]) * xs[2]
+                        <= bound,
+                        name=f"{prefix}_L1_cp{k}",
+                    )
+        elif norm_type == "L2":
+            for k in range(n_cps):
+                xs = [per_axis_cps[ax][k] for ax in range(3)]
+                model.addQConstr(
+                    xs[0] * xs[0] + xs[1] * xs[1] + xs[2] * xs[2]
+                    <= bound * bound,
+                    name=f"{prefix}_L2_cp{k}",
+                )
+        else:
+            for ax in range(3):
+                for k, cp in enumerate(per_axis_cps[ax]):
+                    model.addConstr(cp <= bound, name=f"{prefix}_max_ax{ax}_cp{k}")
+                    model.addConstr(cp >= -bound, name=f"{prefix}_min_ax{ax}_cp{k}")
 
     n_seg = len(coeffs[0])
-    K = max(1, _SAMPLES_PER_SEG)
     for seg in range(n_seg):
         T = Ts[seg]
+        vel_cps = []
+        acc_cps = []
+        jerk_cps = []
         for ax in range(3):
             a, b, c, _ = coeffs[ax][seg]
-            # Jerk: exact (constant) — one pair of constraints per segment
-            if j_max > 0:
-                model.addConstr(6.0 * a <= j_max,
-                                name=f"jmax_seg{seg}_ax{ax}")
-                model.addConstr(6.0 * a >= -j_max,
-                                name=f"jmin_seg{seg}_ax{ax}")
-            # Sample v / a at K+1 points per segment
-            for k in range(K + 1):
-                u = T * k / K
-                if v_max > 0:
-                    vel = 3.0 * a * u * u + 2.0 * b * u + c
-                    model.addConstr(vel <= v_max,
-                                    name=f"vmax_seg{seg}_ax{ax}_k{k}")
-                    model.addConstr(vel >= -v_max,
-                                    name=f"vmin_seg{seg}_ax{ax}_k{k}")
-                if a_max > 0:
-                    acc = 6.0 * a * u + 2.0 * b
-                    model.addConstr(acc <= a_max,
-                                    name=f"amax_seg{seg}_ax{ax}_k{k}")
-                    model.addConstr(acc >= -a_max,
-                                    name=f"amin_seg{seg}_ax{ax}_k{k}")
+            vel_cps.append([
+                c,
+                c + b * T,
+                c + 2.0 * b * T + 3.0 * a * T * T,
+            ])
+            acc_cps.append([
+                2.0 * b,
+                2.0 * b + 6.0 * a * T,
+            ])
+            jerk_cps.append([6.0 * a])
+        _add(vel_cps, v_max, f"vel_seg{seg}")
+        _add(acc_cps, a_max, f"acc_seg{seg}")
+        _add(jerk_cps, j_max, f"jerk_seg{seg}")
+
+
+def _add_map_size_constraints(model, coeffs, Ts, params) -> None:
+    """C++ ``setMapSizeConstraints`` port for Bezier position CPs."""
+    bounds = [
+        (float(params.x_min), float(params.x_max)),
+        (float(params.y_min), float(params.y_max)),
+        (float(params.z_min), float(params.z_max)),
+    ]
+    n_seg = len(coeffs[0])
+    for seg in range(n_seg):
+        cps = _bezier_pos_cps(coeffs, Ts[seg], seg)
+        for ax, (lo, hi) in enumerate(bounds):
+            if hi <= lo:
+                continue
+            for i in range(4):
+                model.addConstr(cps[ax][i] <= hi,
+                                name=f"map_cp{i}_ax{ax}_max_t{seg}")
+                model.addConstr(cps[ax][i] >= lo,
+                                name=f"map_cp{i}_ax{ax}_min_t{seg}")
+
+
+def _bezier_pos_cps(coeffs, T: float, seg: int):
+    T2 = T * T
+    T3 = T2 * T
+    cps = [[None] * 4 for _ in range(3)]
+    for ax in range(3):
+        a, b, c, d = coeffs[ax][seg]
+        cps[ax][0] = d
+        cps[ax][1] = d + c * T / 3.0
+        cps[ax][2] = d + 2.0 * c * T / 3.0 + b * T2 / 3.0
+        cps[ax][3] = d + c * T + b * T2 + a * T3
+    return cps
 
 
 def _add_corridor_constraints(
-    model, coeffs, Ts, parent_of_seg, polys, n_seg,
+    gp, GRB, model, coeffs, Ts, parent_of_seg, polys, n_seg,
 ) -> None:
-    """Constrain each cubic segment to lie in its parent path-edge's
-    polytope using **Bezier convex-hull control points** (matches the
-    C++ ``SolverGurobi::setPolyConsts`` / ``getCP0..3``).
+    """C++ MIQP safe-corridor constraints with Bezier position CPs.
 
     Any cubic ``p(u) = a u³ + b u² + c u + d`` over ``u in [0, T]`` is
     equivalent to a Bezier curve with control points
@@ -985,46 +1119,65 @@ def _add_corridor_constraints(
     CPs in ``getCP0..3``. We follow the same split: Bezier for
     enforcement here; MINVO is available in core for verifiers.
 
-    The boundary CPs ``P_0`` of segment 0 and ``P_3`` of the last
-    segment equal the fixed start / end positions, so we skip them — if
-    ``A.pos`` or ``goal`` happens to sit on a corridor boundary we
-    don't want a spurious infeasibility from numerical noise.
+    Every CP is constrained under the selected polytope indicator,
+    including start/end CPs, matching the C++ implementation.
     """
     if not polys:
         return
-    for seg in range(n_seg):
-        parent = parent_of_seg[seg] if seg < len(parent_of_seg) else seg
-        if parent >= len(polys):
-            continue
-        poly = polys[parent]
-        if poly.A.shape[0] == 0:
-            continue
-        T = Ts[seg]
-        T2 = T * T
-        T3 = T2 * T
-        # Per-axis Bezier control points (each is a linear expression
-        # in the cubic coefficient variables).
-        cps = [[None] * 4 for _ in range(3)]
-        for ax in range(3):
-            a, b, c, d = coeffs[ax][seg]
-            cps[ax][0] = d
-            cps[ax][1] = d + c * T / 3.0
-            cps[ax][2] = d + 2.0 * c * T / 3.0 + b * T2 / 3.0
-            cps[ax][3] = d + c * T + b * T2 + a * T3
+    is_time_layered = (
+        isinstance(polys, (list, tuple))
+        and len(polys) > 0
+        and isinstance(polys[0], (list, tuple))
+    )
 
-        for i in range(4):
-            if seg == 0 and i == 0:
+    if is_time_layered:
+        N_time = len(polys)
+        P = len(polys[0]) if N_time else 0
+
+        def _poly_at(t_sub: int, p: int):
+            t_layer = t_sub if n_seg <= N_time else int(t_sub * N_time / n_seg)
+            t_layer = min(max(0, t_layer), N_time - 1)
+            return polys[t_layer][p]
+    else:
+        P = len(polys)
+
+        def _poly_at(t_sub: int, p: int):
+            return polys[p]
+
+    if P <= 0:
+        return
+
+    b_vars = [
+        [
+            model.addVar(vtype=GRB.BINARY, name=f"b_t{t}_p{p}")
+            for p in range(P)
+        ]
+        for t in range(n_seg)
+    ]
+    for seg in range(n_seg):
+        model.addConstr(
+            gp.quicksum(b_vars[seg][p] for p in range(P)) >= 1,
+            name=f"at_least_1_pol_t{seg}",
+        )
+        cps = _bezier_pos_cps(coeffs, Ts[seg], seg)
+        for p in range(P):
+            poly = _poly_at(seg, p)
+            if poly.A.shape[0] == 0:
+                model.addConstr(b_vars[seg][p] == 0,
+                                name=f"empty_t{seg}_p{p}")
                 continue
-            if seg == n_seg - 1 and i == 3:
-                continue
-            for row in range(poly.A.shape[0]):
-                expr = (
-                    float(poly.A[row, 0]) * cps[0][i]
-                    + float(poly.A[row, 1]) * cps[1][i]
-                    + float(poly.A[row, 2]) * cps[2][i]
-                )
-                model.addConstr(expr <= float(poly.b[row, 0]),
-                                name=f"sfc_bez_seg{seg}_cp{i}_row{row}")
+            for i in range(4):
+                for row in range(poly.A.shape[0]):
+                    expr = (
+                        float(poly.A[row, 0]) * cps[0][i]
+                        + float(poly.A[row, 1]) * cps[1][i]
+                        + float(poly.A[row, 2]) * cps[2][i]
+                    )
+                    model.addGenConstrIndicator(
+                        b_vars[seg][p], 1, expr, GRB.LESS_EQUAL,
+                        float(poly.b[row, 0]),
+                        f"sfc_miqp_seg{seg}_p{p}_cp{i}_row{row}",
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -1074,6 +1227,55 @@ def _has_usable_solution(model, GRB) -> bool:
     if model.Status == GRB.TIME_LIMIT and model.SolCount > 0:
         return True
     return False
+
+
+def _maybe_debug_infeasibility(model, GRB, n_seg, Ts, polys, A, sub_pts):
+    """When ``SANDO_SOLVER_DEBUG=1``, dump Gurobi status + run IIS so we
+    can see which constraint is forcing infeasibility. No-op otherwise.
+    Temporary diagnostic — remove when the dynamic-mode bug is fixed."""
+    import os, sys
+    if os.environ.get("SANDO_SOLVER_DEBUG") != "1":
+        return
+    status = model.Status
+    sol_count = int(getattr(model, "SolCount", 0))
+    is_time_layered = (
+        isinstance(polys, (list, tuple)) and len(polys) > 0
+        and isinstance(polys[0], (list, tuple))
+    )
+    if is_time_layered:
+        N_time = len(polys); P = len(polys[0]) if N_time else 0
+    else:
+        N_time = 1; P = len(polys)
+    print(
+        f"[solver-debug] Status={status} SolCount={sol_count} "
+        f"n_seg={n_seg} N_time={N_time} P={P} "
+        f"Ts_sum={sum(Ts):.4f}",
+        file=sys.stderr,
+    )
+    if status == GRB.INF_OR_UNBD:
+        model.setParam("DualReductions", 0)
+        model.optimize()
+        status = model.Status
+        print(f"[solver-debug] after DualReductions=0, Status={status}",
+              file=sys.stderr)
+    if status == GRB.INFEASIBLE:
+        try:
+            model.computeIIS()
+            cons_in_iis = [c for c in model.getConstrs() if c.IISConstr]
+            gencons_in_iis = [c for c in model.getGenConstrs() if c.IISGenConstr]
+            qcs_in_iis = [c for c in model.getQConstrs() if c.IISQConstr] \
+                if hasattr(model.getQConstrs()[0] if model.NumQConstrs > 0 else type("x", (), {}), "IISQConstr") else []
+            print(
+                f"[solver-debug] IIS: {len(cons_in_iis)} lin + "
+                f"{len(gencons_in_iis)} indicators + {len(qcs_in_iis)} QC",
+                file=sys.stderr,
+            )
+            for c in cons_in_iis[:20]:
+                print(f"  IIS-lin {c.ConstrName}", file=sys.stderr)
+            for c in gencons_in_iis[:20]:
+                print(f"  IIS-ind {c.GenConstrName}", file=sys.stderr)
+        except Exception as e:
+            print(f"[solver-debug] IIS failed: {e}", file=sys.stderr)
 
 
 def _extract_pwp(coeffs, Ts, t_start: float) -> PieceWisePol:

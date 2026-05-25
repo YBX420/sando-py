@@ -161,10 +161,11 @@ def test_solve_qp_respects_j_max():
 
 def test_solve_qp_fails_gracefully_when_j_max_too_tight():
     """Very tight j_max for a long rest-to-rest move is infeasible — the
-    QP must report failure, not raise."""
+    QP must report failure, not raise. Pin the factor sweep to a single
+    point so the test isn't masked by ``factor_final`` enlarging Ts."""
     A = _state(pos=(0.0, 0.0, 2.0))
     path = [np.array([0.0, 0.0, 2.0]), np.array([10.0, 0.0, 2.0])]
-    p = _params(j_max=0.5)  # very tight
+    p = _params(j_max=0.5, factor_initial=1.0, factor_final=1.0)
     _, info = solve_qp(A, path, [], p)
     assert info.success is False
 
@@ -348,19 +349,26 @@ def test_parallel_factor_search_picks_lowest_successful():
 def test_parallel_factor_search_returns_failure_when_all_factors_infeasible():
     """If every factor in the window leaves the QP infeasible, the
     parallel path returns failure (mirrors C++ behaviour) and the
-    adapter shifts the window up for the next call."""
+    adapter shifts the window up for the next call.
+
+    Drives all factors below ``1.0`` so Ts is strictly shorter than the
+    v_max-allocated minimum and dynamic constraints can't all be
+    satisfied — when ``factor >= 1.0`` the time allocator already gives
+    Ts that's feasible by construction, so we have to under-allocate to
+    construct an "all-infeasible" window.
+    """
     A = _state(pos=(0.0, 0.0, 2.0))
     path = [np.array([0.0, 0.0, 2.0]), np.array([10.0, 0.0, 2.0])]
     p = _params(
         v_max=10.0,
-        a_max=0.05,          # absurdly tight: infeasible for any plausible time budget
+        a_max=0.05,
         j_max=200.0,
         use_dynamic_factor=True,
-        dynamic_factor_initial_mean=1.5,
-        factor_initial=1.0,
-        factor_final=2.0,
-        factor_constant_step_size=0.5,
-        dynamic_factor_k_radius=0.5,      # window: 1.0..2.0 (3 factors)
+        dynamic_factor_initial_mean=0.3,
+        factor_initial=0.2,
+        factor_final=0.4,
+        factor_constant_step_size=0.1,
+        dynamic_factor_k_radius=0.1,      # window: 0.2..0.4 (3 factors)
     )
     solver = GurobiSolver(p)
     mean_before = solver.time_alloc.current_mean
@@ -369,10 +377,9 @@ def test_parallel_factor_search_returns_failure_when_all_factors_infeasible():
     assert solver.time_alloc.current_mean > mean_before - 1e-6  # adapter shifted up
 
 
-def test_disabled_adapter_only_tries_one_factor():
-    """With ``use_dynamic_factor=False`` the solver never retries.
-    Confirm it returns the expected single result on a problem where
-    the dynamic adapter would otherwise have helped."""
+def test_disabled_adapter_uses_constant_factor_sweep():
+    """C++ still sweeps factor_initial..factor_final when dynamic
+    factor adaptation is disabled."""
     A = _state(pos=(0.0, 0.0, 2.0))
     path = [np.array([0.0, 0.0, 2.0]), np.array([10.0, 0.0, 2.0])]
     # a_max too tight for the factor=1 time budget. Dynamic adapter
@@ -382,7 +389,9 @@ def test_disabled_adapter_only_tries_one_factor():
         a_max=0.3,
         j_max=200.0,
         use_dynamic_factor=False,
-        dynamic_factor_initial_mean=1.0,
+        factor_initial=1.0,
+        factor_final=3.0,
+        factor_constant_step_size=0.5,
     )
     _, info = solve_qp(A, path, [], p)
-    assert info.success is False
+    assert info.success is True

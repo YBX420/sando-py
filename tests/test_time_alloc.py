@@ -30,11 +30,13 @@ def _params(**overrides) -> Parameters:
 # Static behaviour (use_dynamic_factor off)
 # ---------------------------------------------------------------------------
 
-def test_static_yields_single_factor_when_disabled():
+def test_static_sweeps_factor_range_when_disabled():
     p = _params(use_dynamic_factor=False, dynamic_factor_initial_mean=1.5)
     ta = TimeAlloc(p)
     factors = list(ta.factors_to_try())
-    assert factors == [1.5]
+    assert factors[0] == pytest.approx(p.factor_initial)
+    assert factors[-1] == pytest.approx(p.factor_final)
+    assert len(factors) == 16
 
 
 def test_static_yields_at_least_one_factor():

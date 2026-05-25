@@ -35,12 +35,13 @@ v1 limitations (all fixed by v2)
   intermediate spline.
 """
 
-from .gurobi_solver import GurobiSolver, solve_qp
+from .gurobi_solver import GurobiSolver, estimate_initial_dt, solve_qp
 from .min_jerk import MinJerkSolver, solve
 from .types import SolveTimingBreakdown, SolverInfo
 
 __all__ = [
     "GurobiSolver",
+    "estimate_initial_dt",
     "MinJerkSolver",
     "SolverInfo",
     "SolveTimingBreakdown",

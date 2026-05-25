@@ -31,11 +31,12 @@ from .ellipsoid import (
     find_polyhedron,
     polyhedron_to_polytope,
 )
-from .sfc import sfc
+from .sfc import sfc, sfc_time_layered
 
 __all__ = [
     "grow_aabb",
     "sfc",
+    "sfc_time_layered",
     "decompose_segment",
     "decompose_path",
     "find_ellipsoid",

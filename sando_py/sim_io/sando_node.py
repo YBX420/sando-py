@@ -60,7 +60,7 @@ from sando_py.core import (
     warn_if_extras,
 )
 from sando_py.core.utils import angle_wrap, projectPointToSphere
-from sando_py.decomp import sfc
+from sando_py.decomp import sfc, sfc_time_layered
 from sando_py.decomp.sfc import _voxel_map_occupied_points as _voxel_map_occupied_points_cached
 from sando_py.hgp import HGPPlanner
 from sando_py.core.hardware import InitPoseTransform, init_pose_from_transform_stamped
@@ -81,7 +81,7 @@ from sando_py.sim_io.viz import (
     positions_to_marker_array,
     pwp_to_colored_marker_array,
 )
-from sando_py.solver import GurobiSolver, MinJerkSolver
+from sando_py.solver import GurobiSolver, estimate_initial_dt
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,10 @@ class SandoNode(Node):
         # -------- Planner state --------
         self.current_state_: Optional[RobotState] = None
         self.term_goal_: Optional[np.ndarray] = None
+        # Mirrors C++ ``terminal_goal_initialized_`` (sando.hpp). Used by
+        # ``_term_goal_cb`` to gate the duplicate-goal short-circuit and the
+        # mid-flight smooth-update branch (sando.cpp:1896, 1909, 1978).
+        self.terminal_goal_initialized_: bool = False
         self.trajs_: Dict[int, DynTraj] = {}      # id -> DynTraj
         self.committed_traj_: Optional[PieceWisePol] = None
         self.status_: DroneStatus = DroneStatus.GOAL_REACHED  # C++ initial state
@@ -215,15 +219,10 @@ class SandoNode(Node):
         self._last_replan_comp_time: float = 0.0
 
         # -------- Pipeline --------
-        # ``solver_`` is the v2 Gurobi QP — the default when a Gurobi
-        # license is reachable. ``solver_fallback_`` is the v1 cubic
-        # Hermite, used when v2 reports failure (no license, infeasible
-        # QP, time-limit hit). Mirrors the C++ ``hold previous traj on
-        # Gurobi failure`` branch but with a graceful degrade instead of
-        # an immediate hold.
+        # ``solver_`` is the C++-aligned Gurobi QP. On failure we hold
+        # the previous committed trajectory, matching the C++ planner.
         self.hgp_ = HGPPlanner(self.params)
         self.solver_ = GurobiSolver(self.params)
-        self.solver_fallback_ = MinJerkSolver(self.params)
 
         # -------- Yaw planning state --------
         # ``previous_yaw_`` is the *commanded* yaw reference — the one
@@ -536,12 +535,46 @@ class SandoNode(Node):
             )
 
     def _term_goal_cb(self, msg: PoseStamped) -> None:
-        """Mirrors ``terminalGoalCallback`` (sando_node.cpp:951-979)."""
+        """Mirrors ``terminalGoalCallback`` (sando_node.cpp:951-979) +
+        ``setTerminalGoal`` (sando.cpp:1893-1979)."""
         try:
             goal = pose_stamped_to_goal(msg, self.params)
         except ValueError as e:
             self.get_logger().error(str(e))
             return
+
+        # Ignore duplicate goals — the goal_sender re-publishes for
+        # reliability, but re-triggering YAWING clears the plan and
+        # stops the drone mid-flight. Mirrors sando.cpp:1894-1900.
+        if self.terminal_goal_initialized_ and self.term_goal_ is not None:
+            if float(np.linalg.norm(self.term_goal_ - goal)) < 0.1:
+                return
+
+        # If the drone is already in TRAVELING or GOAL_SEEN state (i.e.
+        # mid-flight), smoothly update the terminal goal without
+        # stopping. The replanning timer will pick up the new goal on
+        # the next cycle and replan toward it. Mirrors sando.cpp:1909-1925.
+        if self.terminal_goal_initialized_ and self.status_ in (
+            DroneStatus.TRAVELING, DroneStatus.GOAL_SEEN,
+        ):
+            self.term_goal_ = goal
+            self.p_hover_ = goal.copy()
+            # NB: C++ also updates ``G_.pos`` to the sphere-projected
+            # goal here (sando.cpp:1915-1917). Python recomputes the
+            # projection inline inside ``_replan_cb`` each tick, so
+            # there is no persistent ``G_`` field to update — the next
+            # replan tick picks up the new ``term_goal_`` automatically.
+            self.get_logger().info(
+                f"SMOOTH_UPDATE (mid-flight): Terminal goal set to {goal.tolist()}"
+            )
+            # Go back to TRAVELING if we were in GOAL_SEEN (since we
+            # have a new goal now). Mirrors sando.cpp:1922.
+            if self.status_ == DroneStatus.GOAL_SEEN:
+                self._set_status(DroneStatus.TRAVELING)
+            return
+
+        # First goal or drone is in YAWING / GOAL_REACHED / HOVER_AVOIDING:
+        # full initialization. Mirrors sando.cpp:1927-1978.
         self.term_goal_ = goal
         # Snapshot the user-requested goal for hover-avoidance return.
         # Mirrors C++ ``setGoal`` (sando.cpp:1836, 1873): ``p_hover_`` is
@@ -562,13 +595,26 @@ class SandoNode(Node):
             self.previous_yaw_ = float(self.current_state_.yaw)
         self.yaw_start_time_ = self._t_now()
 
+        # Reset replanning failure count so YAWING uses getDesiredYaw
+        # (not spinning mode). Mirrors sando.cpp:1956. Note _set_status
+        # also resets it on YAWING entry, but the skip_initial_yawing
+        # path goes straight to TRAVELING and would otherwise miss it.
+        self.replanning_failure_count_ = 0
+
         # Mirrors the C++ state-machine entry on first term_goal:
         # GOAL_REACHED -> YAWING (or TRAVELING if skip_initial_yawing).
         if self.params.skip_initial_yawing:
             self._set_status(DroneStatus.TRAVELING)
+            self.get_logger().info(
+                f"FULL_INIT (TRAVELING, skip_yaw): Terminal goal set to {goal.tolist()}"
+            )
         else:
             self._set_status(DroneStatus.YAWING)
-        self.get_logger().info(f"Terminal goal set to {goal.tolist()}")
+            self.get_logger().info(
+                f"FULL_INIT (YAWING): Terminal goal set to {goal.tolist()}"
+            )
+
+        self.terminal_goal_initialized_ = True
 
     def _replan_cb(self) -> None:
         """One replanning tick: step the state machine, then run
@@ -1221,15 +1267,38 @@ class SandoNode(Node):
         row.global_planning_ms = (time.perf_counter() - t_gp) * 1000.0
 
         # --- Local trajectory optimization (cvx decomp + solver) ---
+        # Time-layered decomp when ``environment_assumption == "dynamic"``
+        # — generate [N_time × P_spatial] polytopes so the solver MIQP
+        # can pick a different corridor per time layer (each layer's
+        # dynamic obstacles are inflated by a different reachability
+        # radius). Mirrors C++ ``cvxEllipsoidDecompTimeLayered`` driven
+        # from ``generateLocalTrajectory`` (sando.cpp:1334-1376).
+        # Other modes (static / dynamic_worst_case / aabb / empty) keep
+        # the single-layer ``sfc()``.
+        env_mode = (self.params.environment_assumption or "").lower()
         t_cvx = time.perf_counter()
-        polys = sfc(path, vm, obstacles, self.params, t_now=t_now)
+        if env_mode == "dynamic" and self.params.num_N > 0:
+            num_N = max(1, int(self.params.num_N))
+            factor_hint = float(
+                getattr(self.solver_.time_alloc, "current_mean",
+                        self.params.dynamic_factor_initial_mean or 1.0)
+            )
+            initial_dt = estimate_initial_dt(
+                A, np.asarray(path[-1], dtype=float), self.params, num_N,
+            )
+            dt_layer = max(1e-3, initial_dt * factor_hint)
+            polys = sfc_time_layered(
+                path, vm, obstacles, self.params,
+                num_time_layers=num_N,
+                dt_layer=dt_layer,
+                t_now=t_now,
+            )
+        else:
+            polys = sfc(path, vm, obstacles, self.params, t_now=t_now)
         row.cvx_decomp_ms = (time.perf_counter() - t_cvx) * 1000.0
 
         t_lto = time.perf_counter()
         traj_new, info = self.solver_.solve(A, path, polys)
-        if not info.success:
-            # v2 QP failed (infeasible / no license / timeout). Try v1.
-            traj_new, info = self.solver_fallback_.solve(A, path, polys)
         row.local_traj_opt_ms = (time.perf_counter() - t_lto) * 1000.0
 
         # Copy the winning solver's per-stage breakdown into the CSV row.
@@ -1506,11 +1575,20 @@ class SandoNode(Node):
         self.pub_free_hgp_path_marker_.publish(ma_free)
 
         # poly_safe — corridors
+        # ``polys`` may be ``List[List[Polytope]]`` (time-layered) or
+        # ``List[Polytope]`` (single-layer). Flatten time layers for the
+        # RViz ``poly_safe`` / ``poly_whole`` arrays — RViz doesn't
+        # distinguish time layers, so we just stack them all.
+        if polys and isinstance(polys[0], (list, tuple)):
+            polys_flat = [p for layer in polys for p in layer]
+        else:
+            polys_flat = list(polys)
         pa = polytopes_to_polyhedron_array(
-            polys, frame_id=self.frame_id_, stamp=stamp,
+            polys_flat, frame_id=self.frame_id_, stamp=stamp,
         )
         self.pub_poly_safe_.publish(pa)
-        # poly_whole — same set in single-thread Python.
+        # poly_whole — full polytope set (= all time layers when
+        # time-layered decomp is active, single layer otherwise).
         self.pub_poly_whole_.publish(pa)
 
         # traj_committed_colored — sampled committed trajectory, JET by |v|

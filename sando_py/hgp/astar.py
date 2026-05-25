@@ -70,6 +70,8 @@ def astar(
     max_expansions: int = 100_000,
     heat_weight: float = 0.0,
     timeout_s: float = 0.0,
+    allow_occupied: bool = False,
+    obstacle_soft_cost: float = 0.0,
 ) -> Optional[List[Index]]:
     """Run A* in 3D (or 2D-as-degenerate-3D). Returns indices
     ``[start, ..., goal]`` or ``None`` if no path was found.
@@ -119,22 +121,31 @@ def astar(
     came_from: dict = {start_idx: -1}
     g_score: dict = {start_idx: 0.0}
     expansions = 0
+    best_idx = start_idx
+    best_h = octile(start, goal)
 
     t_start = time.perf_counter()
     inf = math.inf
 
     while open_heap:
         if timeout_s > 0 and (time.perf_counter() - t_start) > timeout_s:
-            return None
+            path = _reconstruct_flat(came_from, best_idx, nynz, nz)
+            return path if len(path) > 1 else None
 
         _, _, current = heapq.heappop(open_heap)
 
         if current == goal_idx:
             return _reconstruct_flat(came_from, current, nynz, nz)
 
+        ch = octile(_dec(current), goal)
+        if ch < best_h:
+            best_h = ch
+            best_idx = current
+
         expansions += 1
         if expansions > max_expansions:
-            return None
+            path = _reconstruct_flat(came_from, best_idx, nynz, nz)
+            return path if len(path) > 1 else None
 
         cx, cy, cz = _dec(current)
         g_cur = g_score[current]
@@ -142,12 +153,15 @@ def astar(
             nxn, nyn, nzn = cx + dx, cy + dy, cz + dz
             if nxn < 0 or nxn >= nx or nyn < 0 or nyn >= ny or nzn < 0 or nzn >= nz:
                 continue
-            if occ[nxn, nyn, nzn]:
+            occupied = bool(occ[nxn, nyn, nzn])
+            if occupied and not allow_occupied:
                 continue
             nb = nxn * nynz + nyn * nz + nzn
             cost = step
             if use_heat:
                 cost += heat_weight * float(heat[nxn, nyn, nzn])
+                if occupied and allow_occupied:
+                    cost += heat_weight * float(obstacle_soft_cost)
             tentative = g_cur + cost
             if tentative < g_score.get(nb, inf):
                 came_from[nb] = current
@@ -164,7 +178,8 @@ def astar(
                 counter += 1
                 heapq.heappush(open_heap, (f, counter, nb))
 
-    return None
+    path = _reconstruct_flat(came_from, best_idx, nynz, nz)
+    return path if len(path) > 1 else None
 
 
 def _reconstruct_flat(came_from: dict, current: int, nynz: int, nz: int) -> List[Index]:
@@ -193,7 +208,8 @@ def _reconstruct(came_from: dict, current: Index) -> List[Index]:
     return out
 
 
-def simplify_path_los(path: List[Index], vm: VoxelMap) -> List[Index]:
+def simplify_path_los(path: List[Index], vm: VoxelMap,
+                      inflate_radius_cells: int = 0) -> List[Index]:
     """Pull straight-line shortcuts across consecutive waypoints.
 
     Greedy line-of-sight smoothing — for each anchor, advance the second
@@ -207,14 +223,17 @@ def simplify_path_los(path: List[Index], vm: VoxelMap) -> List[Index]:
     i = 0
     while i < len(path3) - 1:
         j = len(path3) - 1
-        while j > i + 1 and not _line_clear_3d(path3[i], path3[j], vm):
+        while j > i + 1 and not _line_clear_3d(
+            path3[i], path3[j], vm, inflate_radius_cells
+        ):
             j -= 1
         out.append(path3[j])
         i = j
     return out
 
 
-def _line_clear_3d(a: Index, b: Index, vm: VoxelMap) -> bool:
+def _line_clear_3d(a: Index, b: Index, vm: VoxelMap,
+                   inflate_radius_cells: int = 0) -> bool:
     """3D Bresenham; ``True`` if every cell on the line is free.
 
     Faithful to the standard 3D-line-rasterisation algorithm — pick the
@@ -234,7 +253,7 @@ def _line_clear_3d(a: Index, b: Index, vm: VoxelMap) -> bool:
         for _ in range(dx + 1):
             if not (0 <= x < vm.nx and 0 <= y < vm.ny and 0 <= z < vm.nz):
                 return False
-            if vm.occupied[x, y, z]:
+            if _blocked(vm, x, y, z, inflate_radius_cells):
                 return False
             if err_1 > 0:
                 y += sy
@@ -251,7 +270,7 @@ def _line_clear_3d(a: Index, b: Index, vm: VoxelMap) -> bool:
         for _ in range(dy + 1):
             if not (0 <= x < vm.nx and 0 <= y < vm.ny and 0 <= z < vm.nz):
                 return False
-            if vm.occupied[x, y, z]:
+            if _blocked(vm, x, y, z, inflate_radius_cells):
                 return False
             if err_1 > 0:
                 x += sx
@@ -268,7 +287,7 @@ def _line_clear_3d(a: Index, b: Index, vm: VoxelMap) -> bool:
         for _ in range(dz + 1):
             if not (0 <= x < vm.nx and 0 <= y < vm.ny and 0 <= z < vm.nz):
                 return False
-            if vm.occupied[x, y, z]:
+            if _blocked(vm, x, y, z, inflate_radius_cells):
                 return False
             if err_1 > 0:
                 y += sy
@@ -280,3 +299,14 @@ def _line_clear_3d(a: Index, b: Index, vm: VoxelMap) -> bool:
             err_2 += 2 * dx
             z += sz
     return True
+
+
+def _blocked(vm: VoxelMap, x: int, y: int, z: int,
+             inflate_radius_cells: int) -> bool:
+    r = max(0, int(inflate_radius_cells))
+    if r <= 0:
+        return bool(vm.occupied[x, y, z])
+    x0 = max(0, x - r); x1 = min(vm.nx, x + r + 1)
+    y0 = max(0, y - r); y1 = min(vm.ny, y + r + 1)
+    z0 = max(0, z - r); z1 = min(vm.nz, z + r + 1)
+    return bool(vm.occupied[x0:x1, y0:y1, z0:z1].any())

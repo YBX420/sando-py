@@ -269,11 +269,9 @@ class Parameters:
     # --- MIQP / time-layered corridor (C++ ``use_time_layered_polytopes``) ---
     # When True, each trajectory segment may choose from any of the
     # ``num_P`` corridor polytopes (binary indicator vars + "at least one
-    # active" constraint, MIQP). When False (default), segment ``i``
-    # is hard-pinned to polytope ``parent_of_seg[i]``. Mirrors
-    # sando.cpp ``createSafeCorridorConstraintsForPolytopeAtleastOne``.
-    # OFF by default because MIQP is ~10× slower than QP.
-    use_miqp_corridor:              bool  = False
+    # active" constraint, MIQP). This is the C++ default behaviour in
+    # ``createSafeCorridorConstraintsForPolytopeAtleastOne``.
+    use_miqp_corridor:              bool  = True
 
     # --- findA lookahead ---
     # Two modes:

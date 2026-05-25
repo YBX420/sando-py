@@ -88,19 +88,28 @@ def jps(
     }
     g_score: Dict[Index, float] = {start: 0.0}
     expansions = 0
+    best_node = start
+    best_h = _octile_3d(start, goal)
 
     while open_heap:
         if timeout_s > 0 and (time.perf_counter() - t_start) > timeout_s:
-            return None
+            path = _reconstruct(came_from, best_node)
+            return path if len(path) > 1 else None
 
         _, _, current = heapq.heappop(open_heap)
 
         if current == goal:
             return _reconstruct(came_from, current)
 
+        h_cur = _octile_3d(current, goal)
+        if h_cur < best_h:
+            best_h = h_cur
+            best_node = current
+
         expansions += 1
         if expansions > max_expansions:
-            return None
+            path = _reconstruct(came_from, best_node)
+            return path if len(path) > 1 else None
 
         parent_dir = came_from[current][1]
         g_cur = g_score[current]
@@ -122,7 +131,8 @@ def jps(
                 counter += 1
                 heapq.heappush(open_heap, (f, counter, jp))
 
-    return None
+    path = _reconstruct(came_from, best_node)
+    return path if len(path) > 1 else None
 
 
 # ---------------------------------------------------------------------------

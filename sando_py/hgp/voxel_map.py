@@ -116,12 +116,12 @@ class VoxelMap:
         the map's z range when ``nz == 1`` (handy for callers that pass
         an altitude that doesn't fall in the single layer)."""
         p = np.asarray(p, dtype=float).reshape(-1)
-        ix = int(np.floor((p[0] - self.x_min) / self.res))
-        iy = int(np.floor((p[1] - self.y_min) / self.res))
+        ix = int((p[0] - self.x_min) / self.res - 0.5)
+        iy = int((p[1] - self.y_min) / self.res - 0.5)
         if self.nz == 1:
             iz = 0
         else:
-            iz = int(np.floor((p[2] - self.z_min) / self.res))
+            iz = int((p[2] - self.z_min) / self.res - 0.5)
         return ix, iy, iz
 
     def idx_to_world(self, idx) -> np.ndarray:
@@ -312,9 +312,9 @@ class VoxelMap:
                 f"mark_points expects (N, 3); got {pts.shape}"
             )
 
-        ix = np.floor((pts[:, 0] - self.x_min) / self.res).astype(np.int64)
-        iy = np.floor((pts[:, 1] - self.y_min) / self.res).astype(np.int64)
-        iz = np.floor((pts[:, 2] - self.z_min) / self.res).astype(np.int64)
+        ix = ((pts[:, 0] - self.x_min) / self.res - 0.5).astype(np.int64)
+        iy = ((pts[:, 1] - self.y_min) / self.res - 0.5).astype(np.int64)
+        iz = ((pts[:, 2] - self.z_min) / self.res - 0.5).astype(np.int64)
         mask = (
             (ix >= 0) & (ix < self.nx)
             & (iy >= 0) & (iy < self.ny)

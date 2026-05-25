@@ -35,7 +35,7 @@ sando_node:
         skip_initial_yawing: false                      # [-] Skip YAWING state, go directly to TRAVELING (useful for interactive sim)
 
         # --- Vehicle Dynamic Limits ---
-        v_max: 10.0                                      # [m/s]   Max velocity
+        v_max: 2.0                                      # [m/s]   Max velocity
         a_max: 20.0                                     # [m/s^2] Max acceleration
         j_max: 100.0                                    # [m/s^3] Max jerk
         w_max: 1.0                                      # [rad/s] Max yaw rate (~4.0 for hardware)
@@ -78,7 +78,7 @@ sando_node:
         max_gurobi_comp_time_sec: 1.0                   # [s] Gurobi solver timeout per replanning cycle
 
         # --- Dynamic Factor Adaptation ---
-        dynamic_factor_initial_mean: 1.5                # [-] Starting time-allocation factor (higher = more conservative)
+        dynamic_factor_initial_mean: 1.8                # [-] Starting time-allocation factor — covers cold-start rest-to-rest cubic (peak/mean ~1.9 needs factor >=1.95). Sweep adapts after one tick anyway.
         factor_initial: 1.0                             # [-] Factor search lower bound
         factor_final: 2.5                               # [-] Factor search upper bound
         factor_constant_step_size: 0.1                  # [-] Factor search step size
@@ -238,7 +238,7 @@ sando_node:
 
         # --- Debug ---
         global_planner_verbose: false                   # [-] Global planner debug output
-        debug_verbose: false                            # [-] General debug output
+        debug_verbose: true                             # [-] General debug output (on for diagnostic)
         verbose_computation_time: false                 # [-] Print computation times
         local_traj_comp_verbose: false                  # [-] Local trajectory computation debug
 

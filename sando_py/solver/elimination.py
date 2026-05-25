@@ -27,10 +27,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+import threading
 from typing import List, Tuple
 
 import numpy as np
 import sympy as sp
+
+# sympy keeps a global Symbol assumption registry that is **not** thread-safe.
+# Two parallel ``_solve_parallel`` workers calling ``_derive`` at the same
+# time can race on ``sp.symbols(... real=True)`` and trip
+# ``InconsistentAssumptions``. Serialise the entire sympy derivation under
+# this lock — the result is cached so the lock is contended only on cache
+# misses, and the symbolic pass runs once per ``(N, dt)`` anyway.
+_DERIVE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +88,19 @@ class CoefficientFormulas:
 def _build_cached(key: Tuple) -> Tuple[np.ndarray, np.ndarray]:
     """LRU-cached version of the heavy sympy derivation. The key is
     (N, rounded-dt-tuple) so repeat calls with the same time allocation
-    skip the work."""
-    N, dt_tuple = key
-    dt = np.asarray(dt_tuple, dtype=float)
-    return _derive(N, dt)
+    skip the work. The cache + derivation are guarded by
+    ``_DERIVE_LOCK`` to keep sympy single-threaded — concurrent
+    ``_derive`` calls trip ``InconsistentAssumptions`` from sympy's
+    global Symbol-assumption registry."""
+    with _DERIVE_LOCK:
+        cached = _BUILD_CACHE.get(key)
+        if cached is not None:
+            return cached
+        N, dt_tuple = key
+        dt = np.asarray(dt_tuple, dtype=float)
+        result = _derive(N, dt)
+        _BUILD_CACHE[key] = result
+        return result
 
 
 _BUILD_CACHE: dict = {}

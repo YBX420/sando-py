@@ -9,14 +9,33 @@ which supports the same math intrinsics (sin, cos, exp, log, ...).
 from __future__ import annotations
 
 import sys
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from typing import Callable, List, Optional
 
 import numpy as np
 import sympy as sp
 
 from .piecewise_poly import PieceWisePol
+
+# sympy global Symbol-assumption registry is not thread-safe; serialise all
+# sympify / lambdify calls under one lock. dynamic_forest can publish 100+
+# obstacles each replanned per second, so the lock plus the lambdify cache
+# below keep this off the hot path.
+_SYMPY_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=512)
+def _cached_lambdify(src: str):
+    """Compile ``src`` (an analytic expression in ``t``) into a numpy
+    callable. Cached so repeated obstacles with the same expression
+    (the dynamic_forest case) skip the heavy sympify+lambdify path."""
+    with _SYMPY_LOCK:
+        t = sp.Symbol("t", real=True)
+        expr = sp.sympify(src)
+        return sp.lambdify(t, expr, modules=["numpy"])
 
 
 class TrajMode(Enum):
@@ -33,9 +52,7 @@ def _compile_one(label: str, src: str, required: bool):
             return None, False
         return None, True
     try:
-        t = sp.Symbol("t", real=True)
-        expr = sp.sympify(src)
-        fn = sp.lambdify(t, expr, modules=["numpy"])
+        fn = _cached_lambdify(src)
         # validate by calling once
         _ = fn(0.0)
         return fn, True

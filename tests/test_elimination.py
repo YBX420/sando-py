@@ -270,11 +270,61 @@ def test_miqp_corridor_succeeds():
     assert info.success
 
 
-def test_miqp_disabled_uses_parent_of_seg_pinning():
-    """Default ``use_miqp_corridor=False`` uses single polytope per
-    segment via parent_of_seg mapping."""
+def test_time_layered_polys_succeeds():
+    """Time-layered ``List[List[Polytope]]`` triggers MIQP path with
+    per-(t, p) polytope selection."""
     p = _bench_params()
-    assert p.use_miqp_corridor is False
+    A = RobotState()
+    A.setPos([0.0, 0.0, 2.0])
+    path, polys_flat = _path_polys()
+    # Wrap as 3 time layers, each layer = same spatial corridors.
+    polys_time_layered = [polys_flat, polys_flat, polys_flat]
+    pwp, info = GurobiSolver(p).solve(A, path, polys_time_layered)
+    assert info.success
+
+
+def test_time_layered_uniform_layers_equal_static():
+    """If every time layer has identical polytopes, the optimal cost
+    should match the single-layer MIQP cost (sanity: no extra
+    constraint beyond corridor membership)."""
+    p = _bench_params()
+    p.use_miqp_corridor = True
+    A = RobotState()
+    A.setPos([0.0, 0.0, 2.0])
+    path, polys_flat = _path_polys()
+
+    _, info_single = GurobiSolver(p).solve(A, path, polys_flat)
+    polys_time_layered = [polys_flat for _ in range(3)]
+    _, info_multi = GurobiSolver(p).solve(A, path, polys_time_layered)
+
+    assert info_single.success and info_multi.success
+    # Both should find the same optimal cost when layers are identical.
+    rel_err = abs(info_single.cost - info_multi.cost) / max(abs(info_single.cost), 1e-9)
+    assert rel_err < 1e-2
+
+
+def test_sfc_time_layered_returns_correct_shape():
+    """``sfc_time_layered`` should return shape ``[num_time_layers][P]``."""
+    from sando_py.decomp import sfc_time_layered
+    from sando_py.hgp import VoxelMap
+
+    p = _bench_params()
+    p.environment_assumption = "dynamic"
+    vm = VoxelMap.from_bounds((-5.0, 15.0), (-5.0, 5.0), (0.0, 4.0), res=0.3)
+    path = [np.array([float(x), float(y), 2.0]) for x, y in
+            [(0, 0), (2, 0.5), (4, -0.3), (6, 0.2), (8, 0)]]
+    polys = sfc_time_layered(
+        path, vm, [], p,
+        num_time_layers=5, dt_layer=0.05, t_now=0.0,
+    )
+    assert len(polys) == 5  # N_time
+    assert len(polys[0]) == len(path) - 1  # P_spatial
+
+
+def test_miqp_corridor_is_default_cpp_behaviour():
+    """Default corridor selection is C++-style MIQP."""
+    p = _bench_params()
+    assert p.use_miqp_corridor is True
     A = RobotState()
     A.setPos([0.0, 0.0, 2.0])
     path, polys = _path_polys()

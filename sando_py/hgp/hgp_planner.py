@@ -29,7 +29,115 @@ import numpy as np
 
 from sando_py.core import DynTraj, Parameters, RobotState
 
-from .astar import astar, simplify_path_los
+from .astar import astar, simplify_path_los, _line_clear_3d, Index
+
+
+def _remove_collinear(path: List["Index"]) -> List["Index"]:
+    """Strip strictly-collinear interior points. Port of C++
+    ``HGPPlanner::removeLinePts`` (hgp_planner.cpp). Geometric only —
+    safe in any heat configuration."""
+    if len(path) < 3:
+        return list(path)
+    out = [path[0]]
+    for i in range(1, len(path) - 1):
+        a = np.asarray(out[-1], dtype=float)
+        b = np.asarray(path[i], dtype=float)
+        c = np.asarray(path[i + 1], dtype=float)
+        if float(np.linalg.norm(b - a)) < 1e-9:
+            continue
+        u = b - a
+        v = c - b
+        # Cross product magnitude == 0 ⇔ collinear.
+        if float(np.linalg.norm(np.cross(u, v))) < 1e-9:
+            continue
+        out.append(path[i])
+    out.append(path[-1])
+    return out
+
+
+def _remove_corner_pts(path: List["Index"], vm: VoxelMap,
+                       w_heat: float = 0.0,
+                       peak_heat_relax: float = 0.5,
+                       los_cells: int = 0) -> List["Index"]:
+    """Cost-aware corner shortcut. Port of C++
+    ``HGPPlanner::removeCornerPts`` (hgp_planner.cpp:153-264).
+    Accepts a (prev → next) shortcut only when it isn't blocked and
+    the path cost (length + ``w_heat`` × heat-integral) doesn't
+    increase. With heat on, also rejects shortcuts that push the peak
+    heat above ``ref_peak * (1 + peak_heat_relax)``."""
+    if len(path) < 3:
+        return list(path)
+    has_heat = vm.heat is not None and w_heat > 0.0
+    res = float(vm.res)
+    ds = max(0.5 * res, 0.05)
+
+    def seg_cost_and_peak(a: "Index", b: "Index"):
+        if not _line_clear_3d(a, b, vm, los_cells):
+            return float("inf"), 0.0
+        ax, ay, az = a
+        bx, by, bz = b
+        # Geometric distance in world coordinates (cell-step * res).
+        L = float(np.linalg.norm(
+            np.array([bx - ax, by - ay, bz - az], dtype=float) * res
+        ))
+        if L < 1e-9:
+            return 0.0, 0.0
+        cost = L
+        peak = 0.0
+        if has_heat:
+            steps = int(np.ceil(L / ds)) + 1
+            ts = np.linspace(0.0, 1.0, steps, dtype=float)
+            for t in ts:
+                ix = int(round(ax + t * (bx - ax)))
+                iy = int(round(ay + t * (by - ay)))
+                iz = int(round(az + t * (bz - az)))
+                if 0 <= ix < vm.nx and 0 <= iy < vm.ny and 0 <= iz < vm.nz:
+                    h = float(vm.heat[ix, iy, iz])
+                    cost += w_heat * h * ds
+                    if h > peak:
+                        peak = h
+        return cost, peak
+
+    optimized = [path[0]]
+    prev = path[0]
+    cost1, peak1 = seg_cost_and_peak(path[0], path[1])
+
+    for i in range(1, len(path) - 1):
+        pose1 = path[i]
+        pose2 = path[i + 1]
+
+        cost2, peak2 = seg_cost_and_peak(pose1, pose2)
+        cost3, peak3 = seg_cost_and_peak(prev, pose2)
+
+        accept = cost3 < cost1 + cost2
+        if accept and has_heat:
+            ref_peak = max(peak1, peak2)
+            if peak3 > ref_peak * (1.0 + peak_heat_relax):
+                accept = False
+
+        if accept:
+            cost1, peak1 = cost3, peak3
+        else:
+            optimized.append(pose1)
+            prev = pose1
+            cost1, peak1 = cost2, peak2
+
+    optimized.append(path[-1])
+    return optimized
+
+
+def _clean_up_path(path: List["Index"], vm: VoxelMap,
+                   w_heat: float = 0.0) -> List["Index"]:
+    """Port of C++ ``HGPPlanner::cleanUpPath`` (hgp_planner.cpp:450-459):
+    remove strictly-collinear interior points, then run forward +
+    backward heat-aware corner shortcutting. The backward pass picks
+    up shortcut opportunities that the forward pass left behind."""
+    p = _remove_collinear(list(path))
+    p = _remove_corner_pts(p, vm, w_heat=w_heat)
+    p.reverse()
+    p = _remove_corner_pts(p, vm, w_heat=w_heat)
+    p.reverse()
+    return p
 from .heat_map import compute_dynamic_heat, compute_static_heat
 from .jps import jps
 from .voxel_map import VoxelMap
@@ -149,11 +257,31 @@ class HGPPlanner:
                 max_expansions=max_exp,
                 heat_weight=heat_w,
                 timeout_s=timeout_s,
+                allow_occupied=(
+                    mode == "astar_heat"
+                    and bool(self.params.use_soft_cost_obstacles)
+                ),
+                obstacle_soft_cost=float(self.params.obstacle_soft_cost or 0.0),
             )
         if idx_path is None:
             return None
 
-        smoothed = simplify_path_los(idx_path, vm)
+        # Path post-processing matches C++ ``HGPPlanner::cleanUpPath``
+        # behaviour by mode (hgp_planner.cpp:426-444). For sjps / sastar
+        # the C++ runs an explicit LOS shortcut chain. For astar_heat
+        # the C++ does ONLY ``removeLinePts`` + heat-aware
+        # ``removeCornerPts`` — never the geometric LOS pass. The Python
+        # default of ``simplify_path_los`` on every mode collapses
+        # heat-aware A* output to 2-3 waypoints, which then forces a
+        # 30 m+ boundary state on the local solver and produces
+        # infeasible MIQPs in dynamic-forest scenarios.
+        if mode in ("sjps", "sastar"):
+            smoothed = simplify_path_los(
+                idx_path, vm, int(self.params.los_cells or 0),
+            )
+        else:
+            heat_w = float(self.params.heat_weight or 0.0) if self._heat_enabled() else 0.0
+            smoothed = _clean_up_path(idx_path, vm, w_heat=heat_w)
         waypoints = [vm.idx_to_world(ix) for ix in smoothed]
 
         # Snap the endpoints to the exact start / goal so downstream code
@@ -287,3 +415,5 @@ class HGPPlanner:
         if after != before:
             vm._occ_version += 1
         return after - before
+
+
