@@ -481,6 +481,7 @@ class VoxelMapUtil:
             return
 
         dimX, dimY, dimZ = self.dim
+        dimX = int(dimX); dimY = int(dimY); dimZ = int(dimZ)
         Rm = self.static_heat_default_radius_m
         p = self.static_heat_p
         alpha = self.static_heat_alpha
@@ -494,47 +495,76 @@ class VoxelMapUtil:
         # boundary_only: keep seeds with at least one non-occupied 6-neighbor
         # 只留「边界种子」:六个直接邻居里至少有一个不是障碍(即障碍的外壳)。
         # 这样只在障碍表面往外铺热度,不浪费算力刷障碍内部。
+        # 向量化:把整张占据图 reshape 成 (dimZ,dimY,dimX)(lin=x+dimX*(y+dimY*z) → C-order),
+        # 对 6 个方向各做一次移位比较;越界 = 非 occ(算 boundary)。内部格 = 6 邻居全是
+        # 占据格;boundary = 自身占据且非内部。等价于原逐种子的「任一邻居非OCC或越界」。
         if self.static_heat_boundary_only and len(seed_idxs) > 0:
-            keep = []
-            for lin in seed_idxs:
-                ix = int(lin % dimX)
-                iy = int((lin // dimX) % dimY)
-                iz = int(lin // (dimX * dimY))
-                boundary = False
-                for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
-                    xx, yy, zz = ix + dx, iy + dy, iz + dz
-                    if not (0 <= xx < dimX and 0 <= yy < dimY and 0 <= zz < dimZ):
-                        boundary = True
-                        break
-                    if self.cmap[xx + dimX * (yy + dimY * zz)] != VAL_OCC:
-                        boundary = True
-                        break
-                if boundary:
-                    keep.append(lin)
-            seed_idxs = np.array(keep, dtype=np.int64) if keep else np.zeros(0, dtype=np.int64)
+            occ3d = (self.cmap == VAL_OCC).reshape(dimZ, dimY, dimX)
+            # 每个方向:邻居「在界内且为占据」的布尔体(越界 = False = 非 occ)
+            interior = occ3d.copy()
+            # +x / -x  (axis=2)
+            nb = np.zeros_like(occ3d); nb[:, :, :-1] = occ3d[:, :, 1:]   # +x neighbor
+            interior &= nb
+            nb = np.zeros_like(occ3d); nb[:, :, 1:] = occ3d[:, :, :-1]   # -x neighbor
+            interior &= nb
+            # +y / -y  (axis=1)
+            nb = np.zeros_like(occ3d); nb[:, :-1, :] = occ3d[:, 1:, :]   # +y neighbor
+            interior &= nb
+            nb = np.zeros_like(occ3d); nb[:, 1:, :] = occ3d[:, :-1, :]   # -y neighbor
+            interior &= nb
+            # +z / -z  (axis=0)
+            nb = np.zeros_like(occ3d); nb[:-1, :, :] = occ3d[1:, :, :]   # +z neighbor
+            interior &= nb
+            nb = np.zeros_like(occ3d); nb[1:, :, :] = occ3d[:-1, :, :]   # -z neighbor
+            interior &= nb
+            # boundary = 占据 且 不是内部;按 lin(C-order)展平后取与当前种子的交集
+            boundary_flat = (occ3d & ~interior).reshape(-1)
+            seed_idxs = seed_idxs[boundary_flat[seed_idxs]]
+            if seed_idxs.size == 0:
+                seed_idxs = np.zeros(0, dtype=np.int64)
+            else:
+                seed_idxs = seed_idxs.astype(np.int64)
 
-        for lin in seed_idxs:
-            ix = int(lin % dimX)
-            iy = int((lin // dimX) % dimY)
-            iz = int(lin // (dimX * dimY))
-            for dx, dy, dz, d_m in offsets:
-                if d_m > Rm:
+        if seed_idxs.size == 0:
+            return
+
+        # 种子三维坐标(向量化解 lin = x + dimX*(y + dimY*z))
+        s = seed_idxs.astype(np.int64)
+        sx = s % dimX
+        sy = (s // dimX) % dimY
+        sz = s // (dimX * dimY)
+
+        # 提前算好 apply_on_unknown / Hmax 标志,避免每个 offset 重复判断
+        apply_on_unknown = self.static_heat_apply_on_unknown
+        Hmax = self.static_heat_Hmax
+
+        # 对每个 offset(dx,dy,dz,d_m)整批种子算同一个 w(w 只取决于 d_m),
+        # 然后把候选热度散射进 self.heat 取最大(np.maximum.at 不会覆盖已有 dynamic heat)。
+        # 等价于原内层 if d_m>Rm: continue —— 这里直接跳过 d_m>Rm 的 offset。
+        for dx, dy, dz, d_m in offsets:
+            if d_m > Rm:
+                continue
+            # 距离越近热度越大((1-u)^p),封顶 Hmax;此 w 与种子无关,整批共用
+            u = d_m / Rm
+            w = alpha * (1.0 - u) ** p
+            if Hmax > 0:
+                w = min(w, Hmax)
+            # 目标格坐标 = 种子 + offset;越界则丢弃
+            xx = sx + dx
+            yy = sy + dy
+            zz = sz + dz
+            valid = (xx >= 0) & (xx < dimX) & (yy >= 0) & (yy < dimY) & (zz >= 0) & (zz < dimZ)
+            if not valid.any():
+                continue
+            tlin = (xx[valid] + dimX * (yy[valid] + dimY * zz[valid])).astype(np.int64)
+            # 默认允许往 UNKNOWN 格刷热度。原因(见文件顶 apply_on_unknown 注释):
+            # 这个 Python 地图不主动挖 free,障碍周边大多是 UNKNOWN,不允许就根本不显热
+            if not apply_on_unknown:
+                tlin = tlin[self.cmap[tlin] != VAL_UNK]
+                if tlin.size == 0:
                     continue
-                xx, yy, zz = ix + dx, iy + dy, iz + dz
-                if not (0 <= xx < dimX and 0 <= yy < dimY and 0 <= zz < dimZ):
-                    continue
-                tlin = xx + dimX * (yy + dimY * zz)
-                # 默认允许往 UNKNOWN 格刷热度。原因(见文件顶 apply_on_unknown 注释):
-                # 这个 Python 地图不主动挖 free,障碍周边大多是 UNKNOWN,不允许就根本不显热
-                if not self.static_heat_apply_on_unknown and self.cmap[tlin] == VAL_UNK:
-                    continue
-                # 距离越近热度越大((1-u)^p),封顶 Hmax;同一格取所有种子里的最大值
-                u = d_m / Rm
-                w = alpha * (1.0 - u) ** p
-                if self.static_heat_Hmax > 0:
-                    w = min(w, self.static_heat_Hmax)
-                if w > self.heat[tlin]:
-                    self.heat[tlin] = w
+            # 同一格取所有种子里的最大值,并与已有(dynamic)热度取 max;w 是标量 float64
+            np.maximum.at(self.heat, tlin, w)
 
     # ------------------------------------------------------------------
     # Ray-trace / line-of-sight
