@@ -5,3 +5,8 @@
 - [全局段测试清单](sando-rgbd-global-tests.md) — 2026-05-25:11 个测试文件覆盖哪段代码/验了什么/找修了 6 个 bug(91 项全绿)
 - [local_opt 第一版的 6 个 formulation bug + 5 步修复](sando-rgbd-localopt-issues.md) — 2026-05-28:LBFGS 卡的真根因(seed/自由度/soft vs hard/time scaling/finite-diff/feasibility 判据)+ 修复顺序
 - [local_opt Step 1 完整规格](sando-rgbd-localopt-step1-spec.md) — 2026-05-28:detour multi-start 拍板(4 方向/top-k=1/几何判定/feasible-first/perturb path 不 ctrl/sequential)
+- [核心创新定位 CLASP idea](sando-py-core-idea.md) — 2026-06-01:按类选避障机制(非权重)+ 物体类连续时间证书+可解释;主轴=机制选择;名字 TBD;★需升级成 conformal 不确定度证书才够顶会
+- [conformal 连续时间证书](sando-py-conformal-cert.md) — 2026-06-01:核心 novelty 升级;定理推通+合成验证(coverage 0.9008、比 union 紧 1.60x);sup-norm score 避 union bound;和 relative-traj bug 同一套数学
+- [sando-py sim2real 三大占位债](sando-py-sim2real-fakes.md) — 2026-06-01:class写死if / 匀速预测 / EKF降维丢信息,按优先级换真感知
+- [墙表示决策 ESDF/SFC](sando-py-esdf-sfc-decision.md) — 2026-06-01:SFC 不用;ESDF 不是现在;局部墙现是解析盒非体素;sim2real 选 ESDF vs ESDF-free
+- [顶会防御地图](sando-py-defense-map.md) — 2026-06-01:命脉=零benchmark对走廊+确定性证书假装预测准;三波(管嘴→做表→上机);per-point 高速假阴性 bug ✅已修
