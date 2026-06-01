@@ -1,3 +1,7 @@
+# 中文说明:这是 ROS 2 / Python 包的安装脚本(ament_python 风格)。它告诉 colcon:
+#   有哪些 Python 子包要安装、哪些资源文件(launch/*.py、config 里的 yaml 和 rviz)要拷到
+#   share 目录,以及把哪些函数注册成可执行节点(下面的 console_scripts,就是 `ros2 run` /
+#   launch 里 executable= 能用的那些名字)。改了节点入口或新增 launch/config,通常要回来动这里。
 from setuptools import setup
 from glob import glob
 import os
@@ -13,6 +17,8 @@ setup(
         f"{package_name}.local",
         f"{package_name}.nodes",
     ],
+    # 中文:要随包安装到 share 目录的非代码文件——ament 索引登记、package.xml、
+    #       所有 launch 脚本、以及 config 下的 yaml 配置和 rviz 布局。
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
@@ -27,6 +33,8 @@ setup(
     description="Python reproduction of SANDO (planner core + ROS I/O).",
     license="BSD-3-Clause",
     tests_require=["pytest"],
+    # 中文:把这些 "可执行名 = 模块:函数" 注册成命令行入口。这就是 launch 文件里
+    #       executable="sando_node"/"fake_sim"/"perclass_obstacle_pub" 等能对应上的来源。
     entry_points={
         "console_scripts": [
             "sando_node = sando_py.nodes.sando_node:main",
