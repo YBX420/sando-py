@@ -146,6 +146,14 @@ mammoth 上有同名计划 [[sando-rgbd-plan-v2]] + 更全的旧背景 memory。
 - **detour 回落**:RT 路径 `plan_local_trajectory_minco` 先单种子(detour off,~30ms);**若 trajectory_valid=False 再回落 detour 多起点**(慢但稀有,救难场景)——既保 demo 快又过 stage5 回归(纯关 detour 会让某些场景返 False)。
 - **commit 调参在 launch**:`k_value_factor`/`default_k_value`;人速在 `perclass_obstacle_pub` 的 `human_amp`/`human_period`。改 Python 必 `colcon build --packages-select sando_py` 再 source。
 
+### Stage 5 收尾决策 + sim2real 定向 ✅ 2026-06-01(会话,非 workflow 实现;ESDF/SFC 经 5 路对抗 workflow)
+- **sim2real 主线确认(用户拍板)**:墙最终一定来自真实 RGBD 增量建图 = 任意占据体素,**不可能是规整盒子**。现在 demo 的盒子/class写死/匀速预测都是通往 sim2real 的占位债。「完全真实」= sim2real 的终极形态。
+- **提速 ✅(逐位等价,已落地)**:`voxel_map._compose_static_heat` 纯 Python 双重循环 → 向量化(种子集 + boundary 6邻居移位 + offset 整批 np.maximum.at 散射)。**88ms→19ms(真实图),隔离 8–11x**。独立 verify 用 `git show HEAD` 旧实现当 ground truth,56 配置 + 红队边界**逐位对照 max_abs_diff=0**(非 <1e-12,是 0)、0 回归(stage1 16/16 + stress 8/8 + dynamic_astar 4/4)。改动只在一个函数。剩 ~占据/静态热度重建仍可压。
+- **★ 认知纠正(我一度搞错,红队 + 核代码推翻)**:局部优化器躲的墙现在是 **DynTraj 解析盒** `AABBObstacle`(planner.py:1184,lo=c-0.5sz hi=c+0.5sz),**不是 RGBD 体素**;体素 cmap 只喂全局 heat-A*,两条独立数据链中间没桥。「给局部软墙喂体素 ESDF」现在没接口。
+- **★ 三大占位债(真正在造假,按该先修顺序,均核代码,用户点名记)**:① **class 源写死 if**(planner.py:730-731,`id∈[200,300)` 判人墙)= per-class 卖点地基,审稿人一眼看穿「分类器是个 if」;② **匀速直线预测**(obstacles.py:67)= 「在正确时刻躲人」物理前提造假;③ **EKF 接口降维**(planner.py:733 只取瞬时 vel,丢 tracker 9D CA 的加速度+5次多项式)= 写了真东西又在接口扔了。顺序 = class 源 → 人预测/EKF → 墙表示。详见 memory [[sando-py-sim2real-fakes]]。
+- **ESDF/SFC 定论**(详见 memory [[sando-py-esdf-sfc-decision]]):**SFC 不用**——但否定理由要换:别用「整数不可微」(只否 MIQP,否不掉走廊定好后凸可微的纯 SFC),真理由是「砸 per-class 软场一极→退化成软硬=weight」+ paper 须正面回应「SFC 仍是静态墙 SOTA 主流(GCOPTER/FASTER/GCS)」。**ESDF 不是现在**:AABB 盒外已精确欧氏距离+光滑梯度(只盒内 L∞ 次梯度糙、收敛态不进墙)、地图每拍重建「只算一次」不成立、引第二套距离表示。墙若抖最小修法是 soft-min 解析光滑化(非 ESDF)。sim2real 接体素后真问题 = **ESDF vs ESDF-free(EGO v2)二选一**(workflow wf_9649c419 深挖中)。
+- **★ sim2real 洞察(化解红队「砸统一框架」攻击)**:真实感知栈天然两条流——人=检测/分割的「物体」(解析球/凸包+硬约束)、墙=RGBD 稠密「环境」(体素→场+软)。所以「墙吃体素、人吃解析」两套表示**有语义依据**(物体 vs 环境),正好长在 per-class(人硬墙软)上,反而是卖点的物理依据,不是缝合怪。
+
 ### Learning 提速定位(2026-05-29 用户拍板纳入路线图,deploy 阶段可选 Stage)
 - **做法**:learned **warm-start**——网络输入(粗路+障碍+类别)→ 输出近最优 `q,T` 初值,优化器从好起点出发收敛步数砍 5-10×。**优化器(MINCO+ALM)一字不改、当 certifier 保留**:还输出连续时间证书/λ/STOP,安全完全不依赖网络。零可解释损失。可选再加"学往哪边绕(拓扑/seed 选择)"省多 seed ~5×(略灰但仍可解释)。
 - **不做**:端到端神经网络直接吐轨迹(丢 λ/证书/STOP = 丢可解释卖点+人硬约束安全保证,❌不当主线)。
