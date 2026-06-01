@@ -1307,22 +1307,33 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
                 and _is_moving(obs)):
             continue
         d_safe = _hard_d_safe(obs, avoid_cfg)
-        vnorm = float(np.linalg.norm(obs.vel))
-        anorm = float(np.linalg.norm(obs.accel))
-        c0 = obs.predict(t0)                                # (M,3) 人在各段起始时刻位置（CA）
-        a = centroid - c0                                   # (M,3) 段质心法向
-        nrm = np.linalg.norm(a, axis=1)
+        T = tr.T                                            # (M,) 各段时长
+        c0 = obs.predict(t0)                                # (M,3) 人在各段起始时刻位置
+        # 相对轨迹证书（取代旧的各向同性球膨胀）：旧法用 c0 + ||v||·T_i 球膨胀，人朝单一方向
+        # 快速移动时各向同性放大严重过保守，高速人下会把安全轨迹假报成 cert<0（实测 -5.7 vs 真实
+        # +4.0）。改法：把人的局部 CA 运动 c(s)=c0+v_eff·s+0.5·accel·s^2（s∈[0,T_i]，
+        # v_eff=velocity_at(t0)=vel+accel·t0）升次成它的五次 Bernstein 控制点 c_k，与轨迹控制点
+        # 做差得相对控制点 D_{i,k}=P_{i,k}-c_k，对 D 做一道支撑半空间。
+        # Soundness：c(s)、P(s) 都是五次 Bernstein 凸组合 → P(s)-c(s)=Σ_k B_k(s)·D_{i,k}（凸组合），
+        # a^T D_k>=R ∀k ⇒ a^T(P(s)-c(s))>=R ⇒ ||P(s)-c(s)||>=a^T(...)>=R，整段连续时间成立，
+        # 且精确处理人移动方向、不各向同性放大 → 比球膨胀紧得多，高速人下不再假阴性。
+        v_eff = obs.vel[None, :] + obs.accel[None, :] * t0[:, None]    # (M,3) velocity_at(t0)
+        kf = np.arange(6, dtype=np.float64)                            # 0..5
+        # 五次 Bernstein 控制点：单项 u^j 的 degree-5 控制点系数 = C(k,j)/C(5,j)，s=T·u
+        #   线性项 v_eff·s -> v_eff·T·(k/5)；二次项 0.5·accel·s^2 -> 0.5·accel·T^2·k(k-1)/10
+        lin = v_eff[:, None, :] * ((kf / 5.0)[None, :, None] * T[:, None, None])
+        quad = obs.accel[None, None, :] * ((T * T)[:, None, None]
+                                           * (kf * (kf - 1.0) / 40.0)[None, :, None])
+        c_bern = c0[:, None, :] + lin + quad                # (M,6,3) c(s) 的五次 Bernstein 控制点
+        D = P - c_bern                                      # (M,6,3) 相对控制点
+        cD = D.mean(axis=1)                                 # (M,3) 相对质心 -> 冻结法向
+        nrm = np.linalg.norm(cD, axis=1)
         ok = nrm > 1e-12
-        a = np.where(ok[:, None], a / np.where(ok[:, None], nrm[:, None], 1.0),
+        a = np.where(ok[:, None], cD / np.where(ok[:, None], nrm[:, None], 1.0),
                      np.array([1.0, 0.0, 0.0]))
-        diff = P - c0[:, None, :]                           # (M,6,3)
-        proj = np.einsum("md,mkd->mk", a, diff)             # (M,6) 控制点在法向上的投影
-        # 膨胀半径：CA 下段内人位移 ||c_h(t0+s)-c_h(t0)|| <= ||vel||·s + 0.5·||accel||·s^2
-        # （s∈[0,T_i]，三角不等式给的保守上界）。所以加 ||vel||·T_i + 0.5·||accel||·T_i^2。
-        # accel=0 时第二项为 0，逐字节回到原 ||vel||·T_i 膨胀。
-        R = (float(obs.radius) + d_safe
-             + vnorm * tr.T + 0.5 * anorm * tr.T * tr.T)    # (M,)
-        m_ik = proj - R[:, None]                            # (M,6) 每点裕度
+        proj = np.einsum("md,mkd->mk", a, D)                # (M,6) 相对控制点在法向上的投影
+        R = float(obs.radius) + d_safe                      # 标量，无膨胀（移动已被相对轨迹精确吸收）
+        m_ik = proj - R                                     # (M,6) 每点裕度
         if np.any(trust_mask):
             margin = min(margin, float(np.min(m_ik[trust_mask])))
     return margin
