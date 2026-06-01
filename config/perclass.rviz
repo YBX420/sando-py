@@ -1,0 +1,70 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Plane Cell Count: 20
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: CommittedTraj
+      Enabled: true
+      Topic:
+        Value: /NX01/traj_committed_colored
+        Depth: 10
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: GlobalPath
+      Enabled: true
+      Topic:
+        Value: /NX01/hgp_path_marker
+        Depth: 10
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: PerClassObstacles
+      Enabled: true
+      Topic:
+        Value: /NX01/perclass_obstacles
+        Depth: 10
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Marker
+      Name: Drone
+      Enabled: true
+      Topic:
+        Value: /NX01/drone_marker
+        Depth: 10
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/PointStamped
+      Name: TermGoal
+      Enabled: true
+      Color: 25; 255; 0
+      Topic:
+        Value: /NX01/point_G_term
+        Depth: 10
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/PointStamped
+      Name: CurrentState
+      Enabled: true
+      Color: 255; 255; 0
+      Topic:
+        Value: /NX01/point_current_state
+        Depth: 10
+        Reliability Policy: Reliable
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 14.0
+      Focal Point:
+        X: 5.0
+        Y: 0.0
+        Z: 1.5
+      Pitch: 0.6
+      Yaw: 0.8
