@@ -1,0 +1,7 @@
+- [说人话](feedback-plain-language.md) — 回答要口语清楚、用词简单,别堆术语和复杂书面句
+- [先穷举 formulation bug 再换算法](feedback-rootcause-first.md) — debug 时先穷举设计层 bug,别一上来贴"算法局部最优"标签跳 paper 方案
+- [要的测试风格](feedback-test-style.md) — 压力测试+真实环境+严格判据(对最优/不变量/回归),不要抽查;标准是"对/最好"不是"和 C++ 一样"
+- [sando-rgbd 定版计划](sando-rgbd-plan.md) — 2026-05-25:弃 Gurobi/MIQP/走廊,改 B-spline+梯度 per-class 软硬场;按管道分阶段构建+验证
+- [全局段测试清单](sando-rgbd-global-tests.md) — 2026-05-25:11 个测试文件覆盖哪段代码/验了什么/找修了 6 个 bug(91 项全绿)
+- [local_opt 第一版的 6 个 formulation bug + 5 步修复](sando-rgbd-localopt-issues.md) — 2026-05-28:LBFGS 卡的真根因(seed/自由度/soft vs hard/time scaling/finite-diff/feasibility 判据)+ 修复顺序
+- [local_opt Step 1 完整规格](sando-rgbd-localopt-step1-spec.md) — 2026-05-28:detour multi-start 拍板(4 方向/top-k=1/几何判定/feasible-first/perturb path 不 ctrl/sequential)
