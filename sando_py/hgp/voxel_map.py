@@ -334,33 +334,46 @@ class VoxelMapUtil:
 
             samples_k = self.dyn_pred_samples[k] if (self.dyn_pred_samples is not None and k < len(self.dyn_pred_samples)) else None
 
-            for iz in range(z0, z1 + 1):
-                for iy in range(y0, y1 + 1):
-                    for ix in range(x0, x1 + 1):
-                        lin = ix + dimX * (iy + dimY * iz)
-                        if self.cmap[lin] > VAL_FREE and not self.use_soft_cost_obstacles:
-                            continue
-                        cell = self.int_to_float(np.array([ix, iy, iz]))
-                        # Distance to AABB
-                        diff = np.maximum(np.abs(cell - ck) - hk, 0.0)
-                        d_box = float(np.linalg.norm(diff))
-                        Hbase = 0.0
-                        if d_box <= Rreach:
-                            u = min(d_box / Rreach, 1.0)
-                            Hbase = self.heat_alpha0 * (1.0 - u) ** p
-                        tube_max = 0.0
-                        for j, (tj, Rj, wj) in enumerate(zip(times, Rs, weights)):
-                            cj = samples_k[j] if (samples_k is not None and j < len(samples_k)) else ck
-                            diff_j = np.maximum(np.abs(cell - cj) - hk, 0.0)
-                            d_j = float(np.linalg.norm(diff_j))
-                            if d_j <= Rj:
-                                uj = min(d_j / Rj, 1.0)
-                                tube_max = max(tube_max, wj * (1.0 - uj) ** q)
-                        Hk = Hbase + self.heat_alpha1 * tube_max
-                        if self.heat_Hmax > 0:
-                            Hk = min(Hk, self.heat_Hmax)
-                        if Hk > self.heat[lin]:
-                            self.heat[lin] = Hk
+            if x1 < x0 or y1 < y0 or z1 < z0:
+                continue
+            # Vectorised over the region AABB (was a Python triple-loop -> seconds
+            # for big/fast obstacles whose reach covers most of the grid). Same
+            # math, same int_to_float cell centres -> numerically equivalent.
+            axs = (np.arange(x0, x1 + 1) + 0.5) * self.res + self.origin[0]
+            ays = (np.arange(y0, y1 + 1) + 0.5) * self.res + self.origin[1]
+            azs = (np.arange(z0, z1 + 1) + 0.5) * self.res + self.origin[2]
+            CX, CY, CZ = np.meshgrid(axs, ays, azs, indexing="ij")
+            # base reachability blob: distance from cell to the obstacle AABB
+            dx = np.maximum(np.abs(CX - ck[0]) - hk[0], 0.0)
+            dy = np.maximum(np.abs(CY - ck[1]) - hk[1], 0.0)
+            dz = np.maximum(np.abs(CZ - ck[2]) - hk[2], 0.0)
+            d_box = np.sqrt(dx * dx + dy * dy + dz * dz)
+            Hbase = np.where(d_box <= Rreach,
+                             self.heat_alpha0 * (1.0 - np.minimum(d_box / Rreach, 1.0)) ** p,
+                             0.0)
+            # trajectory tube: max over predicted time samples
+            tube_max = np.zeros_like(d_box)
+            for j, (tj, Rj, wj) in enumerate(zip(times, Rs, weights)):
+                cj = samples_k[j] if (samples_k is not None and j < len(samples_k)) else ck
+                cj = np.asarray(cj, dtype=np.float64)
+                ex = np.maximum(np.abs(CX - cj[0]) - hk[0], 0.0)
+                ey = np.maximum(np.abs(CY - cj[1]) - hk[1], 0.0)
+                ez = np.maximum(np.abs(CZ - cj[2]) - hk[2], 0.0)
+                d_j = np.sqrt(ex * ex + ey * ey + ez * ez)
+                contrib = np.where(d_j <= Rj,
+                                   wj * (1.0 - np.minimum(d_j / Rj, 1.0)) ** q, 0.0)
+                tube_max = np.maximum(tube_max, contrib)
+            Hk = Hbase + self.heat_alpha1 * tube_max
+            if self.heat_Hmax > 0:
+                Hk = np.minimum(Hk, self.heat_Hmax)
+            IX, IY, IZ = np.meshgrid(np.arange(x0, x1 + 1), np.arange(y0, y1 + 1),
+                                     np.arange(z0, z1 + 1), indexing="ij")
+            lin = (IX + dimX * (IY + dimY * IZ)).ravel()
+            Hk_flat = Hk.ravel()
+            if not self.use_soft_cost_obstacles:
+                # original skipped occupied cells entirely; heat>=0 so max-with-0 is a no-op
+                Hk_flat = np.where(self.cmap[lin] > VAL_FREE, 0.0, Hk_flat)
+            np.maximum.at(self.heat, lin, Hk_flat)
 
     def _compose_static_heat(self):
         if self.heat.size == 0:
