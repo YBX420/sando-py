@@ -307,6 +307,8 @@ class SANDO:
         self.obst_bbox: List[np.ndarray] = []
         self.obst_class: List[str] = []          # per-class tag, parallel to obst_pos
         self.obst_vel: List[np.ndarray] = []      # current obstacle velocity, parallel
+        # obst_accel=当前加速度(给会动的人做 CA 匀加速时空预测;静止/匀速时为 0)
+        self.obst_accel: List[np.ndarray] = []    # current obstacle acceleration, parallel
         self.traj_max_time = 0.0
 
         # Yawing state
@@ -715,6 +717,7 @@ class SANDO:
         # SphereObstacle -> genuine dynamic, space-time avoidance).
         obst_class: List[str] = []
         obst_vel: List[np.ndarray] = []
+        obst_accel: List[np.ndarray] = []
         selected: List[DynTraj] = []
         for traj in local_trajs:
             p = traj.eval(current_time)
@@ -734,6 +737,13 @@ class SANDO:
             except Exception:
                 v = np.zeros(3)
             obst_vel.append(v)
+            # CA 时空预测用的加速度:和 vel 取同一时刻 current_time(SphereObstacle 局部 t=0
+            # 对齐 current_time)。取不到就退回 0(等价于匀速 CV)。
+            try:
+                acc = np.asarray(traj.accel(current_time), dtype=float).reshape(3)
+            except Exception:
+                acc = np.zeros(3)
+            obst_accel.append(acc)
             selected.append(traj)
 
         with self._mtx:
@@ -741,6 +751,7 @@ class SANDO:
             self.obst_bbox = [b.copy() for b in obst_bbox]
             self.obst_class = list(obst_class)
             self.obst_vel = [v.copy() for v in obst_vel]
+            self.obst_accel = [a.copy() for a in obst_accel]
 
         # 中文:预测时域 Th = 最坏轨迹时长 x 最大缩放因子(即"这条轨迹最久可能飞多久")。
         Th = self.worst_traj_time * (self.factors[-1] if self.factors else 1.0)
@@ -1153,7 +1164,8 @@ class SANDO:
     # ------------------------------------------------------------------
     # MINCO local solve (per-class avoidance) — additive replacement body
     # ------------------------------------------------------------------
-    def _obstacles_from_snapshot(self, obst_pos, obst_bbox, obst_class=None, obst_vel=None):
+    def _obstacles_from_snapshot(self, obst_pos, obst_bbox, obst_class=None,
+                                 obst_vel=None, obst_accel=None):
         """Class source hook: map the obstacle snapshot to per-class avoidance
         obstacles for plan_minco. obst_class[k] in {'human','wall'} decides the
         MECHANISM (the per-class point): human -> SphereObstacle (HARD, carries
@@ -1163,6 +1175,8 @@ class SANDO:
         The class tag is currently keyed on the DynTraj id range upstream
         (_compute_obst_pos_and_traj_max_time); a real RGBD/tracker classifier
         swaps in there. Missing tag -> 'human'/HARD (fail-safe), missing vel -> 0.
+        obst_accel[k] -> the human's current acceleration for the CA (constant-
+        acceleration) space-time prediction; missing -> 0 (falls back to CV).
 
         obst_pos[k] = (3,) box CENTER; obst_bbox[k] = (3,) FULL box extents.
 
@@ -1176,6 +1190,7 @@ class SANDO:
         n = len(obst_pos)
         classes = list(obst_class) if obst_class is not None else []
         vels = list(obst_vel) if obst_vel is not None else []
+        accels = list(obst_accel) if obst_accel is not None else []
         obstacles = []
         for k in range(n):
             c = np.asarray(obst_pos[k], dtype=np.float64).copy()
@@ -1187,9 +1202,12 @@ class SANDO:
             else:
                 vel = (np.asarray(vels[k], dtype=np.float64).reshape(3)
                        if k < len(vels) else np.zeros(3))
+                # CA: 给会动的人传当前加速度,做匀加速时空预测;拿不到就当 0(退回匀速 CV)
+                acc = (np.asarray(accels[k], dtype=np.float64).reshape(3)
+                       if k < len(accels) else np.zeros(3))
                 obstacles.append(SphereObstacle(
                     centre0=c, radius=0.5 * float(np.max(sz)),
-                    vel=vel, class_name="human"))
+                    vel=vel, accel=acc, class_name="human"))
         avoid_cfg = _avoid_default_config()
         return obstacles, avoid_cfg
 
@@ -1243,9 +1261,10 @@ class SANDO:
             obst_bbox = [b.copy() for b in self.obst_bbox]
             obst_class = list(self.obst_class)
             obst_vel = [v.copy() for v in self.obst_vel]
+            obst_accel = [a.copy() for a in self.obst_accel]
 
         obstacles, avoid_cfg = self._obstacles_from_snapshot(
-            obst_pos, obst_bbox, obst_class, obst_vel)
+            obst_pos, obst_bbox, obst_class, obst_vel, obst_accel)
 
         # 中文:轨迹起点的初始速度/加速度(让新轨迹和飞机当前运动平滑衔接),以及当种子的折线。
         v0 = local_A.vel.copy()

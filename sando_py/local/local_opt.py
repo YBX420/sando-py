@@ -584,14 +584,15 @@ def _signed_dist_and_grad(obs, p: np.ndarray, t: float):
     AABB outside: d=||outside_vec||, dd/dp = outside_vec/||outside_vec|| (static, dd/dt=0).
     AABB inside : d = L∞ penetration (negative); subgradient ±e on the active axis.
     Caller must keep samples off the kinks (||p-c||=0, ||outside||=0, AABB face/interior)."""
-    # 球体（可能在动）：d = ||p - c(t)|| - r，c(t) = 初始中心 + 速度·t
+    # 球体（可能在动）：d = ||p - c(t)|| - r，c(t) = predict(t)（CA：centre0+vel·t+0.5·accel·t^2）
     if hasattr(obs, "centre0"):  # SphereObstacle
-        c = obs.centre0 + obs.vel * float(t)
+        c = obs.predict(float(t))
         diff = np.asarray(p, dtype=np.float64) - c
         nrm = float(np.linalg.norm(diff))
         n = diff / nrm                 # 单位外法向，也是 dd/dp
         d = nrm - obs.radius
-        dd_dt = -float(n.dot(obs.vel))  # 障碍在动 -> 距离随时间的变化率
+        # 障碍在动 -> 距离随时间的变化率，用瞬时速度 velocity_at(t)=vel+accel·t（CA）
+        dd_dt = -float(n.dot(obs.velocity_at(float(t))))
         return d, n, dd_dt
     # 长方体 AABB（静止 -> dd/dt = 0）
     p = np.asarray(p, dtype=np.float64)
@@ -745,13 +746,18 @@ def _signed_dist_and_grad_batch(obs, P: np.ndarray, t_abs: np.ndarray):
     falls back to the per-point scalar routine (rare, cheap)."""
     P = np.asarray(P, dtype=np.float64)
     k = P.shape[0]
-    if hasattr(obs, "centre0"):  # sphere (possibly moving)
-        c = obs.centre0[None, :] + obs.vel[None, :] * t_abs[:, None]  # (κ,3)
+    if hasattr(obs, "centre0"):  # sphere (possibly moving, CA model)
+        c = obs.predict(t_abs)                                        # (κ,3) centre0+vel·t+0.5·accel·t^2
         diff = P - c
         nrm = np.linalg.norm(diff, axis=1)                            # (κ,)
         n = diff / nrm[:, None]
         d = nrm - obs.radius
-        dd_dt = -(n @ obs.vel)                                        # (κ,)
+        # dd/dt = -n·velocity_at(t)。accel=0 时瞬时速度退回常数 vel，走原来的 n@vel
+        # （BLAS 同一算法，逐字节回退）；accel≠0 时瞬时速度逐点变化，逐点点积。
+        if not np.any(obs.accel):
+            dd_dt = -(n @ obs.vel)                                    # (κ,) CV 回退
+        else:
+            dd_dt = -np.einsum("kd,kd->k", n, obs.velocity_at(t_abs))  # (κ,) CA
         return d, n, dd_dt
     # AABB (static): vectorised over the k samples, same math as the scalar path.
     lo = obs.lo[None, :]; hi = obs.hi[None, :]
@@ -885,8 +891,14 @@ def _is_moving(obs) -> bool:
     True for a sphere-human with nonzero CV velocity. This is the GATE that
     keeps STATIC humans byte-identical to Stage 3: the per-(i,k) space-time
     normal differs geometrically from the centroid normal even at vel=0, so a
-    static human MUST run the old single-time centroid path."""
-    return hasattr(obs, "centre0") and float(np.linalg.norm(obs.vel)) > 0.0
+    static human MUST run the old single-time centroid path.
+
+    CA upgrade: a human with nonzero accel (even if vel==0) is moving, so the
+    gate also fires on ||accel||>0. vel==0 AND accel==0 -> False (static human
+    stays byte-identical to Stage 3)."""
+    return (hasattr(obs, "centre0")
+            and (float(np.linalg.norm(obs.vel)) > 0.0
+                 or float(np.linalg.norm(obs.accel)) > 0.0))
 
 
 def _trust_mask(tr: MinjerkTraj, opt: OptParams) -> np.ndarray:
@@ -941,12 +953,12 @@ def _seg_normals(tr: MinjerkTraj, hard_obs, P=None, opt: OptParams = None):
     fallback = np.array([1.0, 0.0, 0.0])     # 法向退化（人正好压在点上）时的兜底方向
     for h, obs in enumerate(hard_obs):
         if spacetime and _is_moving(obs):
-            # 会动的人：每个控制点按它自己的墙上时刻 t_{i,k} 定位人
-            c = obs.centre0[None, None, :] + obs.vel[None, None, :] * t_pt[:, :, None]
+            # 会动的人：每个控制点按它自己的墙上时刻 t_{i,k} 定位人（CA: predict(t)）
+            c = obs.predict(t_pt)                             # (M,6,3)
             a = P - c                                        # (M,6,3)
         else:
             if hasattr(obs, "centre0"):
-                c = obs.centre0[None, :] + obs.vel[None, :] * t_rep[:, None]  # (M,3)
+                c = obs.predict(t_rep)                        # (M,3) CA: centre0+vel·t+0.5·accel·t^2
             else:
                 c = np.broadcast_to(0.5 * (obs.lo + obs.hi), (M, 3))   # 墙(AABB)取中心
             a_seg = centroid - c                             # (M,3) 每段一个质心法向
@@ -1017,14 +1029,12 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
             R = float(obs.radius) + d_safe             # 要躲开的有效半径 = 球半径 + 安全距离
             moving_st = spacetime and _is_moving(obs)
             if moving_st:
-                # 会动的人：每个控制点用自己的时刻定位人（S4a）
-                c = (obs.centre0[None, None, :]
-                     + obs.vel[None, None, :] * t_pt[:, :, None])    # (M,6,3)
+                # 会动的人：每个控制点用自己的时刻定位人（S4a，CA: predict(t)）
+                c = obs.predict(t_pt)                              # (M,6,3)
             else:
-                # Stage 3：所有控制点共用「段末」单一时刻
+                # Stage 3：所有控制点共用「段末」单一时刻（CA: predict(t_rep)）
                 c = np.broadcast_to(
-                    (obs.centre0[None, :] + obs.vel[None, :] * t_rep[:, None])[:, None, :],
-                    (M, 6, 3))
+                    obs.predict(t_rep)[:, None, :], (M, 6, 3))
             a = normals[:, :, h, :]                    # (M,6,3) 冻结的法向
             diff = P - c                               # (M,6,3)
             proj = np.einsum("mkd,mkd->mk", a, diff)   # a^T(P-c)：控制点在法向上离人多远
@@ -1035,8 +1045,13 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
             dist[idx] = dist_h
             Rarr[idx] = R
             if moving_st:
-                # 会动的人才有：g 对墙上时刻的导数 dg/dt_{i,k} = +a·vel（正号，和 dL/dP 相反）
-                dgdt[idx] = np.einsum("mkd,d->mk", a, obs.vel)
+                # 会动的人才有：g 对墙上时刻的导数 dg/dt_{i,k} = +a·velocity_at(t_{i,k})
+                # （正号，和 dL/dP 相反）。CA 下瞬时速度 vel+accel·t 逐控制点变化；
+                # accel=0 时 velocity_at 退回常数 vel，逐字节回到 a·vel。
+                if not np.any(obs.accel):
+                    dgdt[idx] = np.einsum("mkd,d->mk", a, obs.vel)        # CV 回退
+                else:
+                    dgdt[idx] = np.einsum("mkd,mkd->mk", a, obs.velocity_at(t_pt))  # CA
                 # S4b 信任掩码：优先用「冻结的」掩码，这样某点在内层迭代中跨过 tau_trust 时
                 # 不会在硬/软之间来回切换（保证内层代价光滑，硬约束集合只在外层之间变）。
                 # 只有在没传冻结掩码（T 固定的场景）时，才退而用当前 T 算的掩码。
@@ -1293,7 +1308,8 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
             continue
         d_safe = _hard_d_safe(obs, avoid_cfg)
         vnorm = float(np.linalg.norm(obs.vel))
-        c0 = obs.centre0[None, :] + obs.vel[None, :] * t0[:, None]   # (M,3) 人在各段起始时刻位置
+        anorm = float(np.linalg.norm(obs.accel))
+        c0 = obs.predict(t0)                                # (M,3) 人在各段起始时刻位置（CA）
         a = centroid - c0                                   # (M,3) 段质心法向
         nrm = np.linalg.norm(a, axis=1)
         ok = nrm > 1e-12
@@ -1301,7 +1317,11 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
                      np.array([1.0, 0.0, 0.0]))
         diff = P - c0[:, None, :]                           # (M,6,3)
         proj = np.einsum("md,mkd->mk", a, diff)             # (M,6) 控制点在法向上的投影
-        R = float(obs.radius) + d_safe + vnorm * tr.T       # (M,) 膨胀半径：再加 ||v||·T_i
+        # 膨胀半径：CA 下段内人位移 ||c_h(t0+s)-c_h(t0)|| <= ||vel||·s + 0.5·||accel||·s^2
+        # （s∈[0,T_i]，三角不等式给的保守上界）。所以加 ||vel||·T_i + 0.5·||accel||·T_i^2。
+        # accel=0 时第二项为 0，逐字节回到原 ||vel||·T_i 膨胀。
+        R = (float(obs.radius) + d_safe
+             + vnorm * tr.T + 0.5 * anorm * tr.T * tr.T)    # (M,)
         m_ik = proj - R[:, None]                            # (M,6) 每点裕度
         if np.any(trust_mask):
             margin = min(margin, float(np.min(m_ik[trust_mask])))

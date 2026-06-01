@@ -46,29 +46,50 @@ class Obstacle:
 
 
 class SphereObstacle(Obstacle):
-    """Sphere with optional constant linear velocity (linear extrapolation).
+    """Sphere with optional constant-acceleration (CA) motion model.
 
-    centre(t) = centre0 + vel * t
-    signed_dist = ||p - centre(t)|| - radius
+    centre(t)      = centre0 + vel * t + 0.5 * accel * t^2
+    velocity_at(t) = vel + accel * t
+    signed_dist    = ||p - centre(t)|| - radius
 
-    球障碍 (用来表示"人"),可带一个匀速速度。
-    预测很简单——假设它一直匀速直线走:t 时刻的球心 = 初始球心 + 速度 * t。
+    球障碍 (用来表示"人"),带一个匀加速 (CA) 运动模型。
+    预测:t 时刻的球心 = 初始球心 + 速度*t + 0.5*加速度*t^2(EKF 的匀加速外推)。
+    瞬时速度 (梯度链用):velocity_at(t) = 速度 + 加速度*t —— 注意它不再是常数。
     带符号距离 = 点到 (移动后) 球心的距离 - 半径。
+
+    向后兼容:accel 默认 zeros(3);accel=0 时 predict/velocity_at 逐位回退到原匀速
+    实现 (centre0+vel*t / vel),与历史的匀速 (CV) 约定逐字节一致。
+    t 可以是标量或 numpy 数组,predict/velocity_at 都会对 t 正确广播。
+    注意:accel 放在 class_name 之后,保留历史 (centre0, radius, vel, class_name)
+    的位置参数顺序——旧的位置调用 SphereObstacle(c, r, vel, class_name) 不破坏;
+    新代码用关键字 accel= 传加速度。
     """
 
-    def __init__(self, centre0, radius: float, vel=None, class_name: str = "human"):
+    def __init__(self, centre0, radius: float, vel=None,
+                 class_name: str = "human", accel=None):
         self.centre0 = np.asarray(centre0, dtype=np.float64).reshape(3)
         self.radius = float(radius)
         self.vel = (np.zeros(3, dtype=np.float64) if vel is None
                     else np.asarray(vel, dtype=np.float64).reshape(3))
+        self.accel = (np.zeros(3, dtype=np.float64) if accel is None
+                      else np.asarray(accel, dtype=np.float64).reshape(3))
         self.class_name = class_name
 
-    # 匀速外推:t 时刻球心 = 初始球心 + 速度*t
-    def predict(self, t: float) -> np.ndarray:
-        return self.centre0 + self.vel * float(t)
+    # 匀加速外推:t 时刻球心 = 初始球心 + 速度*t + 0.5*加速度*t^2。
+    # t 可为标量(返回 (3,))或数组(返回 (...,3),最后一维是 xyz)。accel=0 时等于 centre0+vel*t。
+    def predict(self, t):
+        t = np.asarray(t, dtype=np.float64)
+        tt = t[..., None]   # (...,1) 广播到 xyz
+        return self.centre0 + self.vel * tt + 0.5 * self.accel * (tt * tt)
+
+    # 瞬时速度 vel + accel*t(梯度链/dgdt/dd_dt 要用)。accel=0 时退回常数 vel。
+    # t 标量 -> 返回 (3,);t 数组 -> 返回 (...,3)。
+    def velocity_at(self, t):
+        t = np.asarray(t, dtype=np.float64)
+        return self.vel + self.accel * t[..., None]
 
     def signed_dist(self, p: np.ndarray, t: float) -> float:
-        c = self.predict(t)
+        c = self.predict(float(t))
         return float(np.linalg.norm(np.asarray(p) - c) - self.radius)
 
 
