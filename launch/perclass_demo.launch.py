@@ -54,6 +54,13 @@ def generate_launch_description():
         params["sim_env"] = "rviz_only"     # seed empty map -> replan-ready w/o cloud
         params["local_solver"] = "minco"     # the new per-class MINCO solve
         params.setdefault("visual_level", 2)
+        # COMMIT HORIZON: the splice point A must be only ~1 replan ahead, else the
+        # drone executes a long committed (stale) segment and never follows the new
+        # avoidance near the obstacle (SANDO's k_value_factor=5 was tuned for a slow
+        # solver; with the fast MINCO replan it puts A ~2 m ahead -> drone flies
+        # straight through the human). Commit ~= one computation period.
+        params["k_value_factor"] = 3.0
+        params["default_k_value"] = 40
 
         sando = Node(package="sando_py", executable="sando_node", name="sando_node",
                      namespace=ns, output="screen", emulate_tty=True, parameters=[params])
@@ -64,7 +71,9 @@ def generate_launch_description():
                                      "default_goal_z": 2.0, "visual_level": 1}])
         obstacles = Node(package="sando_py", executable="perclass_obstacle_pub",
                          name="perclass_obstacle_pub", namespace=ns, output="screen",
-                         parameters=[{"frame_id": "map"}])
+                         parameters=[{"frame_id": "map",
+                                      "human_amp": 2.0,        # realistic person speed:
+                                      "human_period": 10.0}])  # peak vy ~1.26 m/s
         goal = Node(package="sando_py", executable="auto_goal_pub", name="auto_goal_pub",
                     namespace=ns, output="screen",
                     parameters=[{"frame_id": "map", "goal_x": float(goal_x),

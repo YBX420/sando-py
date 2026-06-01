@@ -1086,12 +1086,16 @@ class SANDO:
 
         t0 = time.perf_counter()
         try:
-            # RT: single warm-started solve from the hgp global path (which is
-            # already obstacle-avoiding) -- NO detour multi-start (that was ~7x
-            # slower, ~4Hz; single seed is ~30ms, ~30Hz). Multi-start belongs to
-            # the offline path / Stage 2 seed refinement, not the replan loop.
+            # RT: try ONE warm-started solve from the hgp global path first (it is
+            # already obstacle-avoiding) -- NO detour multi-start, so the common
+            # case is fast (~30 ms, ~30 Hz; detour was ~7x slower). Only if that
+            # single seed is infeasible do we fall back to the multi-start detour
+            # (slower, but rare) so hard scenes still get solved.
             mj, info = plan_minco(astar_path, obstacles, avoid_cfg, v0=v0, a0=a0,
                                   detour_cfg=DetourConfig(enabled=False))
+            if not info.get("trajectory_valid"):
+                mj, info = plan_minco(astar_path, obstacles, avoid_cfg, v0=v0, a0=a0,
+                                      detour_cfg=DetourConfig(enabled=True))
         except Exception:  # plan_minco can RAISE 'all seeds failed'
             self.replanning_failure_count += 1
             return False

@@ -26,15 +26,16 @@ class PerClassObstaclePub(Node):
         super().__init__("perclass_obstacle_pub")
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("human_x", 5.0)
-        self.declare_parameter("human_vy", 0.8)
-        self.declare_parameter("human_y0", -3.0)
+        self.declare_parameter("human_amp", 2.5)        # y oscillation amplitude (m)
+        self.declare_parameter("human_period", 6.0)     # back-and-forth period (s)
         self.declare_parameter("human_z", 1.0)
         self.declare_parameter("wall_center", [5.0, 1.2, 2.0])
         self.declare_parameter("wall_extents", [2.0, 0.4, 3.0])
         self.frame = self.get_parameter("frame_id").value
         self.hx = float(self.get_parameter("human_x").value)
-        self.vy = float(self.get_parameter("human_vy").value)
-        self.hy0 = float(self.get_parameter("human_y0").value)
+        self.amp = float(self.get_parameter("human_amp").value)
+        self.period = float(self.get_parameter("human_period").value)
+        self.w = 2.0 * math.pi / max(self.period, 1e-3)
         self.hz = float(self.get_parameter("human_z").value)
         self.wc = [float(v) for v in self.get_parameter("wall_center").value]
         self.we = [float(v) for v in self.get_parameter("wall_extents").value]
@@ -50,7 +51,7 @@ class PerClassObstaclePub(Node):
         return float(t.sec) + 1e-9 * float(t.nanosec)
 
     def _human_pos(self, t: float):
-        return [self.hx, self.hy0 + self.vy * (t - self.t0), self.hz]
+        return [self.hx, self.amp * math.sin(self.w * (t - self.t0)), self.hz]
 
     def _dyntraj(self, tid, bbox, fx, fy, fz, vx, vy, vz, pos):
         m = DynTraj()
@@ -69,11 +70,12 @@ class PerClassObstaclePub(Node):
     def _tick(self):
         now = self._now()
         hp = self._human_pos(now)
-        # HUMAN (HARD, id 100): analytic linear crossing in y, t is absolute ROS sec
+        # HUMAN (HARD, id 100): analytic back-and-forth in y (sin), t = absolute ROS sec.
+        # velocity is the exact analytic derivative so the space-time ALM tracks it.
         human = self._dyntraj(
             100, self.human_bbox,
-            f"{self.hx}", f"{self.hy0} + {self.vy}*(t - {self.t0})", f"{self.hz}",
-            "0.0", f"{self.vy}", "0.0", hp)
+            f"{self.hx}", f"{self.amp}*sin({self.w}*(t - {self.t0}))", f"{self.hz}",
+            "0.0", f"{self.amp * self.w}*cos({self.w}*(t - {self.t0}))", "0.0", hp)
         # WALL (SOFT, id 200): static box
         wall = self._dyntraj(
             200, self.we,
