@@ -90,6 +90,7 @@ def ca_fit_predict(px, py, dt):
 
 all_res = []
 per_scene = {}        # name -> residual array (for genuine cross-scene shift tests)
+all_speed = []        # instantaneous |velocity| samples (for the physical-speed-bound budget)
 dt_used = 0.4
 for name, url in SETS.items():
     try:
@@ -97,6 +98,7 @@ for name, url in SETS.items():
     except Exception as e:
         print(f"[skip] {name}: {e}")
         continue
+    all_speed.append(np.sqrt(vx * vx + vy * vy))
     dt = detect_dt(frame, pid, x, vx)
     dt_used = dt
     res = []
@@ -120,10 +122,15 @@ all_res = np.asarray(all_res, dtype=np.float64)
 print(f"\nTOTAL windows={all_res.size}  median={np.median(all_res):.3f}m  "
       f"q90={np.quantile(all_res, 0.9):.3f}m  q95={np.quantile(all_res, 0.95):.3f}m  max={all_res.max():.3f}m")
 
+all_speed = np.concatenate(all_speed) if all_speed else np.zeros(0)
+print(f"instantaneous speed: N={all_speed.size}  q99={np.quantile(all_speed, 0.99):.3f}  "
+      f"max={all_speed.max():.3f} m/s")
+
 out = os.path.join(DATA, "eth_ucy_ca_residuals.npz")
 # per-scene arrays stored under res_<scene> so the hermetic test can do a GENUINE
 # cross-scene distribution-shift check (calibrate on one scene, deploy on another).
+# `speed` = instantaneous |velocity| samples for the physical-speed-bound safety budget.
 save_kw = {f"res_{k}": v for k, v in per_scene.items()}
-np.savez(out, residuals=all_res, W=W, H=H, horizon_s=float(H * 0.4),
-         datasets=list(per_scene.keys()), **save_kw)
-print(f"saved {all_res.size} residuals (+ per-scene) -> {out}")
+np.savez(out, residuals=all_res, speed=all_speed, W=W, H=H, horizon_s=float(H * 0.4),
+         dt=float(dt_used), datasets=list(per_scene.keys()), **save_kw)
+print(f"saved {all_res.size} residuals + {all_speed.size} speeds (+ per-scene) -> {out}")
