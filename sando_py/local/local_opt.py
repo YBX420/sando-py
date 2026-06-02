@@ -68,6 +68,7 @@ from .avoid_config import AvoidParams, resolve_mode
 from .bspline import UniformBSpline
 from .cost import obstacle_cost
 from .minco import MinjerkTraj, C2B
+from .obstacles import SphereObstacle
 
 
 @dataclass
@@ -194,7 +195,25 @@ class OptParams:
     #   这一层**（「人被检测到、估计在界内时，规划不会撞」）；每飞行小时的系统目标还要感知（漏检）
     #   + 硬件故障预算，那些在本 planner 之外。时变 reach(t_{i,k}) 留后续（依赖 T → 梯度不再免费）。
     safety_mode: str = "conformal"
-    a_max_human: float = 0.0        # 人物理最大 |加速度| (m/s^2)；0 = 不启用确定性可达
+    # reach_model（仅 deterministic 用）：可达集 reach 的两种物理模型——
+    #   'accel'（默认）：信任检测到的当前速度 v0(CA 标称),只 bound 不可观测的加速机动
+    #       reach = est_pos_err + est_vel_err*tau + 0.5*a_max_human*tau^2。
+    #       问题(真行人数据揭示):CA-偏离尾重(人会转/停),信 v0 会低估 -> 对真人不是五个九。
+    #   'speed'：**不信速度方向**,只用「瞬时速度物理有界」这个真物理事实——人 tau 秒内必在
+    #       当前位置 v_max_human*tau 内(任意机动,含反向)。把人当成当前 centre0 的**静态**球,
+    #       reach = est_pos_err + v_max_human*tau。这才是对真行人的物理最坏情形(0 物理违反)。
+    #       代价:reach 随 tau 增大 -> 靠**短 tau(快重规划)**压住(见 stage4_safety_budget)。
+    # reach_model (deterministic only): 'accel' trusts the detected velocity and bounds only the
+    #   unobservable acceleration manoeuvre (reach = est_pos_err + est_vel_err*tau + 0.5*a_max*tau^2);
+    #   real-pedestrian data shows this UNDER-estimates (humans turn/stop). 'speed' does NOT trust the
+    #   direction -- it uses the physical fact that instantaneous SPEED is bounded, so the human is
+    #   within v_max_human*tau of its CURRENT position under ANY manoeuvre (incl. a reversal). It treats
+    #   the human as STATIC at centre0 and sets reach = est_pos_err + v_max_human*tau -- the true
+    #   physical worst case (0 physical violations), at the cost of a reach that grows with tau (keep
+    #   tau small via fast replanning). Both are CONSTANT in (q, T) -> gradient-free.
+    reach_model: str = "accel"
+    a_max_human: float = 0.0        # 人物理最大 |加速度| (m/s^2)；'accel' reach 用；0 = 不启用确定性可达
+    v_max_human: float = 0.0        # 人物理最大速度 (m/s)；'speed' reach 用
     est_pos_err: float = 0.0        # 人位置估计误差上界 (m)
     est_vel_err: float = 0.0        # 人速度估计误差上界 (m/s)
 
@@ -973,10 +992,34 @@ def _pred_margin(opt) -> float:
         return 0.0
     if getattr(opt, "safety_mode", "conformal") == "deterministic":
         tau = float(getattr(opt, "tau_trust", 0.0))
-        return (float(getattr(opt, "est_pos_err", 0.0))
-                + float(getattr(opt, "est_vel_err", 0.0)) * tau
+        pos = float(getattr(opt, "est_pos_err", 0.0))
+        if getattr(opt, "reach_model", "accel") == "speed":
+            # 不信方向:人 tau 秒内必在当前位置 v_max*tau 内(配合静态 c0 surrogate)
+            return pos + float(getattr(opt, "v_max_human", 0.0)) * tau
+        # 信 v0、bound 加速机动
+        return (pos + float(getattr(opt, "est_vel_err", 0.0)) * tau
                 + 0.5 * float(getattr(opt, "a_max_human", 0.0)) * tau * tau)
     return float(getattr(opt, "q_conformal", 0.0))
+
+
+def _safety_surrogate(obstacles, opt):
+    """deterministic + reach_model='speed' 下,把每个**会动的硬球体(人)**换成它当前位置 centre0
+    的**静态** surrogate(vel=accel=0)——「不信速度方向」:v_max*tau 的 reach 已覆盖任意速度有界
+    运动,所以证书该罩当前位置的静态球,而不是信任 v0 的 CA 预测。其它 mode / 静态人 / 墙原样返回。
+    一个 vel=accel=0 的球 predict(t)≡centre0,所以走现有静态路径就天然以 c0 为中心。
+    In deterministic SPEED-reach mode, replace each MOVING hard sphere by a STATIC surrogate at its
+    current centre0 (don't trust the velocity direction). Unchanged in any other mode."""
+    if (opt is None or getattr(opt, "safety_mode", "conformal") != "deterministic"
+            or getattr(opt, "reach_model", "accel") != "speed"):
+        return obstacles
+    out = []
+    for o in obstacles:
+        if hasattr(o, "centre0") and (np.any(o.vel) or np.any(o.accel)):
+            out.append(SphereObstacle(o.centre0, o.radius, vel=None,
+                                      class_name=o.class_name))      # static at c0
+        else:
+            out.append(o)
+    return out
 
 
 def _seg_rep_time(tr: MinjerkTraj, i: int) -> float:
@@ -1671,6 +1714,9 @@ def _optimise_one_minco(seed_path: np.ndarray, obstacles, avoid_cfg,
     start, goal, q0, T0 = _minco_seed(seed_path, opt)
     M = T0.size
     nq = 3 * (M - 1)
+    # deterministic SPEED-reach mode: treat moving humans as static at c0 (don't trust direction);
+    # the v_max*tau reach covers any speed-bounded motion. No-op in every other mode.
+    obstacles = _safety_surrogate(obstacles, opt)
     soft_obs, hard_obs = _partition_obstacles(obstacles, avoid_cfg, opt.avoid_override)
 
     sol = _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt,
