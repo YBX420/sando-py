@@ -168,6 +168,35 @@ class OptParams:
     #   与障碍类型无关 → 对**每个**硬障碍都加（球 + 硬 AABB 墙）。同样对 (q,T) 是常数、不动梯度。
     #   默认 0.0（规划=实飞，消融 OFF 臂；旧行为逐字节一致）。
     epsilon_track: float = 0.0
+    # --- deterministic worst-case reachability mode (toward "never collide") ---
+    # safety_mode: 'conformal' (default) uses the calibrated PROBABILISTIC margin q_conformal
+    #   (coverage 1-alpha, an alpha failure rate, distribution-dependent -- cannot reach the
+    #   "every flight hour" reliability target). 'deterministic' REPLACES q_conformal with a
+    #   WORST-CASE reachable-set radius from the human's PHYSICAL limits -- no distribution, no
+    #   calibration data, no alpha. Within the trust window the human (trusted current CA
+    #   estimate, plus a bounded UNOBSERVABLE acceleration manoeuvre and bounded state-estimate
+    #   error) cannot leave Ball(c_nominal(t), reach). Enforcing relative margin >= radius +
+    #   d_safe + reach + epsilon_track then makes a collision IMPOSSIBLE under those physical
+    #   assumptions (not merely 1-alpha unlikely). reach (CONSTANT first version, evaluated at
+    #   tau_trust so the gradient stays free) = est_pos_err + est_vel_err*tau + 0.5*a_max_human
+    #   *tau^2. a_max_human=0 keeps it disabled. NOTE this certifies only the PLANNER layer
+    #   ("given the human is detected and the estimate is in-bound, the plan cannot collide");
+    #   the system-level per-flight-hour target also needs perception (miss-detection) +
+    #   hardware fault budgets, which live OUTSIDE this planner. A tighter time-varying
+    #   reach(t_{i,k}) is future work (it depends on T -> the gradient is no longer free).
+    # safety_mode：安全模式。'conformal'（默认）用概率余量 q_conformal（覆盖 1-alpha、有 alpha
+    #   失败率、依赖分布 → 够不到「每飞行小时」可靠性）；'deterministic' 把 q_conformal 换成由人
+    #   的**物理极限**算的最坏情形可达集半径——无分布、无校准数据、无 alpha。可信窗内人（可信的
+    #   当前 CA 估计 + 有界的不可观测加速机动 + 有界估计误差）出不了 Ball(c标称(t), reach)。强制
+    #   相对裕度 >= radius+d_safe+reach+epsilon_track → 在这些物理假设下撞击**不可能**（不是
+    #   1-alpha 罕见）。reach（常数首版，在 tau_trust 取值、保持梯度免费）= est_pos_err
+    #   + est_vel_err*tau + 0.5*a_max_human*tau^2。a_max_human=0 即关闭。注意它只证明 **planner
+    #   这一层**（「人被检测到、估计在界内时，规划不会撞」）；每飞行小时的系统目标还要感知（漏检）
+    #   + 硬件故障预算，那些在本 planner 之外。时变 reach(t_{i,k}) 留后续（依赖 T → 梯度不再免费）。
+    safety_mode: str = "conformal"
+    a_max_human: float = 0.0        # 人物理最大 |加速度| (m/s^2)；0 = 不启用确定性可达
+    est_pos_err: float = 0.0        # 人位置估计误差上界 (m)
+    est_vel_err: float = 0.0        # 人速度估计误差上界 (m/s)
 
 
 @dataclass
@@ -931,6 +960,25 @@ def _eps_track(opt) -> float:
     return float(getattr(opt, "epsilon_track", 0.0)) if opt is not None else 0.0
 
 
+def _pred_margin(opt) -> float:
+    """人预测不确定余量,加进硬球体(人)的 R。两种 mode（互斥,不叠加）：
+      conformal（默认）：统计 Q_α（概率覆盖 1-α,有 α 失败率、依赖校准分布）。
+      deterministic：物理可达集半径（最坏情形,无分布无 α；朝「每飞行小时不撞」）。
+        reach = est_pos_err + est_vel_err*tau + 0.5*a_max_human*tau^2,tau=tau_trust（常数）。
+    两者都只对球（人），且都是对 (q,T) 的常数 -> 不动梯度。opt=None 取 0。
+    Human-prediction margin for a hard SPHERE's R. 'conformal' -> statistical Q_alpha;
+    'deterministic' -> physical worst-case reachable-set radius (constant at tau_trust).
+    Both are constant w.r.t. (q, T); 0.0 when opt is None."""
+    if opt is None:
+        return 0.0
+    if getattr(opt, "safety_mode", "conformal") == "deterministic":
+        tau = float(getattr(opt, "tau_trust", 0.0))
+        return (float(getattr(opt, "est_pos_err", 0.0))
+                + float(getattr(opt, "est_vel_err", 0.0)) * tau
+                + 0.5 * float(getattr(opt, "a_max_human", 0.0)) * tau * tau)
+    return float(getattr(opt, "q_conformal", 0.0))
+
+
 def _seg_rep_time(tr: MinjerkTraj, i: int) -> float:
     """第 i 段用哪个「代表时刻」来定位人的位置（Stage 3 用法）。取「段末」时刻——
     对一个朝前走的人来说这是最保守的单一时刻；人静止(vel=0)时退化成静态。
@@ -1076,7 +1124,7 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
     hidx = np.tile(np.arange(H), M * 6)
     g = np.zeros(Nc); nrm = np.zeros((Nc, 3)); dist = np.zeros(Nc); Rarr = np.zeros(Nc)
     dgdt = np.zeros(Nc); trust = np.ones(Nc, dtype=bool)
-    q_alpha = _q_conformal(opt)   # conformal 预测不确定度余量（常数，只对硬球体生效；墙不加）
+    q_alpha = _pred_margin(opt)   # 人预测余量（conformal Q_α 或 deterministic 可达 reach；只对球）
     eps = _eps_track(opt)         # 执行管子半径（常数，对每个硬障碍都加：球 + 墙）
     t_rep = np.array([_seg_rep_time(tr, i) for i in range(M)])   # (M,)
     t_pt = tr.control_point_times()                             # (M,6)
@@ -1405,7 +1453,7 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
         a = np.where(ok[:, None], cD / np.where(ok[:, None], nrm[:, None], 1.0),
                      np.array([1.0, 0.0, 0.0]))
         proj = np.einsum("md,mkd->mk", a, D)                # (M,6) 相对控制点在法向上的投影
-        R = float(obs.radius) + d_safe + _q_conformal(opt) + _eps_track(opt)  # +conformal +执行管子
+        R = float(obs.radius) + d_safe + _pred_margin(opt) + _eps_track(opt)  # +预测余量 +执行管子
         m_ik = proj - R                                     # (M,6) 每点裕度
         if np.any(trust_mask):
             margin = min(margin, float(np.min(m_ik[trust_mask])))
@@ -1433,8 +1481,9 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
     g = cons["g"]; z = lam + rho * g
     t_pt = tr.control_point_times()                          # (M,6)
     trust = cons["trust"]
-    q_alpha = _q_conformal(opt)        # conformal 余量（硬球体 R 里已含；这里单独暴露给可视化）
+    pred_m = _pred_margin(opt)         # 预测余量（conformal Q_α 或 deterministic reach；硬球体 R 已含）
     eps_tr = _eps_track(opt)           # 执行管子半径（每个硬障碍 R 里已含；单独暴露给可视化）
+    det_mode = getattr(opt, "safety_mode", "conformal") == "deterministic"
     recs = []
     for m in range(g.size):
         i = int(cons["seg"][m]); k = int(cons["kpt"][m]); h = int(cons["hidx"][m])
@@ -1456,16 +1505,17 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
             "c_h": np.asarray(c_h, dtype=np.float64).copy(),
             # R = 强制的有效半径（球半径 + d_safe + conformal 余量 Q_alpha）；
             # clearance = 原始几何间隙 dist - d_safe（不含 Q_alpha，所以加大 Q 时它不变）；
-            # q_conformal = 这条约束里含的 conformal 余量，单独画出来 = 「为预测不确定度多推的量」。
-            # R = enforced effective radius (radius + d_safe + Q_alpha + epsilon_track).
+            # R = enforced effective radius (radius + d_safe + pred_margin + epsilon_track).
             # `clearance` is the RAW geometric gap dist - d_safe (margin-INDEPENDENT — it does
-            # NOT drop as Q or eps grow). `q_conformal` (spheres only) and `epsilon_track`
-            # (every hard obstacle) expose the two uncertainty slices of R so a viewer sees how
-            # much extra the prediction margin vs the execution-tube margin pushed this point.
+            # NOT drop as the margins grow). `pred_margin` (spheres only; = conformal Q_alpha OR
+            # the deterministic reach radius, per safety_mode) and `epsilon_track` (every hard
+            # obstacle) expose the uncertainty slices of R; `safety_mode` says which the pred
+            # slice is (statistical-1-alpha vs physical-worst-case).
             "R": float(cons["R"][m]),
             "dist": float(cons["dist"][m]),
             "clearance": float(cons["dist"][m] - _hard_d_safe(obs, avoid_cfg)),
-            "q_conformal": float(q_alpha) if hasattr(obs, "centre0") else 0.0,
+            "pred_margin": float(pred_m) if hasattr(obs, "centre0") else 0.0,
+            "safety_mode": "deterministic" if det_mode else "conformal",
             "epsilon_track": float(eps_tr),
             "g": float(g[m]),
             "lambda": lam_m,
@@ -1641,7 +1691,16 @@ def _optimise_one_minco(seed_path: np.ndarray, obstacles, avoid_cfg,
     # per-class 的核心意义——所以它们的接近度只记录进 feas 指标，绝不能因此把轨迹判为无效。
     # check_feasibility 是一视同仁量所有障碍的，软墙蹭一下就可能触发它的 clearance_violation；
     # 这里重新只按硬集合下结论，若硬集合没问题就退回到（与类别无关的）运动学检查。
-    hard_violation = bool(safety_obs) and (max_breach > opt.clearance_tol)
+    # 有效性必须按**强制的**有效半径判:除了 d_safe,还要算进预测余量 (conformal Q_α 或
+    # deterministic reach) + 执行管子 eps_track——否则 ALM 没顶到要求的裕度时会被假报 valid
+    # (确定性「人做最坏机动也不撞」的保证就空了)。max_breach 是相对裸 d_safe 的,平移一个常数即可。
+    # 默认两余量都 0 -> max_breach 不变 -> 旧行为逐字节一致。
+    # Validity must use the ENFORCED effective radius: d_safe + prediction margin (conformal Q_alpha
+    # OR deterministic reach) + execution tube eps_track. Otherwise a plan that fails to reach the
+    # inflated margin is falsely 'valid' (the deterministic worst-case guarantee would be hollow).
+    # max_breach is relative to bare d_safe, so shift it by the constant extra. Default 0 -> no change.
+    extra = _pred_margin(opt) + _eps_track(opt)
+    hard_violation = bool(safety_obs) and (max_breach + extra > opt.clearance_tol)
     if hard_violation:
         feas["trajectory_valid"] = False
         feas["failure_reason"] = "clearance_violation"
