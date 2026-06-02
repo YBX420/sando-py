@@ -222,6 +222,77 @@ check("DET.e2e.0 deterministic plan valid IFF it achieved the enforced d_safe+re
 
 
 # ===========================================================================
+# DET.speed : the SPEED-bound reach model (don't trust direction) -- the design correction
+# the real-data safety budget forced. The human is within v_max*tau of NOW under ANY motion
+# (incl. a reversal the accel/CA model misses), so the cert clears the STATIC c0 by v_max*tau.
+# ===========================================================================
+print("\n--- DET.speed: speed-bound reach (physical, covers any speed-bounded motion incl reversal) ---")
+V_MAX_H = 2.5
+TAU_S = 0.7
+SPEED_REACH = V_MAX_H * TAU_S                      # = 1.75 m
+opt_speed = OptParams(safety_mode="deterministic", reach_model="speed",
+                      v_max_human=V_MAX_H, tau_trust=TAU_S, est_pos_err=0.05)
+check("DET.speed.0 _pred_margin (speed model) = est_pos_err + v_max_human*tau",
+      abs(_pred_margin(opt_speed) - (0.05 + SPEED_REACH)) < 1e-12,
+      f"_pred_margin={_pred_margin(opt_speed):.4f} vs {0.05 + SPEED_REACH:.4f}")
+
+
+def worst_breaches_speed(tr, c0, v_max, n=5000):
+    """#breaches under ANY speed-bounded human motion: c_true(t) = c0 + v_max*dir*t with |dir|=1
+    (constant full-speed in any direction -- the worst speed-bounded adversary, incl. a reversal
+    of whatever it was doing). Per-time: ||c_true(t)-c0|| = v_max*t <= v_max*tau."""
+    ts = np.linspace(0.0, min(TAU_S, tr.t_end), 80)
+    pts = tr.eval(ts)
+    dirs = [np.array([0.0, 1.0, 0.0]), np.array([0.0, -1.0, 0.0]), np.array([-1.0, 0.0, 0.0])]
+    dirs += list(rng.standard_normal((n, 3)))
+    nb = 0; worst_clr = np.inf
+    for d in dirs:
+        nrm = np.linalg.norm(d)
+        if nrm < 1e-9:
+            continue
+        v = (np.asarray(d, float) / nrm) * v_max
+        c_true = c0[None, :] + v[None, :] * ts[:, None]
+        clr = float(np.min(np.linalg.norm(pts - c_true, axis=1) - RH))
+        worst_clr = min(worst_clr, clr)
+        if clr < D_SAFE - 1e-3:
+            nb += 1
+    return nb, worst_clr
+
+
+# speed-bound trajectory clears the STATIC c0 by d_safe + v_max*tau; accel-budget traj clears
+# only by d_safe + 0.5*a_max*tau^2 (< v_max*tau here) -> the speed adversary breaches it.
+tr_speed = straight_traj(RH + D_SAFE + SPEED_REACH)
+tr_accelbudget = straight_traj(RH + D_SAFE + 0.5 * A_MAX_H * TAU_S * TAU_S)   # 0.49 m budget
+nb_sp, wc_sp = worst_breaches_speed(tr_speed, C0, V_MAX_H)
+nb_ab, wc_ab = worst_breaches_speed(tr_accelbudget, C0, V_MAX_H)
+print(f"   speed-budget traj (reach {SPEED_REACH:.2f}): {nb_sp} breaches, worst clr={wc_sp:.3f}")
+print(f"   accel-budget traj (reach {0.5*A_MAX_H*TAU_S*TAU_S:.2f}): {nb_ab} breaches, worst clr={wc_ab:.3f}")
+check("DET.speed.1 IRON PROOF: speed-bound reach -> 0 collisions under ANY speed-bounded motion",
+      nb_sp == 0 and wc_sp >= D_SAFE - 1e-3,
+      f"{nb_sp} breaches, worst clr={wc_sp:.3f} >= d_safe (covers reversal the accel model misses)")
+check("DET.speed.2 the accel/CA budget IS breached by a full-speed (e.g. reversing) human",
+      nb_ab > 0 and wc_ab < D_SAFE,
+      f"{nb_ab} breaches, worst clr={wc_ab:.3f} < d_safe -> trusting v0 under-covers a fast/reversing human")
+
+# end-to-end: plan_minco speed mode treats the MOVING human as static at c0 and achieves v_max*tau.
+# Uses a SHORT tau (the safety-budget lever: short replan window keeps the physical reach feasible)
+# and a human far enough off-path that the start clears the no-go ball.
+print("\n--- DET.speed.e2e: plan_minco speed mode treats moving human static at c0, clears v_max*tau ---")
+TAU_E2E = 0.4
+REACH_E2E = V_MAX_H * TAU_E2E                      # = 1.0 m (short tau -> feasible reach)
+human_mv = SphereObstacle([1.8, 2.6, 1.5], RH, vel=np.array([1.5, 0.0, 0.0]), class_name="human")
+opt_sp_e2e = OptParams(vmax=3.0, amax=3.0, maxiter=400, safety_mode="deterministic",
+                       reach_model="speed", v_max_human=V_MAX_H, tau_trust=TAU_E2E)
+tr_spe, info_spe = plan_minco(ASTAR, [human_mv], CFG, opt_params=opt_sp_e2e, detour_cfg=ND)
+# clearance to the STATIC c0 (what speed mode certifies), not the moving prediction
+static_c0 = SphereObstacle(human_mv.centre0, RH, class_name="human")
+clr_static, _ = hard_clearance(tr_spe, [static_c0], CFG, K_eval=4000)
+check("DET.speed.e2e.0 speed-mode plan valid AND clears the STATIC c0 by d_safe + v_max*tau (short tau)",
+      info_spe["trajectory_valid"] and clr_static >= D_SAFE + REACH_E2E - 0.05,
+      f"valid={info_spe['trajectory_valid']}, static-c0 clr={clr_static:.3f} >= {D_SAFE+REACH_E2E:.2f} (tau={TAU_E2E})")
+
+
+# ===========================================================================
 # DET.hover : reachable set blocks the corridor -> honest STOP, never false 'valid'
 # ===========================================================================
 print("\n--- DET.hover: a huge reachable set blocks the only gap -> STOP (valid=False) ---")
