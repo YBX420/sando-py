@@ -148,6 +148,26 @@ class OptParams:
     #   梯度逐字节不变、只是把约束/证书的「水位」抬高（优化器只是把轨迹多推出去 Q_alpha）。
     #   墙(AABB，软/静态)不加。默认 0.0 = 确定性 Stage 4（旧行为逐字节一致；这就是消融的 OFF 臂）。
     q_conformal: float = 0.0
+    # --- execution gap: plan -> flown tube (epsilon_track) ---
+    # epsilon_track: a conservative upper bound on how far the FLOWN trajectory deviates
+    #   from the PLANNED one (tracking error + state-estimation error + replan latency).
+    #   The certificate is about the PLAN p(s); the drone flies p_actual(s) with
+    #   ||p_actual(s)-p(s)|| <= epsilon_track. Adding it to R upgrades the guarantee from
+    #   "the PLAN clears" to "the flown TUBE clears": plan margin >= R = r + d_safe + Q +
+    #   epsilon_track => flown margin >= plan margin - epsilon_track - Q >= r + d_safe.
+    #   UNLIKE Q_alpha (human-prediction error, SPHERES only), epsilon_track is the DRONE's
+    #   own position uncertainty -> obstacle-agnostic, so it inflates EVERY hard obstacle
+    #   (spheres AND hard AABB walls). Like Q_alpha it is CONSTANT in (q, T)
+    #   (deps/dq = deps/dT = 0) -> no gradient term, only the constraint/cert level shifts.
+    #   Default 0.0 (plan == flown, the ablation OFF arm; existing behaviour byte-for-byte).
+    # epsilon_track：实飞轨迹偏离规划轨迹的保守上界（跟踪误差+状态估计误差+replan 延迟）。
+    #   证书是对「规划」p(s) 的，无人机飞的是 p_actual(s)，||p_actual-p|| <= epsilon_track。
+    #   把它加进 R，就把保证从「规划清出」升级成「实飞管子清出」：规划裕度 >= R = r+d_safe+Q+eps
+    #   ⇒ 实飞裕度 >= 规划裕度 - eps - Q >= r+d_safe。
+    #   与 Q_alpha（人预测误差，只对球）不同：epsilon_track 是无人机**自己**的位置不确定度，
+    #   与障碍类型无关 → 对**每个**硬障碍都加（球 + 硬 AABB 墙）。同样对 (q,T) 是常数、不动梯度。
+    #   默认 0.0（规划=实飞，消融 OFF 臂；旧行为逐字节一致）。
+    epsilon_track: float = 0.0
 
 
 @dataclass
@@ -902,6 +922,15 @@ def _q_conformal(opt) -> float:
     return float(getattr(opt, "q_conformal", 0.0)) if opt is not None else 0.0
 
 
+def _eps_track(opt) -> float:
+    """执行 gap 的管子半径 epsilon_track：实飞偏离规划的保守上界，加到**每个**硬障碍的
+    有效半径上（球 + 墙，因为它是无人机自身位置误差、与障碍类型无关）。和 Q_alpha 一样是
+    对 (q,T) 的常数 -> 不动梯度，只抬约束/证书水位。opt 为 None 时取 0。
+    Execution-tube radius epsilon_track (plan->flown bound) added to EVERY hard obstacle's
+    effective radius. Constant w.r.t. (q, T); 0.0 when opt is None."""
+    return float(getattr(opt, "epsilon_track", 0.0)) if opt is not None else 0.0
+
+
 def _seg_rep_time(tr: MinjerkTraj, i: int) -> float:
     """第 i 段用哪个「代表时刻」来定位人的位置（Stage 3 用法）。取「段末」时刻——
     对一个朝前走的人来说这是最保守的单一时刻；人静止(vel=0)时退化成静态。
@@ -1048,6 +1077,7 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
     g = np.zeros(Nc); nrm = np.zeros((Nc, 3)); dist = np.zeros(Nc); Rarr = np.zeros(Nc)
     dgdt = np.zeros(Nc); trust = np.ones(Nc, dtype=bool)
     q_alpha = _q_conformal(opt)   # conformal 预测不确定度余量（常数，只对硬球体生效；墙不加）
+    eps = _eps_track(opt)         # 执行管子半径（常数，对每个硬障碍都加：球 + 墙）
     t_rep = np.array([_seg_rep_time(tr, i) for i in range(M)])   # (M,)
     t_pt = tr.control_point_times()                             # (M,6)
     idx_all = (np.arange(M)[:, None] * 6 + np.arange(6)[None, :]) * H  # (M,6) base idx
@@ -1056,7 +1086,7 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
         d_safe = _hard_d_safe(obs, avoid_cfg)
         idx = idx_all + h                              # 这个障碍 h 对应的扁平下标 (M,6)
         if hasattr(obs, "centre0"):                   # 球体 -> 用支撑半空间
-            R = float(obs.radius) + d_safe + q_alpha   # 有效半径 = 球半径 + 安全距离 + conformal 余量
+            R = float(obs.radius) + d_safe + q_alpha + eps  # 球半径 + d_safe + conformal + 管子
             moving_st = spacetime and _is_moving(obs)
             if moving_st:
                 # 会动的人：每个控制点用自己的时刻定位人（S4a，CA: predict(t)）
@@ -1099,7 +1129,8 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
                 for k in range(6):
                     m = (i * 6 + k) * H + h
                     d, ddp, _ = _signed_dist_and_grad(obs, P[i, k], float(t_rep[i]))
-                    g[m] = d_safe - d; nrm[m] = ddp; dist[m] = d; Rarr[m] = d_safe
+                    # 墙也加执行管子 eps（无人机自身位置误差，与障碍类型无关）；不加 conformal
+                    g[m] = (d_safe + eps) - d; nrm[m] = ddp; dist[m] = d; Rarr[m] = d_safe + eps
     return {"g": g, "n": nrm, "seg": seg, "kpt": kpt, "hidx": hidx,
             "dist": dist, "R": Rarr, "dgdt": dgdt, "trust": trust}, P
 
@@ -1374,7 +1405,7 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
         a = np.where(ok[:, None], cD / np.where(ok[:, None], nrm[:, None], 1.0),
                      np.array([1.0, 0.0, 0.0]))
         proj = np.einsum("md,mkd->mk", a, D)                # (M,6) 相对控制点在法向上的投影
-        R = float(obs.radius) + d_safe + _q_conformal(opt)  # +conformal 余量（移动已被相对轨迹精确吸收）
+        R = float(obs.radius) + d_safe + _q_conformal(opt) + _eps_track(opt)  # +conformal +执行管子
         m_ik = proj - R                                     # (M,6) 每点裕度
         if np.any(trust_mask):
             margin = min(margin, float(np.min(m_ik[trust_mask])))
@@ -1403,6 +1434,7 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
     t_pt = tr.control_point_times()                          # (M,6)
     trust = cons["trust"]
     q_alpha = _q_conformal(opt)        # conformal 余量（硬球体 R 里已含；这里单独暴露给可视化）
+    eps_tr = _eps_track(opt)           # 执行管子半径（每个硬障碍 R 里已含；单独暴露给可视化）
     recs = []
     for m in range(g.size):
         i = int(cons["seg"][m]); k = int(cons["kpt"][m]); h = int(cons["hidx"][m])
@@ -1425,14 +1457,16 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
             # R = 强制的有效半径（球半径 + d_safe + conformal 余量 Q_alpha）；
             # clearance = 原始几何间隙 dist - d_safe（不含 Q_alpha，所以加大 Q 时它不变）；
             # q_conformal = 这条约束里含的 conformal 余量，单独画出来 = 「为预测不确定度多推的量」。
-            # R = enforced effective radius (radius + d_safe + Q_alpha). `clearance` is the
-            # RAW geometric gap dist - d_safe (Q_alpha-INDEPENDENT — it does NOT drop as Q grows);
-            # `q_conformal` exposes the conformal slice of R so a viewer sees how much extra
-            # the prediction-uncertainty margin pushed this point (R = radius + clearance_target + Q).
+            # R = enforced effective radius (radius + d_safe + Q_alpha + epsilon_track).
+            # `clearance` is the RAW geometric gap dist - d_safe (margin-INDEPENDENT — it does
+            # NOT drop as Q or eps grow). `q_conformal` (spheres only) and `epsilon_track`
+            # (every hard obstacle) expose the two uncertainty slices of R so a viewer sees how
+            # much extra the prediction margin vs the execution-tube margin pushed this point.
             "R": float(cons["R"][m]),
             "dist": float(cons["dist"][m]),
             "clearance": float(cons["dist"][m] - _hard_d_safe(obs, avoid_cfg)),
             "q_conformal": float(q_alpha) if hasattr(obs, "centre0") else 0.0,
+            "epsilon_track": float(eps_tr),
             "g": float(g[m]),
             "lambda": lam_m,
             "rho": float(rho),
