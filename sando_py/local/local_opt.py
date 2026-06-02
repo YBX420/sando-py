@@ -129,6 +129,25 @@ class OptParams:
     #   所以已有的静态测试不受影响。
     tau_trust: float = 0.75
     spacetime_hard: bool = True
+    # --- conformal continuous-time certificate (novelty upgrade) ---
+    # q_conformal: Q_alpha — the (1-alpha) quantile of the human-prediction
+    #   sup-norm error sup_s||c_true(s)-c_pred(s)||, calibrated OFFLINE on a hold-out
+    #   set (see test/stage4_conformal_coverage.py). Added to a HARD SPHERE's
+    #   effective radius so R = radius + d_safe + Q_alpha. By the certificate
+    #   theorem, enforcing the relative margin >= R then guarantees Pr(no collision
+    #   over the whole interval) >= 1-alpha against the TRUE (unknown) human path.
+    #   It is a CONSTANT w.r.t. the decision variables (q, T): dQ/dq = dQ/dT = 0, so
+    #   every analytic gradient is byte-identical and only the constraint/cert LEVEL
+    #   shifts (the optimizer simply pushes the trajectory out by Q_alpha more).
+    #   Walls (AABB, soft/static) get no Q_alpha. Default 0.0 => deterministic
+    #   Stage 4 (all existing behaviour byte-for-byte; this is the ablation OFF arm).
+    # q_conformal：Q_alpha——人预测误差 sup_s||真-预测|| 的 (1-alpha) 分位，离线在校准集上
+    #   标定（见 test/stage4_conformal_coverage.py）。加到硬球体的有效半径上：
+    #   R = 半径 + d_safe + Q_alpha。证书定理保证：相对裕度 >= R 时，对人「真实(未知)轨迹」
+    #   整段不撞的概率 >= 1-alpha。它对优化变量 (q,T) 是常数（dQ/dq=dQ/dT=0），所以所有解析
+    #   梯度逐字节不变、只是把约束/证书的「水位」抬高（优化器只是把轨迹多推出去 Q_alpha）。
+    #   墙(AABB，软/静态)不加。默认 0.0 = 确定性 Stage 4（旧行为逐字节一致；这就是消融的 OFF 臂）。
+    q_conformal: float = 0.0
 
 
 @dataclass
@@ -873,6 +892,16 @@ def _hard_d_safe(obs, avoid_cfg) -> float:
     return float(params.d_safe)
 
 
+def _q_conformal(opt) -> float:
+    """conformal 安全裕度 Q_alpha：加到硬球体有效半径上的「预测不确定度余量」。
+    它是离线标定的常数（见 OptParams.q_conformal），对优化变量 (q,T) 不依赖
+    -> 不动任何解析梯度，只抬高约束/证书水位。opt 为 None（独立 check_grad 闸用）时取 0。
+    Conformal margin Q_alpha added to a hard sphere's effective radius. A constant
+    w.r.t. (q, T) (see OptParams.q_conformal): leaves all gradients untouched, only
+    shifts the constraint/certificate level. 0.0 when opt is None."""
+    return float(getattr(opt, "q_conformal", 0.0)) if opt is not None else 0.0
+
+
 def _seg_rep_time(tr: MinjerkTraj, i: int) -> float:
     """第 i 段用哪个「代表时刻」来定位人的位置（Stage 3 用法）。取「段末」时刻——
     对一个朝前走的人来说这是最保守的单一时刻；人静止(vel=0)时退化成静态。
@@ -1018,6 +1047,7 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
     hidx = np.tile(np.arange(H), M * 6)
     g = np.zeros(Nc); nrm = np.zeros((Nc, 3)); dist = np.zeros(Nc); Rarr = np.zeros(Nc)
     dgdt = np.zeros(Nc); trust = np.ones(Nc, dtype=bool)
+    q_alpha = _q_conformal(opt)   # conformal 预测不确定度余量（常数，只对硬球体生效；墙不加）
     t_rep = np.array([_seg_rep_time(tr, i) for i in range(M)])   # (M,)
     t_pt = tr.control_point_times()                             # (M,6)
     idx_all = (np.arange(M)[:, None] * 6 + np.arange(6)[None, :]) * H  # (M,6) base idx
@@ -1026,7 +1056,7 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
         d_safe = _hard_d_safe(obs, avoid_cfg)
         idx = idx_all + h                              # 这个障碍 h 对应的扁平下标 (M,6)
         if hasattr(obs, "centre0"):                   # 球体 -> 用支撑半空间
-            R = float(obs.radius) + d_safe             # 要躲开的有效半径 = 球半径 + 安全距离
+            R = float(obs.radius) + d_safe + q_alpha   # 有效半径 = 球半径 + 安全距离 + conformal 余量
             moving_st = spacetime and _is_moving(obs)
             if moving_st:
                 # 会动的人：每个控制点用自己的时刻定位人（S4a，CA: predict(t)）
@@ -1274,24 +1304,36 @@ def _certificate_margin(cons) -> float:
 
 def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
                                   opt: OptParams, trust_mask=None) -> float:
-    """会动的人的「连续时间」安全证书（S4a/S4b）。比逐点检查更可靠：它能保证一整段时间内
-    都安全，不只是采样点。做法：每段用一个「把半径充气」的支撑半空间——
-    把人在「段起始时刻」的球，按 ||速度||·T_i 向外膨胀（覆盖这段时间里人能走到的最远范围），
-    再检查这段所有可信控制点都在这个膨胀球外。膨胀半径定理保证：段裕度 >=0 就意味着这段内
-    每个时刻 t 都有 signed_dist(p(t),t) >= d_safe。只在「可信」控制点上检查（信任窗口内）。
-    静态/关 space-time 的人改用上面的 _certificate_margin（紧的逐点形式）。
-    返回所有 (段, 可信控制点, 会动的人) 上的最小裕度。
+    """会动的人的「连续时间」安全证书（S4a/S4b）。保证一整段时间都安全，不只是采样点。
+    用的是「相对轨迹」支撑半空间（**不是**早期那种各向同性球膨胀 R=r+d_safe+||v||·T_i——
+    那个对快速人严重过保守、会假报 cert<0，已被取代）。
+
+    做法：把人在该段的**完整 CA 运动** c(s)=c0+v_eff·s+½·accel·s²（s∈[0,T_i]，
+    v_eff=velocity_at(t0)）升次成它的五次 Bernstein 控制点 c_k，与轨迹控制点 P_{i,k} 做差得
+    相对控制点 D_{i,k}=P_{i,k}-c_k，再对 D 架一道（每段冻结的）支撑半空间。
+    ★关键：c(s) 是 degree-2 多项式，升到 degree-5 Bernstein 是**精确**的——所以加速度项 ½a·s²
+    被 c_k 一字不差地吸收（见代码里的 quad 项 = ½a·s² 的精确 Bernstein 系数），R **不需要**任何
+    速度或加速度膨胀。只在「可信」控制点上检查（信任窗口内）；静态/关 space-time 用 _certificate_margin。
     CONTINUOUS-TIME clearance certificate for MOVING humans (S4a/S4b).
 
-    Per segment i use ONE inflated-radius supporting halfspace:
-        a_i = unit(centroid_k(P_{i,k}) - c_h(t_i^0)),  t_i^0 = _cum[i]
-        R_i = r_h + d_safe + ||vel_h|| * T_i
-        margin_i = min over trusted k of (a_i^T (P_{i,k} - c_h(t_i^0)) - R_i)
-    By the inflated-radius theorem (start-time sphere Minkowski-inflated by
-    ||vel||*T_i), margin >= 0 over a segment implies signed_dist(p(t),t)>=d_safe
-    for EVERY t in that segment (not just the 6 nodes). Asserted only over
-    TRUSTED control points (the trust window). Static humans / spacetime-off use
-    _certificate_margin (the Stage-3 tight per-point form) instead.
+    Uses a RELATIVE-TRAJECTORY supporting halfspace (NOT the early isotropic ball
+    inflation R = r + d_safe + ||v||*T_i, which was over-conservative for fast humans
+    and has been replaced). Per segment i, degree-elevate the human's FULL CA motion
+        c(s) = c0 + v_eff*s + 0.5*accel*s^2,   s in [0, T_i],  v_eff = velocity_at(t0)
+    to its exact degree-5 Bernstein control points c_k, subtract from the trajectory
+    control points (D_{i,k} = P_{i,k} - c_k), freeze a normal a_i = unit(mean_k D_{i,k}),
+    and certify:
+        R_i = r_h + d_safe + Q_alpha        (Q_alpha = conformal margin, see _q_conformal)
+        margin_i = min over trusted k of (a_i^T D_{i,k} - R_i)
+    SOUNDNESS: both p(s) and c(s) are degree-5 Bernstein, so p(s)-c(s) = sum_k B_k(s) D_{i,k}
+    is a convex combination; a^T D_k >= R for all k => a^T(p(s)-c(s)) >= R for ALL s in the
+    segment => ||p(s)-c(s)|| >= R (continuous-time, not just the 6 nodes).
+    ACCELERATION is handled EXACTLY, not by inflation: c(s) is degree 2, and degree
+    elevation to degree 5 is exact, so the 0.5*accel*s^2 term lives in c_k verbatim
+    (the `quad` term below). R therefore needs NO ||v||*T or 0.5*||a||*T^2 padding — the
+    only residual assumption is that the human follows CA up to the conformal error Q_alpha
+    (unmodelled jerk etc.), which is exactly what Q_alpha absorbs. Asserted only over
+    TRUSTED control points (the trust window). Static / spacetime-off use _certificate_margin.
 
     Returns the minimum margin over all (segment, trusted-k, moving-human)."""
     M = tr.M
@@ -1332,7 +1374,7 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
         a = np.where(ok[:, None], cD / np.where(ok[:, None], nrm[:, None], 1.0),
                      np.array([1.0, 0.0, 0.0]))
         proj = np.einsum("md,mkd->mk", a, D)                # (M,6) 相对控制点在法向上的投影
-        R = float(obs.radius) + d_safe                      # 标量，无膨胀（移动已被相对轨迹精确吸收）
+        R = float(obs.radius) + d_safe + _q_conformal(opt)  # +conformal 余量（移动已被相对轨迹精确吸收）
         m_ik = proj - R                                     # (M,6) 每点裕度
         if np.any(trust_mask):
             margin = min(margin, float(np.min(m_ik[trust_mask])))
@@ -1360,6 +1402,7 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
     g = cons["g"]; z = lam + rho * g
     t_pt = tr.control_point_times()                          # (M,6)
     trust = cons["trust"]
+    q_alpha = _q_conformal(opt)        # conformal 余量（硬球体 R 里已含；这里单独暴露给可视化）
     recs = []
     for m in range(g.size):
         i = int(cons["seg"][m]); k = int(cons["kpt"][m]); h = int(cons["hidx"][m])
@@ -1379,9 +1422,17 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
             "ctrl_pt": k,
             "P": P[i, k].copy(),
             "c_h": np.asarray(c_h, dtype=np.float64).copy(),
+            # R = 强制的有效半径（球半径 + d_safe + conformal 余量 Q_alpha）；
+            # clearance = 原始几何间隙 dist - d_safe（不含 Q_alpha，所以加大 Q 时它不变）；
+            # q_conformal = 这条约束里含的 conformal 余量，单独画出来 = 「为预测不确定度多推的量」。
+            # R = enforced effective radius (radius + d_safe + Q_alpha). `clearance` is the
+            # RAW geometric gap dist - d_safe (Q_alpha-INDEPENDENT — it does NOT drop as Q grows);
+            # `q_conformal` exposes the conformal slice of R so a viewer sees how much extra
+            # the prediction-uncertainty margin pushed this point (R = radius + clearance_target + Q).
             "R": float(cons["R"][m]),
             "dist": float(cons["dist"][m]),
             "clearance": float(cons["dist"][m] - _hard_d_safe(obs, avoid_cfg)),
+            "q_conformal": float(q_alpha) if hasattr(obs, "centre0") else 0.0,
             "g": float(g[m]),
             "lambda": lam_m,
             "rho": float(rho),
