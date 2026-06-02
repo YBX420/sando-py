@@ -124,6 +124,25 @@ check("SHIFT.scene genuine real->real scene shift (zara->eth) collapses coverage
       f"eth coverage under zara-calibrated Q={Q_zara:.3f}m is {cov_eth_under_zara:.4f} << {target:.2f}")
 
 
+# --- ROBUST: the cheap, safe fix for the 0.53 collapse = calibrate on the WORST scene -
+# Don't reach for context-conditioning Q(x) yet (gradient no longer free). The conservative
+# constant fix -- same principle as a conservative constant epsilon_track -- is to calibrate
+# on the MOST crowded scene (eth, q90=1.20m). That Q is conservative for ANY deployment no
+# more extreme than eth, so coverage on the calmer scenes stays >= target (it over-covers).
+hotel = np.asarray(z["res_hotel"], dtype=np.float64)
+Q_eth = split_conformal_quantile(eth)                        # calibrate on the WORST scene
+cov_zara_under_eth = float(np.mean(zara <= Q_eth))
+cov_hotel_under_eth = float(np.mean(hotel <= Q_eth))
+cov_pool_under_eth = float(np.mean(real <= Q_eth))
+print(f"\nROBUST worst-scene calibration: Q_eth={Q_eth:.3f}m -> coverage  zara={cov_zara_under_eth:.4f}  "
+      f"hotel={cov_hotel_under_eth:.4f}  pooled={cov_pool_under_eth:.4f}")
+check("ROBUST.0 worst-scene (eth) calibration is conservative >= target on all calmer scenes",
+      min(cov_zara_under_eth, cov_hotel_under_eth, cov_pool_under_eth) >= target,
+      f"min coverage over {{zara,hotel,pooled}} = "
+      f"{min(cov_zara_under_eth, cov_hotel_under_eth, cov_pool_under_eth):.4f} >= {target:.2f} "
+      f"(vs the 0.53 collapse the OTHER way) -- bank 0.53 for the paper, ship worst-scene Q")
+
+
 # ---------------------------------------------------------------- summary
 total = len(results)
 passed = sum(1 for _, ok, _ in results if ok)
