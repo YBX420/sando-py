@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>sando_cpp</name>
+  <version>0.0.1</version>
+  <description>C++ ROS2 node wrapping the golden-verified C++ port of the sando_py MINCO per-class planner (planner.hpp).</description>
+  <maintainer email="cpp-port@example.com">cpp-port</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>dynus_interfaces</depend>
+</package>
