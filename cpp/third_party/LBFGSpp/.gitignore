@@ -1,0 +1,13 @@
+*.o
+*.out
+include/Eigen/*
+archive/*
+issues/*
+build/*
+.settings/*
+.project
+.cproject
+/Debug/
+/Release/
+bazel-*
+MODULE.bazel.lock
