@@ -89,3 +89,20 @@ ctest --test-dir build --output-on-failure     # 或直接 ./build/test_<mod>.ex
 - **obstacle_tracker 聚类**:Python 装了 sklearn 时走 DBSCAN,没装时走 cKDTree+并查集 fallback(连通分量)。本机 WSL 无 sklearn → Python 实际走 fallback,我的 C++ `connected_components` **精确复现 fallback**(golden 0 误差)。**但生产环境若装了 sklearn,DBSCAN 在边界点上会与连通分量不同** —— 这是 Python 自身两条实现路径的差异,非移植缺陷。
 - **4 个 convert_* 节点**只编译验证(都是简单字段搬运 / 几条算术);其中 cmd_vel 控制律、odom→world 四元数变换是 1:1 直译,未单独 golden(逻辑足够简单)。
 - 仍未还原(需外部依赖):`solver_gurobi.py`(727)—— 基线 Gurobi MIQP,需 Gurobi C++ 商业 license 才能编译+验证,**非他的算法**(他走 `local_solver='minco'`)。
+
+
+## Isaac Sim 集成(进程内 C-ABI DLL + ctypes,Windows 本地)
+现有 `isaac_sando_loop.py` 是**进程内 Python** 架构(`E:\isssacsim\python.bat` 直接 import 算法、驱动 Isaac core API)。这里把 C++ 引擎接进去,**不碰 Isaac 渲染那部分**,只把算法引擎从 `sando_py` 换成 C++。
+
+- **`cpp/capi/sando_capi.cpp`** — `extern "C"` 扁平 ABI,包住 golden 验证过的 `planner.hpp`(Parameters 全字段按名分派 / DynTraj 句柄 / SANDO 全生命周期)。MinGW g++ 静态编译成自包含 DLL,任何 CPython(Isaac 的 MSVC 3.10)都能 ctypes 加载,无需 MinGW 运行时。
+  - 构建(一行):`cd cpp && g++ -O2 -shared -std=c++17 -o capi/sando_capi.dll capi/sando_capi.cpp -Iinclude -Ithird_party/eigen -Ithird_party -static -static-libgcc -static-libstdc++`(DLL 是构建产物,gitignore,不入库)
+- **`sando_cpp_bridge.py`**(仓库根)— ctypes 包装,暴露与 `sando_py` **同名 API** 的 `Parameters/RobotState/DynTraj/SANDO`。Parameters 预置全部默认值,`hasattr` 行为与 dataclass 一致。
+- **接入方式**:`isaac_sando_loop.py` / `_isaac_pipeline_headless_test.py` 顶部加引擎选择器,默认 `cpp`,可用 `SANDO_ENGINE=py` 环境变量或 YAML 顶层 `engine:` 切回 Python。跑法不变:`E:\isssacsim\python.bat isaac_sando_loop.py`。
+
+**反作弊验证(`_verify_bridge_vs_py.py`:同一进程同时跑 sando_py 与 C++,逐拍对比 + 独立闭环):**
+- A. AnalyticExpr 解析器:DynTraj.eval(t) **py vs cpp = 4.44e-16**(机器精度)。
+- B. HGP 全局路径:**路径长度一致时 bit-EXACT(0.0)**;偶发 ±1 个共线节点(机器精度级 A*/LoS 平局);动态行人附近路线可能不同(C++ 端 `worst_traj_time` 由 Gurobi bootstrap 提供,未移植 → 缺预测性膨胀,文档已标注)。
+- C. 闭环(60m 复杂动图,4 墙 + 6 行人移动):**两引擎都到达、都不撞、都 human-safe + wall-clear、都绕行**;净空相近(C++ 1.06/1.19 vs py 1.21/1.93,差异即 LBFGSpp-vs-scipy 局部极小)。
+- **速度(本次回报)**:C++ replan **2–8 ms** vs Python **74–76 ms**,**~10–15×**。
+
+诚实结论:bridge 正确驱动 golden 验证过的 C++ 引擎(解析器精确、障碍正确入规划器、闭环到达+避障净空相近);所有发散都是**既有的、已记录的 C++ 移植差异**(LBFGSpp/scipy、Gurobi-stub),由 bridge 如实暴露,非 bridge 引入。Isaac 渲染部分未变(loop 主体只换了引擎 import),无 GPU 环境无法本机验证渲染,但 planner 级已完整验证。

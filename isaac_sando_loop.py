@@ -44,13 +44,22 @@ except ImportError:
     from omni.isaac.core.objects import VisualCuboid
 
 # ---- 你的真管线(只经 SANDO, 不直调局部求解器)----
-from sando_py.types import Parameters, RobotState, DynTraj
-from sando_py.planner import SANDO
-try:
-    from sando_py.types import DroneStatus
-except Exception:
-    from sando_py.planner import DroneStatus
-GOAL_REACHED = int(DroneStatus.GOAL_REACHED)
+# 引擎选择: "cpp" = C++ 移植(sando_cpp_bridge -> sando_capi.dll, golden 验证过的同一套算法),
+#          "py"  = 纯 Python sando_py。默认 cpp;可用环境变量 SANDO_ENGINE 或 YAML 顶层 engine: 覆盖。
+SANDO_ENGINE = os.environ.get("SANDO_ENGINE", CFG.get("engine", "cpp")).lower()
+if SANDO_ENGINE == "cpp":
+    from sando_cpp_bridge import (Parameters, RobotState, DynTraj, SANDO,
+                                  DroneStatus_GOAL_REACHED as GOAL_REACHED)
+    print(f"[isaac] engine = C++ (sando_cpp_bridge)", flush=True)
+else:
+    from sando_py.types import Parameters, RobotState, DynTraj
+    from sando_py.planner import SANDO
+    try:
+        from sando_py.types import DroneStatus
+    except Exception:
+        from sando_py.planner import DroneStatus
+    GOAL_REACHED = int(DroneStatus.GOAL_REACHED)
+    print("[isaac] engine = Python (sando_py)", flush=True)
 
 # ===========================================================================
 # Parameters: 从 YAML 逐字段 setattr(只认 Parameters 真有的字段)
@@ -91,11 +100,34 @@ drone = world.scene.add(VisualCuboid(prim_path="/World/drone", name="drone",
     position=START.copy(), scale=np.array([0.35, 0.35, 0.35]), color=np.array([0.1, 0.4, 1.0])))
 
 OBS = SCENE["obstacles"]
+
+
+def make_dt(i, o):
+    """从场景 spec 造 per-class DynTraj(静态: center; 运动: traj/vel 表达式)。"""
+    dt = DynTraj()
+    dt.id = (200 + i) if o.get("class", "wall") == "wall" else i   # 200<=id<300 -> wall/软, 否则 human/硬
+    dt.mode = "Analytic"
+    dt.bbox = np.array(o["size"], float)                           # 全尺寸(见文件头注 1)
+    if "traj" in o:
+        dt.traj_x, dt.traj_y, dt.traj_z = [str(e) for e in o["traj"]]
+        if "vel" in o:
+            dt.traj_vx, dt.traj_vy, dt.traj_vz = [str(e) for e in o["vel"]]
+    else:
+        c = o["center"]
+        dt.traj_x, dt.traj_y, dt.traj_z = f"{c[0]}", f"{c[1]}", f"{c[2]}"
+        dt.traj_vx = dt.traj_vy = dt.traj_vz = "0.0"
+    dt.compile_analytic()
+    return dt
+
+
+DTS = [make_dt(i, o) for i, o in enumerate(OBS)]
+IS_HUMAN = [o.get("class", "wall") != "wall" for o in OBS]
+obs_prims = []
 for i, o in enumerate(OBS):
-    c = np.array(o["center"], float); sz = np.array(o["size"], float)
-    col = np.array([0.55, 0.55, 0.6]) if o.get("class", "wall") == "wall" else np.array([1.0, 0.25, 0.25])
-    world.scene.add(VisualCuboid(prim_path=f"/World/obs_{i}", name=f"obs_{i}",
-        position=c.copy(), scale=sz.copy(), color=col))
+    p0 = DTS[i].eval(0.0); sz = np.array(o["size"], float)
+    col = np.array([1.0, 0.25, 0.25]) if IS_HUMAN[i] else np.array([0.55, 0.55, 0.6])
+    obs_prims.append(world.scene.add(VisualCuboid(prim_path=f"/World/obs_{i}", name=f"obs_{i}",
+        position=p0.copy(), scale=sz.copy(), color=col)))
 
 # 面包屑轨迹
 N_TRAIL = 500
@@ -124,21 +156,12 @@ print(f"[isaac] 启动完毕. start={START} goal={GOAL} status={sando.get_drone_
 
 
 def push_obstacles(t, p_d):
-    """把每个障碍作为 per-class DynTraj 推给 planner(id 编码类别)。
-       静态障碍用 Analytic 常量表达式; bbox=全尺寸(见文件头注 1)。"""
+    """把 SENSE_R 内的障碍作为 per-class DynTraj 推给 planner(add_traj 按 id 去重/更新)。
+       DynTraj.traj_* 是预测层 —— 将来 NN 预测就换这里, planner/证书不动。"""
     cull = float(LOOP.get("sense_cull_r", 40.0))
-    for i, o in enumerate(OBS):
-        c = np.array(o["center"], float)
-        if np.linalg.norm(c - p_d) > cull:
-            continue
-        cls = o.get("class", "wall")
-        dt = DynTraj()
-        dt.id = (200 + i) if cls == "wall" else i      # 200<=id<300 -> wall/软; 否则 human/硬
-        dt.mode = "Analytic"
-        dt.traj_x = f"{float(c[0])}"; dt.traj_y = f"{float(c[1])}"; dt.traj_z = f"{float(c[2])}"
-        dt.traj_vx = "0.0"; dt.traj_vy = "0.0"; dt.traj_vz = "0.0"   # 静态; NN 预测以后换这一层
-        dt.bbox = np.array(o["size"], float)           # 全尺寸
-        sando.add_traj(dt, t)
+    for dt in DTS:
+        if np.linalg.norm(dt.eval(t) - p_d) <= cull:
+            sando.add_traj(dt, t)
 
 
 def signed_box_dist(p, c, sz):
@@ -149,10 +172,10 @@ def signed_box_dist(p, c, sz):
     return float(np.max(np.maximum(lo - p, p - hi)))   # <=0 内部
 
 
-def clearance_all(p):
+def clearance_all(p, t):
     cmin = np.inf
-    for o in OBS:
-        cmin = min(cmin, signed_box_dist(p, np.array(o["center"], float), np.array(o["size"], float)))
+    for i, o in enumerate(OBS):
+        cmin = min(cmin, signed_box_dist(p, DTS[i].eval(t), np.array(o["size"], float)))
     return cmin
 
 
@@ -189,7 +212,7 @@ while simulation_app.is_running() and t < T_MAX and not reached:
         gmaxy = max((abs(float(p[1])) for p in gp), default=0.0)
         print(f"  t={t:5.2f} | ok={int(ok_plan)} | status={sando.get_drone_status()} | "
               f"gN={len(gp):2d} | g|y|max={gmaxy:5.2f} | drone_y={p_d[1]:+.2f} | "
-              f"ms={last_rt*1000:5.0f} | clr={clearance_all(p_d):+.2f}", flush=True)
+              f"ms={last_rt*1000:5.0f} | clr={clearance_all(p_d, t):+.2f}", flush=True)
         next_replan = t + REPLAN_DT
 
     # 消费 plan 队列推进无人机(你真管线的输出, 不直接 eval mj)
@@ -200,7 +223,9 @@ while simulation_app.is_running() and t < T_MAX and not reached:
         a_d = np.asarray(ng.accel, dtype=float)
 
     drone.set_world_pose(position=p_d)
-    c = clearance_all(p_d)
+    for i in range(len(OBS)):                       # 障碍按 t 运动(可视化跟着动)
+        obs_prims[i].set_world_pose(position=DTS[i].eval(t))
+    c = clearance_all(p_d, t)
     min_clear = min(min_clear, c)
     if c < 0.0:
         collided = True
