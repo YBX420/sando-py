@@ -1,0 +1,69 @@
+# Isaac <-> 真 sando_py 管线 的参数。改这里调参,脚本不用动。
+# planner.* 会逐个 setattr 到 sando_py.types.Parameters(只认 Parameters 里真有的字段)。
+
+planner:
+  # —— 必须项(改错会静默不动,别乱动)——
+  sim_env: rviz_only          # 走「占据图」分支(无点云/无未知区);别的值会要点云
+  use_hardware: false         # true 会多门控 kdtree,占据模式永不就绪 -> 静默不动
+  local_solver: minco         # 选你的 per-class MINCO(非 Gurobi)
+  global_planner: astar_heat  # 真 heat-A* 全局规划
+  skip_initial_yawing: true   # false -> set_terminal_goal 进 YAWING,replan 永远 no-op
+  vehicle_type: uav
+  use_state_update: true      # receding-horizon:A 取自 plan 偏移
+
+  # —— HGP 全局 / heat 场 ——
+  use_heat_map: true
+  dynamic_heat_enabled: true
+  dynamic_as_occupied_current: true   # 盒子障碍栅格化成 occupied(否则 HGP 看不到)
+  static_heat_enabled: true
+  inflation_hgp: 0.45         # 体素图障碍膨胀(≈无人机半径+裕度)
+  res: 0.3                    # 体素分辨率 m/格
+  factor_hgp: 1.0             # 全局用 factor_hgp*res 的粗格
+  horizon: 16.0              # 局部规划时域(s)+ 障碍接收/采用半径
+  num_P: 6                    # 全局路径裁到 num_P+1 点
+  max_dist_vertexes: 1.0
+  max_num_expansion: 100000
+  hgp_timeout_duration_ms: 1000
+  global_planner_heuristic_weight: 2.0
+  use_free_start: true
+  free_start_factor: 2.0
+  use_free_goal: false
+
+  # —— 局部 MINCO / 动力学 ——
+  dc: 0.02                    # setpoint 采样 dt(也是 plan 队列消费速率)
+  v_max: 5.0                  # ⚠️ 注:plan_local_trajectory_minco 当前没把它传进 plan_minco
+  a_max: 8.0                  #     (OptParams 默认管速度/加速度)——见脚本里 FLAG
+  j_max: 100.0
+  drone_bbox: [0.3, 0.3, 0.3]
+  drone_radius: 0.2
+
+  # —— 状态机 / 高度 ——
+  goal_radius: 0.6            # GOAL_REACHED 阈值
+  goal_seen_radius: 2.0
+  default_k_value: 20         # plan 队列提交偏移(commit/splice)
+  num_replanning_before_adapt: 10
+  hover_avoidance_enabled: false
+  force_goal_z: true
+  default_goal_z: 2.0
+  z_min: 0.5                  # A 落在 [z_min,z_max] 外会静默失败
+  z_max: 6.0
+  debug_verbose: false
+
+# —— 场景(全可调):起点/终点 + 障碍(中心 / 全尺寸 / 类别)——
+# class: wall=软场(id 自动落 200~299), human=硬约束(id<200)
+scene:
+  start: [0.0, 0.0, 2.0]
+  goal:  [50.0, 0.0, 2.0]
+  obstacles:
+    - {center: [10.0, 0.0, 2.0], size: [0.8, 0.8, 4.0], class: wall}
+    - {center: [18.0, 0.0, 2.0], size: [0.8, 0.8, 4.0], class: wall}
+    - {center: [26.0, 0.0, 2.0], size: [0.8, 0.8, 4.0], class: wall}
+    - {center: [34.0, 0.0, 2.0], size: [0.8, 0.8, 4.0], class: wall}
+    - {center: [42.0, 0.0, 2.0], size: [0.8, 0.8, 4.0], class: wall}
+
+# —— 仿真循环 ——
+loop:
+  replan_dt: 0.1     # 重规划周期(s)~10Hz
+  t_max: 60.0
+  sense_cull_r: 40.0 # 只把这范围内的障碍 push 给 planner(sim 侧裁剪,非 planner 配置)
+  headless: false
