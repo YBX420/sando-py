@@ -1,5 +1,35 @@
 """Local trajectory optimisation: B-spline + L-BFGS-B + detour multi-start.
 
+============================================================================
+中文说明（这个文件在整个规划器里干什么）：
+  这是「局部轨迹优化」环节。上游 heat-A*（hgp）给一条折线（粗糙的全局向导），
+  这里把它变成一条又平滑又安全的飞行曲线。
+
+  文件里其实有两套并行的实现，共用同一套「多起点 + 可行性挑选」的外壳：
+    1. plan()        —— 旧版：用 B 样条曲线 + scipy 的 L-BFGS-B 数值优化。
+    2. plan_minco()  —— 新版（当前主线）：用 MINCO（最小急动度五次曲线），
+                        梯度是解析推导出来的（不是数值差分），更快更准；
+                        而且按障碍「类别」分别处理：
+                          - 人（human）= HARD 硬约束：用「控制点凸包 + 增广拉格朗日
+                            (ALM)」把曲线挡在人之外，还考虑时间（space-time，
+                            人会动，要在「正确的时刻」躲开）。
+                          - 墙（wall）  = SOFT 软约束：用 EGO 那种「势场」，
+                            离得近就推一把，但允许蹭着走。
+
+  关键输入：A* 折线 astar_path、障碍列表 obstacles、每类障碍的避障参数 avoid_cfg。
+  关键输出：(轨迹对象, info 字典)。info 里把两件事分开报：
+        trajectory_valid   —— 轨迹「业务上」是否安全（离障碍够远、速度/加速度不超限）
+        optimizer_success  —— scipy 数值求解器是否收敛（两者互相独立！求解器收敛
+                              不代表轨迹安全，反之亦然）
+
+  名词速记：
+    MINCO   = 一种把「内部路点 q + 每段时间 T」当自由变量、内部用带状方程
+              M(T)c=b 解出多项式系数的轨迹表示（min-jerk 五次）。
+    ALM/PHR = 增广拉格朗日法，把硬约束变成可以用普通无约束优化器解的罚函数，
+              外层循环慢慢加大罚重 rho、更新乘子 lambda，直到约束满足。
+    EGO 场  = 一种软避障代价，离障碍越近代价越高（这里用三次方 hinge）。
+============================================================================
+
 Pipeline (per replan):
   1. take A* post-processed polyline + obstacles + per-class avoid config
   2. detour seed generation:
@@ -38,39 +68,50 @@ from .avoid_config import AvoidParams, resolve_mode
 from .bspline import UniformBSpline
 from .cost import obstacle_cost
 from .minco import MinjerkTraj, C2B
+from .obstacles import SphereObstacle
 
 
 @dataclass
 class OptParams:
+    """优化器的全部超参数（代价权重、限速、ALM 设置、space-time 设置等）。
+    一个地方集中放，plan()/plan_minco() 都从这里读。"""
+    # w_* 是各项代价的权重；w_time 是「时间锚」——不加它的话 dt 会被优化器无脑拉大，
+    # 因为平滑/速度/加速度代价都 ~ 1/dt^2，时间越长代价越小，会跑飞。
     w_smooth: float = 1.0
     w_vel: float = 100.0
     w_accel: float = 100.0
     w_time: float = 10.0
-    vmax: float = 3.0
-    amax: float = 3.0
-    dt_min: float = 0.05
-    K: int = 200
-    maxiter: int = 200
-    degree: int = 5
+    vmax: float = 3.0              # 速度上限 (m/s)
+    amax: float = 3.0              # 加速度上限 (m/s^2)
+    dt_min: float = 0.05           # 每段时间的下限，防止 dt 被压到 0 出数值病态
+    K: int = 200                   # 沿轨迹采样点数（算代价、查可行性时用）
+    maxiter: int = 200             # 求解器最大迭代次数
+    degree: int = 5                # B 样条阶数（5 = 五次曲线）
     # feasibility tolerances (Q4 of Step 1 spec)
-    clearance_tol: float = 0.05    # accept if min_clearance ≥ d_safe - tol
-    vel_tol: float = 0.10          # accept if max_v ≤ vmax · (1 + tol)
-    accel_tol: float = 0.10        # accept if max_a ≤ amax · (1 + tol)
+    # 可行性判据的容差：留一点点余量，免得差零点几就被判失败
+    clearance_tol: float = 0.05    # accept if min_clearance ≥ d_safe - tol（离障碍够远）
+    vel_tol: float = 0.10          # accept if max_v ≤ vmax · (1 + tol)（速度别超太多）
+    accel_tol: float = 0.10        # accept if max_a ≤ amax · (1 + tol)（加速度别超太多）
     # --- MINCO path additions (plan_minco only; unused by the B-spline plan) ---
-    w_obs: float = 1.0             # obstacle term weight in the MINCO cost
-    kappa: int = 16                # per-segment time-integral quadrature samples
-    M_cap: int = 12                # max interior-segment count for the MINCO seed
+    # 下面这几个只给新版 plan_minco 用，旧版 B 样条 plan() 用不到
+    w_obs: float = 1.0             # MINCO 代价里软障碍项的权重
+    kappa: int = 16                # 每段时间积分的采样点数（中点求积，越多越准越慢）
+    M_cap: int = 12                # MINCO 种子最多切几段（内部路点数的上限）
     # --- Stage 3: per-class HARD / SOFT + augmented-Lagrangian (ALM) ---
     # avoid_override: None -> per-class (mode from avoid_cfg[class].mode, fail-safe HARD);
     #                 'soft' -> force ALL obstacles soft (EGO field, ALM off) — the M2 baseline arm;
     #                 'hard' -> force ALL obstacles into the ALM convex-hull constraint (incl. walls).
+    # avoid_override：避障模式总开关。None = 按每类障碍自己的 mode 走（人硬/墙软，
+    #   读不到配置就保守地当硬约束）；'soft' = 强制所有障碍都走软场（关掉 ALM，
+    #   这是论文里的对照组 M2 baseline）；'hard' = 强制所有障碍（连墙）都进 ALM 硬约束。
     avoid_override: object = None
-    alm_rho0: float = 10.0         # initial penalty parameter rho
-    alm_rho_max: float = 1.0e8     # cap rho to avoid ill-conditioning the inner solve
-    alm_rho_grow: float = 2.0      # multiply rho when the outer step stalls progress
-    alm_outer_iters: int = 12      # outer-loop cap; STOP if still violating after this
-    alm_viol_tol: float = 1.0e-3   # max constraint violation below which ALM has converged
-    alm_inner_maxiter: int = 40    # L-BFGS-B iterations per inner solve (PHR warm-starts well)
+    # ALM（增广拉格朗日）外层循环的设置：
+    alm_rho0: float = 10.0         # 罚重 rho 的初值
+    alm_rho_max: float = 1.0e8     # rho 上限，太大内层求解会病态
+    alm_rho_grow: float = 2.0      # 外层进展卡住时，rho 乘这个倍数放大
+    alm_outer_iters: int = 12      # 外层循环上限；到了还在违反约束就停（判为 STOP）
+    alm_viol_tol: float = 1.0e-3   # 最大约束违反量小于它就认为 ALM 收敛
+    alm_inner_maxiter: int = 40    # 每次内层 L-BFGS-B 的迭代上限（PHR 热启动效果好，不用太多）
     # --- Stage 4: per-control-point SPACE-TIME ALM (S4a) + trust window (S4b) ---
     # tau_trust: seconds of prediction trust AHEAD of the replan instant (offline
     #   t_now=0). A control point with wall-clock t_{i,k} <= tau_trust is HARD
@@ -80,20 +121,115 @@ class OptParams:
     #   the EXACT Stage-3 segment-END single-time path runs (byte-identical).
     #   The _is_moving gate makes static humans Stage-3-identical even when True,
     #   so existing static tests are unaffected by the default-on switch.
+    # tau_trust：从「这次重规划的此刻」往前预测多少秒算「可信」。一个控制点的墙上
+    #   钟时间 t_{i,k} <= tau_trust 才算硬约束（ALM 顶住）；超过这个时间，对人未来位置的
+    #   预测就不可信了，这个控制点会从硬约束集合里「降级」，改交给软场 EGO 管（避免重复算）。
+    # spacetime_hard：space-time（考虑时间维度躲动态障碍）的总开关。设 False 或人是静止的
+    #   （速度=0）时，走的是和 Stage 3 完全一样的「每段只取段末单一时刻」老路径（逐字节一致）。
+    #   下面的 _is_moving 门控保证：哪怕这开关默认开着，静止的人也走 Stage 3 老路径，
+    #   所以已有的静态测试不受影响。
     tau_trust: float = 0.75
     spacetime_hard: bool = True
+    # --- conformal continuous-time certificate (novelty upgrade) ---
+    # q_conformal: Q_alpha — the (1-alpha) quantile of the human-prediction
+    #   sup-norm error sup_s||c_true(s)-c_pred(s)||, calibrated OFFLINE on a hold-out
+    #   set (see test/stage4_conformal_coverage.py). Added to a HARD SPHERE's
+    #   effective radius so R = radius + d_safe + Q_alpha. By the certificate
+    #   theorem, enforcing the relative margin >= R then guarantees Pr(no collision
+    #   over the whole interval) >= 1-alpha against the TRUE (unknown) human path.
+    #   It is a CONSTANT w.r.t. the decision variables (q, T): dQ/dq = dQ/dT = 0, so
+    #   every analytic gradient is byte-identical and only the constraint/cert LEVEL
+    #   shifts (the optimizer simply pushes the trajectory out by Q_alpha more).
+    #   Walls (AABB, soft/static) get no Q_alpha. Default 0.0 => deterministic
+    #   Stage 4 (all existing behaviour byte-for-byte; this is the ablation OFF arm).
+    # q_conformal：Q_alpha——人预测误差 sup_s||真-预测|| 的 (1-alpha) 分位，离线在校准集上
+    #   标定（见 test/stage4_conformal_coverage.py）。加到硬球体的有效半径上：
+    #   R = 半径 + d_safe + Q_alpha。证书定理保证：相对裕度 >= R 时，对人「真实(未知)轨迹」
+    #   整段不撞的概率 >= 1-alpha。它对优化变量 (q,T) 是常数（dQ/dq=dQ/dT=0），所以所有解析
+    #   梯度逐字节不变、只是把约束/证书的「水位」抬高（优化器只是把轨迹多推出去 Q_alpha）。
+    #   墙(AABB，软/静态)不加。默认 0.0 = 确定性 Stage 4（旧行为逐字节一致；这就是消融的 OFF 臂）。
+    q_conformal: float = 0.0
+    # --- execution gap: plan -> flown tube (epsilon_track) ---
+    # epsilon_track: a conservative upper bound on how far the FLOWN trajectory deviates
+    #   from the PLANNED one (tracking error + state-estimation error + replan latency).
+    #   The certificate is about the PLAN p(s); the drone flies p_actual(s) with
+    #   ||p_actual(s)-p(s)|| <= epsilon_track. Adding it to R upgrades the guarantee from
+    #   "the PLAN clears" to "the flown TUBE clears": plan margin >= R = r + d_safe + Q +
+    #   epsilon_track => flown margin >= plan margin - epsilon_track - Q >= r + d_safe.
+    #   UNLIKE Q_alpha (human-prediction error, SPHERES only), epsilon_track is the DRONE's
+    #   own position uncertainty -> obstacle-agnostic, so it inflates EVERY hard obstacle
+    #   (spheres AND hard AABB walls). Like Q_alpha it is CONSTANT in (q, T)
+    #   (deps/dq = deps/dT = 0) -> no gradient term, only the constraint/cert level shifts.
+    #   Default 0.0 (plan == flown, the ablation OFF arm; existing behaviour byte-for-byte).
+    # epsilon_track：实飞轨迹偏离规划轨迹的保守上界（跟踪误差+状态估计误差+replan 延迟）。
+    #   证书是对「规划」p(s) 的，无人机飞的是 p_actual(s)，||p_actual-p|| <= epsilon_track。
+    #   把它加进 R，就把保证从「规划清出」升级成「实飞管子清出」：规划裕度 >= R = r+d_safe+Q+eps
+    #   ⇒ 实飞裕度 >= 规划裕度 - eps - Q >= r+d_safe。
+    #   与 Q_alpha（人预测误差，只对球）不同：epsilon_track 是无人机**自己**的位置不确定度，
+    #   与障碍类型无关 → 对**每个**硬障碍都加（球 + 硬 AABB 墙）。同样对 (q,T) 是常数、不动梯度。
+    #   默认 0.0（规划=实飞，消融 OFF 臂；旧行为逐字节一致）。
+    epsilon_track: float = 0.0
+    # --- deterministic worst-case reachability mode (toward "never collide") ---
+    # safety_mode: 'conformal' (default) uses the calibrated PROBABILISTIC margin q_conformal
+    #   (coverage 1-alpha, an alpha failure rate, distribution-dependent -- cannot reach the
+    #   "every flight hour" reliability target). 'deterministic' REPLACES q_conformal with a
+    #   WORST-CASE reachable-set radius from the human's PHYSICAL limits -- no distribution, no
+    #   calibration data, no alpha. Within the trust window the human (trusted current CA
+    #   estimate, plus a bounded UNOBSERVABLE acceleration manoeuvre and bounded state-estimate
+    #   error) cannot leave Ball(c_nominal(t), reach). Enforcing relative margin >= radius +
+    #   d_safe + reach + epsilon_track then makes a collision IMPOSSIBLE under those physical
+    #   assumptions (not merely 1-alpha unlikely). reach (CONSTANT first version, evaluated at
+    #   tau_trust so the gradient stays free) = est_pos_err + est_vel_err*tau + 0.5*a_max_human
+    #   *tau^2. a_max_human=0 keeps it disabled. NOTE this certifies only the PLANNER layer
+    #   ("given the human is detected and the estimate is in-bound, the plan cannot collide");
+    #   the system-level per-flight-hour target also needs perception (miss-detection) +
+    #   hardware fault budgets, which live OUTSIDE this planner. A tighter time-varying
+    #   reach(t_{i,k}) is future work (it depends on T -> the gradient is no longer free).
+    # safety_mode：安全模式。'conformal'（默认）用概率余量 q_conformal（覆盖 1-alpha、有 alpha
+    #   失败率、依赖分布 → 够不到「每飞行小时」可靠性）；'deterministic' 把 q_conformal 换成由人
+    #   的**物理极限**算的最坏情形可达集半径——无分布、无校准数据、无 alpha。可信窗内人（可信的
+    #   当前 CA 估计 + 有界的不可观测加速机动 + 有界估计误差）出不了 Ball(c标称(t), reach)。强制
+    #   相对裕度 >= radius+d_safe+reach+epsilon_track → 在这些物理假设下撞击**不可能**（不是
+    #   1-alpha 罕见）。reach（常数首版，在 tau_trust 取值、保持梯度免费）= est_pos_err
+    #   + est_vel_err*tau + 0.5*a_max_human*tau^2。a_max_human=0 即关闭。注意它只证明 **planner
+    #   这一层**（「人被检测到、估计在界内时，规划不会撞」）；每飞行小时的系统目标还要感知（漏检）
+    #   + 硬件故障预算，那些在本 planner 之外。时变 reach(t_{i,k}) 留后续（依赖 T → 梯度不再免费）。
+    safety_mode: str = "conformal"
+    # reach_model（仅 deterministic 用）：可达集 reach 的两种物理模型——
+    #   'accel'（默认）：信任检测到的当前速度 v0(CA 标称),只 bound 不可观测的加速机动
+    #       reach = est_pos_err + est_vel_err*tau + 0.5*a_max_human*tau^2。
+    #       问题(真行人数据揭示):CA-偏离尾重(人会转/停),信 v0 会低估 -> 对真人不是五个九。
+    #   'speed'：**不信速度方向**,只用「瞬时速度物理有界」这个真物理事实——人 tau 秒内必在
+    #       当前位置 v_max_human*tau 内(任意机动,含反向)。把人当成当前 centre0 的**静态**球,
+    #       reach = est_pos_err + v_max_human*tau。这才是对真行人的物理最坏情形(0 物理违反)。
+    #       代价:reach 随 tau 增大 -> 靠**短 tau(快重规划)**压住(见 stage4_safety_budget)。
+    # reach_model (deterministic only): 'accel' trusts the detected velocity and bounds only the
+    #   unobservable acceleration manoeuvre (reach = est_pos_err + est_vel_err*tau + 0.5*a_max*tau^2);
+    #   real-pedestrian data shows this UNDER-estimates (humans turn/stop). 'speed' does NOT trust the
+    #   direction -- it uses the physical fact that instantaneous SPEED is bounded, so the human is
+    #   within v_max_human*tau of its CURRENT position under ANY manoeuvre (incl. a reversal). It treats
+    #   the human as STATIC at centre0 and sets reach = est_pos_err + v_max_human*tau -- the true
+    #   physical worst case (0 physical violations), at the cost of a reach that grows with tau (keep
+    #   tau small via fast replanning). Both are CONSTANT in (q, T) -> gradient-free.
+    reach_model: str = "accel"
+    a_max_human: float = 0.0        # 人物理最大 |加速度| (m/s^2)；'accel' reach 用；0 = 不启用确定性可达
+    v_max_human: float = 0.0        # 人物理最大速度 (m/s)；'speed' reach 用
+    est_pos_err: float = 0.0        # 人位置估计误差上界 (m)
+    est_vel_err: float = 0.0        # 人速度估计误差上界 (m/s)
 
 
 @dataclass
 class DetourConfig:
+    """「绕行多起点」的设置。思路：A* 那条线如果离障碍太近，就在它两侧各鼓出一条
+    备选路线当种子，多个种子各优化一遍，最后挑最好的——避免优化器从一个差起点掉进局部坑。"""
     enabled: bool = True
-    directions: int = 4               # ±u, ±v
-    trigger_margin: float = 0.10      # m — trigger detour if min_clearance < d_safe + margin
-    detour_margin: float = 0.30       # m — push to (r + d_safe + margin) outside obstacle
-    top_k_obstacles: int = 1          # only generate detours for the top-k violators
-    max_seeds: int = 5                # hard cap on candidates
-    K_eval: int = 100                 # samples along polyline for clearance/trigger check
-    perturb_window: int = 3           # half-window of path points to nudge
+    directions: int = 4               # 每个障碍最多往 ±u, ±v 四个方向各鼓一条
+    trigger_margin: float = 0.10      # m — 折线离障碍 < d_safe + margin 才触发绕行
+    detour_margin: float = 0.30       # m — 把路点推到障碍外 (r + d_safe + margin) 处
+    top_k_obstacles: int = 1          # 只给违反最严重的前 k 个障碍生成绕行
+    max_seeds: int = 5                # 候选种子总数硬上限
+    K_eval: int = 100                 # 沿折线采样多少点来查间隙/判断是否触发
+    perturb_window: int = 3           # 鼓包时影响的路点半窗宽（前后各几个点跟着挪）
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +237,9 @@ class DetourConfig:
 # ---------------------------------------------------------------------------
 
 def _obstacle_geom(obs) -> Tuple[np.ndarray, float]:
-    """Return (centre, radius_equiv). For AABB we fall back to its bounding sphere
+    """返回障碍的 (中心, 等效半径)。球体直接读；长方体(AABB)就用它的外接球近似
+    （第一版偷懒，但拿来定个绕行方向够用了）。
+    Return (centre, radius_equiv). For AABB we fall back to its bounding sphere
     (first-version simplification — good enough to choose a detour direction)."""
     if hasattr(obs, "centre0"):  # SphereObstacle
         return obs.centre0.copy(), float(obs.radius)
@@ -113,13 +251,16 @@ def _obstacle_geom(obs) -> Tuple[np.ndarray, float]:
 
 
 def _orthonormal_pair(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Two unit vectors orthogonal to `axis` and to each other."""
+    """给定一个轴 axis，返回两个互相垂直、又都垂直于它的单位向量 (u, v)。
+    用来确定「往障碍两侧鼓」的两个正交方向。
+    Two unit vectors orthogonal to `axis` and to each other."""
     n = float(np.linalg.norm(axis))
     if n < 1e-9:
         return np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
     a = axis / n
     world = np.eye(3)
     cosines = np.abs(world @ a)
+    # 挑一个和 axis 最不平行的世界坐标轴，减去它在 a 上的分量，得到一个垂直方向 u
     pick = int(np.argmin(cosines))   # world axis least aligned with `axis`
     u = world[pick] - float(np.dot(world[pick], a)) * a
     u /= max(float(np.linalg.norm(u)), 1e-9)
@@ -133,6 +274,8 @@ def _orthonormal_pair(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def _resample_polyline(path: np.ndarray, K: int) -> np.ndarray:
+    """把折线按弧长（实际走过的距离）均匀重采样成 K 个点。
+    用累计长度做线性插值，这样点在空间上分布均匀，不受原折线顶点疏密影响。"""
     diffs = np.linalg.norm(np.diff(path, axis=0), axis=1)
     cum = np.concatenate([[0.0], np.cumsum(diffs)])
     total = float(cum[-1])
@@ -143,12 +286,15 @@ def _resample_polyline(path: np.ndarray, K: int) -> np.ndarray:
 
 
 def _min_clearance_per_obstacle(path: np.ndarray, obstacles, K_eval: int):
-    """Return list of (min_clearance, closest_path_index) per obstacle."""
+    """对每个障碍，算折线离它最近的「带符号距离」以及最近发生在哪个折线顶点附近。
+    返回每个障碍一条 (最小间隙, 最近折线点下标)。
+    Return list of (min_clearance, closest_path_index) per obstacle."""
     samples = _resample_polyline(path, K_eval)
     out = []
     for obs in obstacles:
         ds = np.array([obs.signed_dist(samples[i], 0.0) for i in range(K_eval)])
         i_min = int(np.argmin(ds))
+        # 采样点是在重采样后的密集序列上找的，这里按比例换算回原折线的顶点下标
         # map sample index back to path index (proportional)
         i_path = int(round(i_min * (len(path) - 1) / max(K_eval - 1, 1)))
         out.append((float(ds[i_min]), i_path))
@@ -157,7 +303,11 @@ def _min_clearance_per_obstacle(path: np.ndarray, obstacles, K_eval: int):
 
 def _make_detour_path(path: np.ndarray, obstacle, direction: np.ndarray,
                       d_safe: float, detour_cfg: DetourConfig) -> np.ndarray:
-    """Bulge the polyline around obstacle in the given direction.
+    """把折线沿给定方向「鼓」出一个包，绕开这个障碍。
+    做法：找到离障碍中心最近的折线点，算出绕行目标点
+    (中心 + 方向 · (半径 + 安全距离 + 余量))，然后把附近一窗口的点按钟形权重
+    朝目标点挪过去。首尾两端钉死不动（保证起点终点不变）。
+    Bulge the polyline around obstacle in the given direction.
 
     Find the closest path index to the obstacle centre, compute the detour
     target at (centre + direction · (r + d_safe + margin)), then shift a
@@ -174,7 +324,8 @@ def _make_detour_path(path: np.ndarray, obstacle, direction: np.ndarray,
     M = len(path)
     for j in range(max(0, i_close - w), min(M, i_close + w + 1)):
         if j == 0 or j == M - 1:
-            continue  # endpoints stay pinned
+            continue  # 首尾钉死，不挪 / endpoints stay pinned
+        # 离最近点越远，挪得越少（钟形/三角权重），形成一个平滑的鼓包
         weight = max(0.0, 1.0 - abs(j - i_close) / (w + 1))
         new_path[j] += shift * weight
     return new_path
@@ -182,27 +333,33 @@ def _make_detour_path(path: np.ndarray, obstacle, direction: np.ndarray,
 
 def _generate_detour_seeds(astar_path: np.ndarray, obstacles, avoid_cfg, opt: OptParams,
                            detour_cfg: DetourConfig) -> List[Tuple[str, np.ndarray]]:
-    """Build the list of candidate seed paths. Always includes 'original'."""
+    """生成候选种子路径列表，第一个永远是原始 A* 折线 'original'。
+    只对「离障碍太近」的障碍生成绕行种子，每个种子是一条带名字的折线。
+    Build the list of candidate seed paths. Always includes 'original'."""
     seeds: List[Tuple[str, np.ndarray]] = [("original", astar_path)]
     if not detour_cfg.enabled or not obstacles:
         return seeds
     clearances = _min_clearance_per_obstacle(astar_path, obstacles, detour_cfg.K_eval)
+    # 挑出「违反者」：折线离它太近（间隙 < d_safe + 触发余量）的障碍
     violators = []
     for i, obs in enumerate(obstacles):
         params = avoid_cfg.get(obs.class_name)
-        d_safe = params.d_safe if params is not None else 0.8  # fail-safe default
+        d_safe = params.d_safe if params is not None else 0.8  # 读不到配置就用保守默认 0.8
         min_clr, i_path = clearances[i]
         violation = (d_safe + detour_cfg.trigger_margin) - min_clr
         if violation > 0:
             violators.append((violation, i, obs, d_safe, i_path))
     if not violators:
         return seeds
-    violators.sort(key=lambda v: -v[0])  # most-violated first
+    violators.sort(key=lambda v: -v[0])  # 违反最严重的排前面 / most-violated first
+    # 只给前 top_k 个最严重的障碍生成绕行
     for violation, i, obs, d_safe, i_path in violators[: detour_cfg.top_k_obstacles]:
         centre, _r = _obstacle_geom(obs)
         path_pt = astar_path[min(i_path, len(astar_path) - 1)]
+        # 绕行的「轴」= 从最近折线点指向障碍中心；两侧 ±u/±v 就是垂直于这条轴的方向
         axis = centre - path_pt
         if float(np.linalg.norm(axis)) < 1e-6:
+            # 折线点恰好压在障碍中心上，轴退化了，改用「起点->终点」方向兜底
             # path point coincides with obstacle centre — fall back to start-goal axis
             axis = astar_path[-1] - astar_path[0]
         u, v = _orthonormal_pair(axis)
@@ -210,7 +367,7 @@ def _generate_detour_seeds(astar_path: np.ndarray, obstacles, avoid_cfg, opt: Op
         for j, d in enumerate(dirs):
             new_path = _make_detour_path(astar_path, obs, d, d_safe, detour_cfg)
             seeds.append((f"detour_obs{i}_dir{j}", new_path))
-            if len(seeds) >= detour_cfg.max_seeds:
+            if len(seeds) >= detour_cfg.max_seeds:  # 到种子上限就停，别生成太多拖慢求解
                 return seeds
     return seeds
 
@@ -221,7 +378,13 @@ def _generate_detour_seeds(astar_path: np.ndarray, obstacles, avoid_cfg, opt: Op
 
 def check_feasibility(spline, obstacles, avoid_cfg,
                       opt: OptParams, K_eval: int = 200) -> dict:
-    """Compute trajectory-level feasibility, independent of optimiser convergence.
+    """检查轨迹「业务上」是否可行（够安全 + 速度/加速度不超限），和优化器是否收敛无关。
+    沿轨迹密集采 K_eval 个点：量到每个障碍的最近间隙、看最大速度/加速度有没有超限，
+    任何一项越界就给出 failure_reason，否则 trajectory_valid=True。
+
+    spline 可以是 B 样条(UniformBSpline)，也可以是 MINCO 轨迹(MinjerkTraj)——
+    这里只用到它们共有的 .t_start/.t_end/.eval/.eval_deriv 接口，所以两种都能传。
+    Compute trajectory-level feasibility, independent of optimiser convergence.
 
     `spline` may be a UniformBSpline OR a MinjerkTraj — only .t_start/.t_end/
     .eval/.eval_deriv are used, which both expose identically.
@@ -235,7 +398,8 @@ def check_feasibility(spline, obstacles, avoid_cfg,
     max_violation = 0.0
     for obs in obstacles:
         params = avoid_cfg.get(obs.class_name)
-        d_safe = params.d_safe if params is not None else 0.8  # fail-safe default
+        d_safe = params.d_safe if params is not None else 0.8  # 读不到配置就保守用 0.8
+        # 注意 signed_dist 带时间参数 ts[i]：动态障碍在不同时刻位置不同
         for i in range(K_eval):
             d = obs.signed_dist(pts[i], float(ts[i]))
             if d < min_clr:
@@ -252,6 +416,7 @@ def check_feasibility(spline, obstacles, avoid_cfg,
     vel_violation = max(0.0, max_v - opt.vmax)
     accel_violation = max(0.0, max_a - opt.amax)
 
+    # 按优先级定失败原因：先看离障碍够不够远，再看速度，再看加速度（带容差）
     failure_reason = None
     if obstacles and max_violation > opt.clearance_tol:
         failure_reason = "clearance_violation"
@@ -278,24 +443,31 @@ def check_feasibility(spline, obstacles, avoid_cfg,
 
 def _build_spline(x: np.ndarray, num_ctrl: int, p: int,
                   start_pt: np.ndarray, end_pt: np.ndarray) -> UniformBSpline:
+    """把优化变量 x = [内部控制点拉平..., dt] 还原成一条 B 样条。
+    首尾各 p+1 个控制点固定成 start/end（clamped，保证起终点不动），中间是自由变量。"""
     dt = float(x[-1])
     interior = x[:-1].reshape(-1, 3)
     ctrl = np.empty((num_ctrl, 3), dtype=np.float64)
-    ctrl[: p + 1] = start_pt
+    ctrl[: p + 1] = start_pt           # 头部 p+1 个重复 = 钉住起点
     ctrl[p + 1 : -(p + 1)] = interior
-    ctrl[-(p + 1) :] = end_pt
+    ctrl[-(p + 1) :] = end_pt          # 尾部 p+1 个重复 = 钉住终点
     return UniformBSpline(ctrl, degree=p, dt=dt)
 
 
 def _total_cost(x: np.ndarray, num_ctrl: int, p: int,
                 start_pt: np.ndarray, end_pt: np.ndarray,
                 obstacles, avoid_cfg, opt: OptParams, T_target: float) -> float:
+    """B 样条路径的总代价（标量），给 scipy 数值优化器当目标函数。
+    = 障碍代价 + 平滑(snap^2) + 超速罚 + 超加速度罚 + 时间锚。注意这版没有解析梯度，
+    L-BFGS-B 自己做有限差分；MINCO 那条路径才有解析梯度。"""
     bs = _build_spline(x, num_ctrl, p, start_pt, end_pt)
     K = opt.K
     ts = np.linspace(bs.t_start, bs.t_end, K)
     c_obs = obstacle_cost(bs, obstacles, avoid_cfg, K=K)
+    # 平滑项：snap = 四阶导（急动度的导数），平方平均，越小曲线越顺
     snap = bs.eval_deriv(ts, order=4)
     c_smooth = opt.w_smooth * float(np.mean(np.sum(snap * snap, axis=1)))
+    # 超速罚：只罚超过 vmax 的部分（hinge），平方
     vel = bs.eval_deriv(ts, order=1)
     v_mag = np.linalg.norm(vel, axis=1)
     v_over = np.maximum(v_mag - opt.vmax, 0.0)
@@ -304,6 +476,7 @@ def _total_cost(x: np.ndarray, num_ctrl: int, p: int,
     a_mag = np.linalg.norm(accel, axis=1)
     a_over = np.maximum(a_mag - opt.amax, 0.0)
     c_accel = opt.w_accel * float(np.mean(a_over * a_over))
+    # 时间锚：把总时长拉回 T_target 附近，防止 dt 失控（见文件头说明）
     T_actual = (num_ctrl - p) * float(x[-1])
     rel = (T_actual - T_target) / max(T_target, 1e-6)
     c_time = opt.w_time * rel * rel
@@ -312,16 +485,19 @@ def _total_cost(x: np.ndarray, num_ctrl: int, p: int,
 
 def _optimise_one(seed_path: np.ndarray, obstacles, avoid_cfg, opt: OptParams,
                   num_ctrl: int) -> dict:
-    """Run one LBFGS-B from a given seed polyline. Return candidate record."""
+    """从一条种子折线出发，跑一次 B 样条 L-BFGS-B 优化，返回这个候选的记录。
+    Run one LBFGS-B from a given seed polyline. Return candidate record."""
     p = opt.degree
     seg_lens = np.linalg.norm(np.diff(seed_path, axis=0), axis=1)
     path_len = float(seg_lens.sum())
+    # 初始总时长按「路径长度 / 限速」估，再分摊到每段得到 dt0（不低于 dt_min 两倍）
     T0 = path_len / max(opt.vmax, 1e-6)
     dt0 = max(T0 / max(num_ctrl - p, 1), opt.dt_min * 2.0)
     bs0 = UniformBSpline.fit_path(seed_path, num_ctrl=num_ctrl, degree=p,
                                   dt=dt0, clamp_endpoints=True)
     start_pt = seed_path[0].copy()
     end_pt = seed_path[-1].copy()
+    # 优化变量 x = [内部控制点拉平..., dt]，最后一维 dt 受 dt_min 下界约束
     interior_init = bs0.ctrl[p + 1 : -(p + 1)].copy().ravel()
     x0 = np.concatenate([interior_init, [dt0]])
     bounds = [(None, None)] * (x0.size - 1) + [(opt.dt_min, None)]
@@ -350,7 +526,10 @@ def _optimise_one(seed_path: np.ndarray, obstacles, avoid_cfg, opt: OptParams,
 
 
 def _select_best(candidates: List[dict]) -> dict:
-    """Feasible-first; failing that, the 'least bad' candidate."""
+    """从多个种子优化结果里挑最好的（B 样条版）。
+    可行优先：只要有可行的，就在可行里挑代价最低的；一个可行的都没有，就挑「最不糟」的
+    （按 间隙违反量 -> 速度违反量 -> 代价 依次比较）。
+    Feasible-first; failing that, the 'least bad' candidate."""
     feasible = [c for c in candidates if c["feasibility"]["trajectory_valid"]]
     if feasible:
         return min(feasible, key=lambda c: c["final_cost"])
@@ -362,10 +541,10 @@ def _select_best(candidates: List[dict]) -> dict:
 
 
 def _select_best_minco(candidates: List[dict]) -> dict:
-    """MINCO selection. A candidate that breaches a HARD human can NEVER win as
-    valid; feasible-first picks the cheapest fully-valid one, otherwise the
-    least-bad is ranked HARD-breach FIRST (the violated constraint is a person),
-    then soft-wall clearance, then vel, then cost — the explicit STOP ordering."""
+    """从多个种子结果里挑最好的（MINCO 版）。和 _select_best 的区别：撞了人(HARD)的
+    候选永远不能算「可行」；都不可行时，「最不糟」的排序把『撞人 hard_max_breach』放在
+    最前面比（因为违反的约束是个人，最要命），然后才是软墙间隙、速度、代价——
+    这就是显式的 STOP 优先级。"""
     feasible = [c for c in candidates if c["feasibility"]["trajectory_valid"]]
     if feasible:
         return min(feasible, key=lambda c: c["final_cost"])
@@ -388,7 +567,9 @@ def plan(astar_path: np.ndarray,
          num_ctrl: int = None,
          opt_params: OptParams = None,
          detour_cfg: DetourConfig = None) -> Tuple[UniformBSpline, dict]:
-    """Plan a quintic B-spline with detour multi-start + feasibility selection.
+    """【旧版 B 样条对外接口】用五次 B 样条 + 绕行多起点 + 可行性挑选规划一条轨迹。
+    （新版主线是下面的 plan_minco；这个保留作对照/历史。）
+    Plan a quintic B-spline with detour multi-start + feasibility selection.
 
     Returns (spline, info). `info` has these keys:
         trajectory_valid    (bool) — business feasibility (clearance / vel / accel)
@@ -408,14 +589,17 @@ def plan(astar_path: np.ndarray,
     astar_path = np.asarray(astar_path, dtype=np.float64)
     if astar_path.ndim != 2 or astar_path.shape[0] < 2:
         raise ValueError(f"astar_path must be (M≥2, d), got {astar_path.shape}")
+    # 控制点数：默认大约取折线点数的一半，但至少要够 clamped 五次样条用（头尾各 p+1 个）
     if num_ctrl is None:
         num_ctrl = max(2 * (p + 1), int(round(len(astar_path) / 2)))
     if num_ctrl < 2 * (p + 1) + 1:
         num_ctrl = 2 * (p + 1) + 1
 
     obstacles_list = list(obstacles)
+    # 第一步：生成种子（原始 + 若干绕行）
     seeds = _generate_detour_seeds(astar_path, obstacles_list, avoid_cfg, opt, detour_cfg)
 
+    # 第二步：每个种子各优化一遍；某个种子数值上炸了就跳过，继续别的
     candidates: List[dict] = []
     for name, seed_path in seeds:
         try:
@@ -428,6 +612,7 @@ def plan(astar_path: np.ndarray,
     if not candidates:
         raise RuntimeError("all seeds failed to optimise")
 
+    # 第三步：挑最好的
     best = _select_best(candidates)
     feas = best["feasibility"]
     info = {
@@ -452,8 +637,18 @@ def plan(astar_path: np.ndarray,
 
 
 # ===========================================================================
-# MINCO analytic-gradient solve path (M2). Additive: the B-spline plan() above
-# stays untouched. Decision vars x = [q.ravel() ((M-1)*3,), T (M,)].
+# 【下面是新版主线：MINCO 解析梯度求解路径 (M2)】
+# 和上面的 B 样条 plan() 完全独立，互不影响。
+# 优化变量 x = [内部路点 q 拉平 ((M-1)*3 个), 每段时间 T (M 个)]。
+# 总代价 = 平滑能量 + 软障碍 + 超速罚 + 超加速度罚 + 时间锚，
+#   而且对 (q, T) 的梯度全是「解析」推出来的（不是数值差分），所以又快又准。
+#
+# 障碍/速度/加速度这些是「沿时间的积分」，用每段中点求积近似（GCOPTER 那套）：
+#   第 i 段在 tau = s_j·T_i 处采样，s_j=(j+0.5)/kappa，求积权重 T_i/kappa。
+# 对时间 T 的梯度有两条来源（这是最容易算错的地方）：
+#   隐式(IMPLICIT)：c = M(T)^{-1} b，系数 c 本身依赖 T   -> grad_from_dcost_dc(...)
+#   显式(EXPLICIT)：采样时刻在动 + 求积权重在变           -> dcost_dT_explicit，见下
+# ===========================================================================
 # Cost = w_smooth·energy + w_obs·obstacle + w_vel·vel-hinge + w_accel·acc-hinge
 #        + w_time·time-anchor, all with ANALYTIC gradient w.r.t. (q, T).
 #
@@ -466,41 +661,51 @@ def plan(astar_path: np.ndarray,
 
 
 def _signed_dist_and_grad(obs, p: np.ndarray, t: float):
-    """Return (d, dd/dp (3,), dd/dt scalar) analytically for sphere / AABB.
+    """单点版：解析地算「点 p 在时刻 t 离障碍 obs 的带符号距离 d，以及 d 对位置的梯度
+    dd/dp 和对时间的梯度 dd/dt」。球体和长方体(AABB)分开处理。
+    注意：调用方要保证采样点别落在不可导的拐点上（球心处、长方体表面/内部的棱角）。
+    Return (d, dd/dp (3,), dd/dt scalar) analytically for sphere / AABB.
 
     Sphere(moving): d=||p-c(t)||-r, c(t)=centre0+vel·t.
         dd/dp = (p-c)/||p-c||,  dd/dt = -(p-c)/||p-c|| · vel = -(dd/dp)·vel.
     AABB outside: d=||outside_vec||, dd/dp = outside_vec/||outside_vec|| (static, dd/dt=0).
     AABB inside : d = L∞ penetration (negative); subgradient ±e on the active axis.
     Caller must keep samples off the kinks (||p-c||=0, ||outside||=0, AABB face/interior)."""
+    # 球体（可能在动）：d = ||p - c(t)|| - r，c(t) = predict(t)（CA：centre0+vel·t+0.5·accel·t^2）
     if hasattr(obs, "centre0"):  # SphereObstacle
-        c = obs.centre0 + obs.vel * float(t)
+        c = obs.predict(float(t))
         diff = np.asarray(p, dtype=np.float64) - c
         nrm = float(np.linalg.norm(diff))
-        n = diff / nrm
+        n = diff / nrm                 # 单位外法向，也是 dd/dp
         d = nrm - obs.radius
-        dd_dt = -float(n.dot(obs.vel))
+        # 障碍在动 -> 距离随时间的变化率，用瞬时速度 velocity_at(t)=vel+accel·t（CA）
+        dd_dt = -float(n.dot(obs.velocity_at(float(t))))
         return d, n, dd_dt
-    # AABBObstacle (static -> dd/dt = 0)
+    # 长方体 AABB（静止 -> dd/dt = 0）
     p = np.asarray(p, dtype=np.float64)
+    # over = 每个轴上「超出盒子」的量（在盒外才 > 0）
     over = np.maximum(obs.lo - p, 0.0) + np.maximum(p - obs.hi, 0.0)
     if np.any(over > 0.0):
+        # 在盒外：d = 到盒子的欧氏距离 = ||over||
         nrm = float(np.linalg.norm(over))
-        # dd/dp_axis = sign on the violated face: +1 if p>hi, -1 if p<lo
+        # dd/dp_axis = 被违反那个面的符号：p>hi 取 +1，p<lo 取 -1
         sign = np.where(p > obs.hi, 1.0, 0.0) - np.where(p < obs.lo, 1.0, 0.0)
-        dd_dp = (over * sign) / nrm  # over is |violation|; restore signed direction
+        dd_dp = (over * sign) / nrm  # over 是 |违反量|，乘 sign 还原带方向
         return nrm, dd_dp, 0.0
-    # inside: d = max over axes of max(lo-p, p-hi)  (<= 0); L∞ subgradient
+    # 在盒内：d = 各轴 max(lo-p, p-hi) 的最大值（<=0，负的表示穿透深度）；用 L∞ 次梯度
     cand = np.maximum(obs.lo - p, p - obs.hi)  # per-axis penetration (signed, <=0)
     ax = int(np.argmax(cand))
     grad = np.zeros(3)
-    # active term is max(lo-p, p-hi) on axis ax; whichever wins sets the sign
+    # 在 ax 这个轴上比 lo-p 和 p-hi 谁大，谁就决定次梯度方向
     grad[ax] = -1.0 if (obs.lo[ax] - p[ax]) >= (p[ax] - obs.hi[ax]) else 1.0
     return float(cand[ax]), grad, 0.0
 
 
 def _seg_vander(taus: np.ndarray):
-    """Power-basis rows for orders 0..3 at local times taus (kappa,).
+    """造「幂基」矩阵：在一组局部时刻 taus 上，把 0~3 阶导数对多项式系数的依赖写成矩阵行。
+    返回 (B0,B1,B2,B3)，每个形状 (kappa,6)。B_o 这一阶满足：deriv^(o) = B_o @ c。
+    第 p 列、第 o 阶的值 = (p!/(p-o)!)·tau^(p-o)，就是对 tau 求 o 次导后剩下的多项式。
+    Power-basis rows for orders 0..3 at local times taus (kappa,).
 
     Returns (B0,B1,B2,B3) each (kappa,6): B_o[j] = _basis(taus[j], o).
     Vectorised over the kappa samples (no per-point scalar _basis): column p of
@@ -523,7 +728,10 @@ _BASIS_CACHE = {}
 
 
 def _fixed_basis(kappa: int):
-    """Cached fixed-fraction basis: s=(j+0.5)/kappa and Bs_o=_seg_vander(s).
+    """带缓存的「固定比例基」：求积点取每段的等分中点比例 s=(j+0.5)/kappa（与段长无关），
+    在这些比例上预算一次幂基 Bs=_seg_vander(s) 存起来。每段只要按各自 T_i 缩放即可（见
+    _scale_basis），不用每段重造，省时间。idx[o][p]=max(p-o,0) 记录缩放时该乘 T_i 的几次方。
+    Cached fixed-fraction basis: s=(j+0.5)/kappa and Bs_o=_seg_vander(s).
 
     Returns (s, (Bs0,Bs1,Bs2,Bs3), idx) where idx[o][p]=max(p-o,0) selects the
     Ti-power that scales column p of order o (see _scale_basis)."""
@@ -536,7 +744,9 @@ def _fixed_basis(kappa: int):
 
 
 def _scale_basis(Bs, idx, Ti: float):
-    """Scale fixed-fraction basis Bs (at tau=s) to segment time Ti.
+    """把「固定比例基」Bs（在 tau=s 上算的）缩放到实际段时长 Ti 上。
+    因为 tau = s·Ti，所以 B_o 的第 p 列要乘 Ti^(p-o)。代替每段重新跑 _seg_vander。
+    Scale fixed-fraction basis Bs (at tau=s) to segment time Ti.
 
     B_o(s·Ti)[:,p] = Bs_o[:,p]·Ti^(p-o).  Columns p<o are zero in Bs, so their
     Ti^0=1 scaling is harmless. Replaces a per-segment _seg_vander rebuild."""
@@ -545,7 +755,12 @@ def _scale_basis(Bs, idx, Ti: float):
 
 
 def _minco_obstacle_term(tr: MinjerkTraj, obstacles, avoid_cfg, opt: OptParams):
-    """(cost, dcost_dc (6M,3), dcost_dT_explicit (M,)) for the obstacle integral.
+    """软障碍（EGO 势场）的代价项及其解析梯度。这里的 obstacles 是【软】障碍集合（墙）。
+    返回 (代价, 对系数 c 的梯度 (6M,3), 对每段时间 T 的显式梯度 (M,))。
+
+    代价 = Σ_i (T_i/κ) Σ_j Σ_obs W·φ(d)，其中 φ(d)=(d_safe-d)^3 只在 d<d_safe（离得太近）时生效。
+    也就是离墙越近罚越多（三次方），离得够远就完全不罚（允许蹭着走，这就是软的意思）。
+    (cost, dcost_dc (6M,3), dcost_dT_explicit (M,)) for the obstacle integral.
 
     cost = Σ_i (T_i/κ) Σ_j Σ_obs W·φ(d),  φ(d)=(d_safe-d)^3 for d<d_safe.
     See header / explicit_dT_term derivation: dcost_dT_explicit collects
@@ -563,64 +778,73 @@ def _minco_obstacle_term(tr: MinjerkTraj, obstacles, avoid_cfg, opt: OptParams):
     dT_exp = np.zeros(M)
     if not obstacles:
         return cost, dcost_dc, dT_exp
-    cum = tr._cum
-    for i in range(M):
+    cum = tr._cum                              # 各段起始的累计墙上时间
+    for i in range(M):                         # 逐段
         Ti = float(tr.T[i])
-        taus = s * Ti
+        taus = s * Ti                          # 这一段内的局部采样时刻
         B0, B1, _, _ = _scale_basis(Bs, bidx, Ti)
-        ci = tr.c[6 * i:6 * i + 6]             # (6,3)
-        P = B0 @ ci                            # (κ,3) sample positions
-        V = B1 @ ci                            # (κ,3) sample velocities
-        t_abs = cum[i] + taus                  # (κ,) absolute times
-        wq = Ti / kap
+        ci = tr.c[6 * i:6 * i + 6]             # (6,3) 这段的多项式系数
+        P = B0 @ ci                            # (κ,3) 采样点位置
+        V = B1 @ ci                            # (κ,3) 采样点速度
+        t_abs = cum[i] + taus                  # (κ,) 每个采样点的绝对（墙上）时刻
+        wq = Ti / kap                          # 求积权重
         for obs in obstacles:
             params = avoid_cfg[obs.class_name]
             d_safe = params.d_safe
             W = params.weight
-            # batched (d, dd/dp, dd/dt) over the κ samples
+            # 一次性算这 κ 个采样点的 (距离, dd/dp, dd/dt)
             dvec, ndp, dddt = _signed_dist_and_grad_batch(obs, P, t_abs)  # (κ,),(κ,3),(κ,)
-            diff = d_safe - dvec               # (κ,)
-            act = diff > 0.0
+            diff = d_safe - dvec               # (κ,) 侵入量，>0 才有罚
+            act = diff > 0.0                   # 只在「离得太近」的采样点上算（active）
             if not np.any(act):
                 continue
             diff_a = diff[act]
-            phi = diff_a ** 3
-            dphi = -3.0 * diff_a * diff_a      # φ'(d), (na,)
+            phi = diff_a ** 3                  # φ = 侵入量^3
+            dphi = -3.0 * diff_a * diff_a      # φ'(d)（注意对 d 求导带负号）, (na,)
             B0a = B0[act]; ndpa = ndp[act]; Va = V[act]; sa = s[act]
             cost += wq * W * float(np.sum(phi))
+            # 对系数 c 的梯度（隐式那条链）：把每个采样点的贡献按基函数摊回 6 个系数上
             # implicit-c: Σ_j (wq W dphi_j) outer(B0_j, ndp_j)
             coef = (wq * W) * dphi             # (na,)
             dcost_dc[6 * i:6 * i + 6] += B0a.T @ (coef[:, None] * ndpa)
             Phi = W * phi
-            # (a) quadrature-weight
+            # 下面是对段时间 T 的「显式」梯度，三部分（见 docstring 的 a/b/c）：
+            # (a) 求积权重 T_i/κ 里那个 T_i 求导
             dT_exp[i] += (1.0 / kap) * float(np.sum(Phi))
-            # (b) moving-local-sample: wq Σ_j W dphi_j (ndp_j·V_j) s_j
+            # (b) 采样的局部时刻 tau=s_j·T_i 也随 T_i 变 -> 链式带速度项
             ndp_dot_V = np.einsum("kd,kd->k", ndpa, Va)
             dT_exp[i] += wq * float(np.sum(W * dphi * ndp_dot_V * sa))
-            # (c) absolute-time term for moving obstacles
+            # (c) 障碍在动时，采样点的绝对时刻 t_abs 也依赖各段 T -> 额外的时间项
             dddt_a = dddt[act]
             if np.any(dddt_a != 0.0):
                 A = (wq * W) * dphi * dddt_a   # (na,) = wq·∂Φ/∂t_abs per sample
-                dT_exp[i] += float(np.sum(sa * A))   # (c1) same segment
+                dT_exp[i] += float(np.sum(sa * A))   # (c1) 本段内（局部分量 s_j）
                 if i > 0:
-                    dT_exp[:i] += float(np.sum(A))    # (c2) all upstream segments
+                    dT_exp[:i] += float(np.sum(A))    # (c2) 本段时刻还受前面所有段 T 影响
     return cost, dcost_dc, dT_exp
 
 
 def _signed_dist_and_grad_batch(obs, P: np.ndarray, t_abs: np.ndarray):
-    """Vectorised (d (κ,), dd/dp (κ,3), dd/dt (κ,)) over κ sample points P.
+    """_signed_dist_and_grad 的「一批 κ 个点一起算」向量化版本，数学完全一样。
+    球体纯 numpy 矢量化；长方体也矢量化了（盒外/盒内分别处理）。
+    Vectorised (d (κ,), dd/dp (κ,3), dd/dt (κ,)) over κ sample points P.
 
     Same math as _signed_dist_and_grad, batched. Sphere is pure-numpy; AABB
     falls back to the per-point scalar routine (rare, cheap)."""
     P = np.asarray(P, dtype=np.float64)
     k = P.shape[0]
-    if hasattr(obs, "centre0"):  # sphere (possibly moving)
-        c = obs.centre0[None, :] + obs.vel[None, :] * t_abs[:, None]  # (κ,3)
+    if hasattr(obs, "centre0"):  # sphere (possibly moving, CA model)
+        c = obs.predict(t_abs)                                        # (κ,3) centre0+vel·t+0.5·accel·t^2
         diff = P - c
         nrm = np.linalg.norm(diff, axis=1)                            # (κ,)
         n = diff / nrm[:, None]
         d = nrm - obs.radius
-        dd_dt = -(n @ obs.vel)                                        # (κ,)
+        # dd/dt = -n·velocity_at(t)。accel=0 时瞬时速度退回常数 vel，走原来的 n@vel
+        # （BLAS 同一算法，逐字节回退）；accel≠0 时瞬时速度逐点变化，逐点点积。
+        if not np.any(obs.accel):
+            dd_dt = -(n @ obs.vel)                                    # (κ,) CV 回退
+        else:
+            dd_dt = -np.einsum("kd,kd->k", n, obs.velocity_at(t_abs))  # (κ,) CA
         return d, n, dd_dt
     # AABB (static): vectorised over the k samples, same math as the scalar path.
     lo = obs.lo[None, :]; hi = obs.hi[None, :]
@@ -649,7 +873,10 @@ def _signed_dist_and_grad_batch(obs, P: np.ndarray, t_abs: np.ndarray):
 
 def _minco_dynamic_term(tr: MinjerkTraj, order: int, limit: float,
                         weight: float, opt: OptParams):
-    """(cost, dcost_dc, dcost_dT_explicit) for a vel(order=1)/accel(order=2) hinge.
+    """动力学限制项（超速/超加速度罚）及其解析梯度。order=1 罚速度，order=2 罚加速度。
+    被罚量 h = max(||某阶导|| - limit, 0)^2（只罚超出 limit 的部分），代价 = Σ_i (T_i/κ) Σ_j weight·h。
+    这是纯几何项（不涉及障碍的绝对时刻），所以对 T 的显式梯度只有 (a) 求积权重 + (b) 采样时刻移动两部分。
+    (cost, dcost_dc, dcost_dT_explicit) for a vel(order=1)/accel(order=2) hinge.
 
     integrand h = max(||deriv||-limit, 0)^2, cost = Σ_i (T_i/κ) Σ_j weight·h.
     ∂h/∂deriv = 2·over·(deriv/||deriv||).  No abs-time path (purely geometric),
@@ -666,32 +893,37 @@ def _minco_dynamic_term(tr: MinjerkTraj, order: int, limit: float,
         taus = s * Ti
         B0, B1, B2, B3 = _scale_basis(Bs, bidx, Ti)
         Bo = {0: B0, 1: B1, 2: B2, 3: B3}[order]
-        Bnext = {0: B1, 1: B2, 2: B3}[order]    # d/dtau of the order-th deriv
+        Bnext = {0: B1, 1: B2, 2: B3}[order]    # 被限那阶导再对 tau 求一次导（算 (b) 用）
         ci = tr.c[6 * i:6 * i + 6]
-        D = Bo @ ci                              # (κ,3) the deriv being limited
-        Dn = Bnext @ ci                          # (κ,3) its tau-derivative
+        D = Bo @ ci                              # (κ,3) 被限制的那阶导（速度或加速度）
+        Dn = Bnext @ ci                          # (κ,3) 它对 tau 的导数
         wq = Ti / kap
-        mag = np.linalg.norm(D, axis=1)          # (κ,)
+        mag = np.linalg.norm(D, axis=1)          # (κ,) 模长
         over = mag - limit
-        act = (over > 0.0) & (mag > 0.0)
+        act = (over > 0.0) & (mag > 0.0)         # 只在超限且模长非零（可导）的点上算
         if not np.any(act):
             continue
         Da = D[act]; Dna = Dn[act]; Boa = Bo[act]; sa = s[act]
         maga = mag[act]; overa = over[act]
-        u = Da / maga[:, None]                    # (na,3)
+        u = Da / maga[:, None]                    # (na,3) 单位方向
         h = overa * overa
-        dh_dderiv = (2.0 * overa)[:, None] * u   # (na,3)
+        dh_dderiv = (2.0 * overa)[:, None] * u   # (na,3) ∂h/∂(那阶导)
         cost += wq * weight * float(np.sum(h))
         dcost_dc[6 * i:6 * i + 6] += (wq * weight) * (Boa.T @ dh_dderiv)
-        # (a) quadrature-weight
+        # (a) 求积权重 T_i/κ 求导
         dT_exp[i] += (1.0 / kap) * weight * float(np.sum(h))
-        # (b) moving-sample: dh/dtau = dh_dderiv · d(deriv)/dtau
+        # (b) 采样时刻 tau=s_j·T_i 随 T_i 变：dh/dtau = ∂h/∂导 · d(导)/dtau
         dh_dtau = np.einsum("kd,kd->k", dh_dderiv, Dna)
         dT_exp[i] += wq * weight * float(np.sum(dh_dtau * sa))
     return cost, dcost_dc, dT_exp
 
 
 # ===========================================================================
+# 【Stage 3：HARD（人）的硬约束实现】
+# 核心想法：MINCO 每段五次曲线可以写成 6 个 Bernstein 控制点的凸组合，曲线整段都被
+# 这 6 个控制点的「凸包」包住。所以只要让每个控制点都离人足够远，整段曲线就一定离人足够远
+# （连续时间都保证，不止采样点）。再用增广拉格朗日(PHR)把这些约束变成可优化的罚函数。
+#
 # Stage 3 — HARD (humans) = continuous-time convex-hull constraint via the
 # Bernstein control points + augmented-Lagrangian (PHR) penalty.
 #
@@ -707,7 +939,9 @@ def _minco_dynamic_term(tr: MinjerkTraj, order: int, limit: float,
 
 
 def _partition_obstacles(obstacles, avoid_cfg, override):
-    """Split obstacles into (soft_obs, hard_obs) per resolve_mode + override."""
+    """把障碍按类别分成两堆：软的（走 EGO 场）和硬的（走 ALM 凸包约束）。
+    分法由 resolve_mode 决定（人=硬，墙=软），override 可以强制全软/全硬。
+    Split obstacles into (soft_obs, hard_obs) per resolve_mode + override."""
     soft_obs, hard_obs = [], []
     for o in obstacles:
         if resolve_mode(o, avoid_cfg, override) == "hard":
@@ -718,30 +952,110 @@ def _partition_obstacles(obstacles, avoid_cfg, override):
 
 
 def _hard_d_safe(obs, avoid_cfg) -> float:
-    """d_safe for a hard obstacle; fail-safe to the human default 0.8."""
+    """取硬障碍的安全距离 d_safe；读不到配置时保守用人的默认值 0.8。
+    d_safe for a hard obstacle; fail-safe to the human default 0.8."""
     params = avoid_cfg.get(obs.class_name)
     if params is None:
         return 0.8
     return float(params.d_safe)
 
 
+def _q_conformal(opt) -> float:
+    """conformal 安全裕度 Q_alpha：加到硬球体有效半径上的「预测不确定度余量」。
+    它是离线标定的常数（见 OptParams.q_conformal），对优化变量 (q,T) 不依赖
+    -> 不动任何解析梯度，只抬高约束/证书水位。opt 为 None（独立 check_grad 闸用）时取 0。
+    Conformal margin Q_alpha added to a hard sphere's effective radius. A constant
+    w.r.t. (q, T) (see OptParams.q_conformal): leaves all gradients untouched, only
+    shifts the constraint/certificate level. 0.0 when opt is None."""
+    return float(getattr(opt, "q_conformal", 0.0)) if opt is not None else 0.0
+
+
+def _eps_track(opt) -> float:
+    """执行 gap 的管子半径 epsilon_track：实飞偏离规划的保守上界，加到**每个**硬障碍的
+    有效半径上（球 + 墙，因为它是无人机自身位置误差、与障碍类型无关）。和 Q_alpha 一样是
+    对 (q,T) 的常数 -> 不动梯度，只抬约束/证书水位。opt 为 None 时取 0。
+    Execution-tube radius epsilon_track (plan->flown bound) added to EVERY hard obstacle's
+    effective radius. Constant w.r.t. (q, T); 0.0 when opt is None."""
+    return float(getattr(opt, "epsilon_track", 0.0)) if opt is not None else 0.0
+
+
+def _pred_margin(opt) -> float:
+    """人预测不确定余量,加进硬球体(人)的 R。两种 mode（互斥,不叠加）：
+      conformal（默认）：统计 Q_α（概率覆盖 1-α,有 α 失败率、依赖校准分布）。
+      deterministic：物理可达集半径（最坏情形,无分布无 α；朝「每飞行小时不撞」）。
+        reach = est_pos_err + est_vel_err*tau + 0.5*a_max_human*tau^2,tau=tau_trust（常数）。
+    两者都只对球（人），且都是对 (q,T) 的常数 -> 不动梯度。opt=None 取 0。
+    Human-prediction margin for a hard SPHERE's R. 'conformal' -> statistical Q_alpha;
+    'deterministic' -> physical worst-case reachable-set radius (constant at tau_trust).
+    Both are constant w.r.t. (q, T); 0.0 when opt is None."""
+    if opt is None:
+        return 0.0
+    if getattr(opt, "safety_mode", "conformal") == "deterministic":
+        tau = float(getattr(opt, "tau_trust", 0.0))
+        pos = float(getattr(opt, "est_pos_err", 0.0))
+        if getattr(opt, "reach_model", "accel") == "speed":
+            # 不信方向:人 tau 秒内必在当前位置 v_max*tau 内(配合静态 c0 surrogate)
+            return pos + float(getattr(opt, "v_max_human", 0.0)) * tau
+        # 信 v0、bound 加速机动
+        return (pos + float(getattr(opt, "est_vel_err", 0.0)) * tau
+                + 0.5 * float(getattr(opt, "a_max_human", 0.0)) * tau * tau)
+    return float(getattr(opt, "q_conformal", 0.0))
+
+
+def _safety_surrogate(obstacles, opt):
+    """deterministic + reach_model='speed' 下,把每个**会动的硬球体(人)**换成它当前位置 centre0
+    的**静态** surrogate(vel=accel=0)——「不信速度方向」:v_max*tau 的 reach 已覆盖任意速度有界
+    运动,所以证书该罩当前位置的静态球,而不是信任 v0 的 CA 预测。其它 mode / 静态人 / 墙原样返回。
+    一个 vel=accel=0 的球 predict(t)≡centre0,所以走现有静态路径就天然以 c0 为中心。
+    In deterministic SPEED-reach mode, replace each MOVING hard sphere by a STATIC surrogate at its
+    current centre0 (don't trust the velocity direction). Unchanged in any other mode."""
+    if (opt is None or getattr(opt, "safety_mode", "conformal") != "deterministic"
+            or getattr(opt, "reach_model", "accel") != "speed"):
+        return obstacles
+    out = []
+    for o in obstacles:
+        if hasattr(o, "centre0") and (np.any(o.vel) or np.any(o.accel)):
+            out.append(SphereObstacle(o.centre0, o.radius, vel=None,
+                                      class_name=o.class_name))      # static at c0
+        else:
+            out.append(o)
+    return out
+
+
 def _seg_rep_time(tr: MinjerkTraj, i: int) -> float:
-    """Representative wall-clock time for segment i (Stage 3: segment END — the
+    """第 i 段用哪个「代表时刻」来定位人的位置（Stage 3 用法）。取「段末」时刻——
+    对一个朝前走的人来说这是最保守的单一时刻；人静止(vel=0)时退化成静态。
+    Stage 4 才改成每个控制点用各自的墙上时刻。
+    Representative wall-clock time for segment i (Stage 3: segment END — the
     most conservative single time for a forward-moving human, and reduces to
     static for vel=0). Full per-control-point wall-clock is Stage 4."""
     return float(tr._cum[i + 1])
 
 
 def _is_moving(obs) -> bool:
-    """True for a sphere-human with nonzero CV velocity. This is the GATE that
+    """判断这个障碍是不是「会动的人」（球体且速度非零，假设匀速运动 CV）。
+    这是个关键「门控」：保证静止的人走的还是 Stage 3 老路径、逐字节一致。
+    原因——即使速度=0，按「每个控制点各自法向」算出来的几何方向也和按「段质心法向」
+    算的不同，所以静态的人必须强制走旧的「单时刻 + 质心法向」那条路。
+    True for a sphere-human with nonzero CV velocity. This is the GATE that
     keeps STATIC humans byte-identical to Stage 3: the per-(i,k) space-time
     normal differs geometrically from the centroid normal even at vel=0, so a
-    static human MUST run the old single-time centroid path."""
-    return hasattr(obs, "centre0") and float(np.linalg.norm(obs.vel)) > 0.0
+    static human MUST run the old single-time centroid path.
+
+    CA upgrade: a human with nonzero accel (even if vel==0) is moving, so the
+    gate also fires on ||accel||>0. vel==0 AND accel==0 -> False (static human
+    stays byte-identical to Stage 3)."""
+    return (hasattr(obs, "centre0")
+            and (float(np.linalg.norm(obs.vel)) > 0.0
+                 or float(np.linalg.norm(obs.accel)) > 0.0))
 
 
 def _trust_mask(tr: MinjerkTraj, opt: OptParams) -> np.ndarray:
-    """(M,6) bool: control point (i,k) is trusted-HARD iff t_{i,k} <= tau_trust.
+    """算「信任窗口」掩码 (M,6) 布尔：某控制点 (i,k) 的墙上时刻 t_{i,k} <= tau_trust 才算
+    可信硬约束（True）。离线仿真里 t_now=0，所以直接用 control_point_times()。
+    每轮外层 ALM 之间会冻结这个掩码（和支撑半空间法向一样的纪律），只在外层之间重算；
+    超出信任窗口的点直接踢出硬约束集合（它的 g/权重 全归零，改交软场管）。
+    (M,6) bool: control point (i,k) is trusted-HARD iff t_{i,k} <= tau_trust.
 
     Offline harness: t_now = 0 so t_{i,k} = control_point_times() directly.
     FROZEN per outer ALM iter (same discipline as the supporting-halfspace
@@ -751,7 +1065,20 @@ def _trust_mask(tr: MinjerkTraj, opt: OptParams) -> np.ndarray:
 
 
 def _seg_normals(tr: MinjerkTraj, hard_obs, P=None, opt: OptParams = None):
-    """Frozen supporting-halfspace normals per (segment i, control pt k, human h).
+    """算「支撑半空间」的法向（要在每轮外层 ALM 里冻结）。
+    直观理解：在控制点和人之间架一道「隔板」（半空间），法向就是从人指向控制点的单位方向。
+    把约束写成「控制点要待在隔板外侧」后，约束对控制点是线性的，内层优化才好解。
+
+    两种算法：
+      Stage 3（静止的人 / 关掉 space-time）：每段每障碍只用一个法向
+          a_{i,h} = 单位(该段6控制点质心 - 人在代表时刻的位置)。
+      Stage 4（S4a，会动的人 + 开 space-time）：每个控制点各用各的法向
+          a_{i,k,h} = 单位(P_{i,k} - 人在该控制点墙上时刻 t_{i,k} 的位置)，
+          也就是「在正确的时刻躲开」的那个更紧的法向。
+
+    不管哪种都统一返回 (M, 6, H, 3)：静态那支只是把每段的质心法向在 6 个控制点上复制一遍
+    （几何上和老的 (M,H,3) 完全等价），保证静态障碍的 g 和 dg/dP 一字不变。
+    Frozen supporting-halfspace normals per (segment i, control pt k, human h).
 
     Stage 3 (static human / spacetime off): ONE normal per (segment, obstacle)
         a_{i,h} = unit(centroid_k(P_{i,k}) - c_h(t_rep_i)).
@@ -772,21 +1099,21 @@ def _seg_normals(tr: MinjerkTraj, hard_obs, P=None, opt: OptParams = None):
     t_rep = np.array([_seg_rep_time(tr, i) for i in range(M)])  # (M,)
     t_pt = tr.control_point_times()                         # (M,6)
     A = np.zeros((M, 6, H, 3))
-    fallback = np.array([1.0, 0.0, 0.0])
+    fallback = np.array([1.0, 0.0, 0.0])     # 法向退化（人正好压在点上）时的兜底方向
     for h, obs in enumerate(hard_obs):
         if spacetime and _is_moving(obs):
-            # per-control-point: anchor each P_{i,k} at the human's own time
-            c = obs.centre0[None, None, :] + obs.vel[None, None, :] * t_pt[:, :, None]
+            # 会动的人：每个控制点按它自己的墙上时刻 t_{i,k} 定位人（CA: predict(t)）
+            c = obs.predict(t_pt)                             # (M,6,3)
             a = P - c                                        # (M,6,3)
         else:
             if hasattr(obs, "centre0"):
-                c = obs.centre0[None, :] + obs.vel[None, :] * t_rep[:, None]  # (M,3)
+                c = obs.predict(t_rep)                        # (M,3) CA: centre0+vel·t+0.5·accel·t^2
             else:
-                c = np.broadcast_to(0.5 * (obs.lo + obs.hi), (M, 3))
-            a_seg = centroid - c                             # (M,3) one per segment
-            a = np.broadcast_to(a_seg[:, None, :], (M, 6, 3))
+                c = np.broadcast_to(0.5 * (obs.lo + obs.hi), (M, 3))   # 墙(AABB)取中心
+            a_seg = centroid - c                             # (M,3) 每段一个质心法向
+            a = np.broadcast_to(a_seg[:, None, :], (M, 6, 3))  # 复制到 6 个控制点上
         nrm = np.linalg.norm(a, axis=2)                      # (M,6)
-        ok = nrm > 1e-12
+        ok = nrm > 1e-12                                     # 法向不退化才归一化，否则用兜底
         A[:, :, h, :] = np.where(ok[:, :, None],
                                  a / np.where(ok[:, :, None], nrm[:, :, None], 1.0),
                                  fallback)
@@ -795,7 +1122,14 @@ def _seg_normals(tr: MinjerkTraj, hard_obs, P=None, opt: OptParams = None):
 
 def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
                      opt: OptParams = None, trust_mask=None):
-    """Evaluate every (segment i, ctrl-pt k, hard-obs h) TIGHT constraint.
+    """逐个算出每条硬约束 g（针对每个「段 i × 控制点 k × 硬障碍 h」的组合）。
+    约定 g <= 0 表示「这个点离障碍够远（安全）」，g > 0 表示「侵入了，要被罚」。
+    球体用支撑半空间形式（静止/会动两种写法见 docstring）；墙(AABB)直接用带符号距离。
+    S4b 信任窗口：超过 tau_trust 的控制点 g 设成一个极大负数 -> 永远不激活（交给软场）。
+    返回 (一堆扁平数组的字典, 控制点坐标 P (M,6,3))。其中 n 存的是 dg/dP 的相反数
+    （即外法向），这样别处用 dL/dP = -w*n 形式统一；dgdt 是 g 对墙上时刻的导数
+    （只有「可信的会动球体」非零）；trust 是每条约束的 S4b 布尔掩码。
+    Evaluate every (segment i, ctrl-pt k, hard-obs h) TIGHT constraint.
 
     SPHERE (static human / spacetime off) -> Stage-3 supporting-halfspace at the
       segment-END single time t_rep_i:
@@ -825,48 +1159,53 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
     if normals is None:
         normals = _seg_normals(tr, hard_obs, P, opt=opt)
     spacetime = opt is not None and bool(opt.spacetime_hard)
-    Nc = M * 6 * H
+    Nc = M * 6 * H                            # 约束总条数 = 段 × 6控制点 × 硬障碍
+    # 把三维索引 (i,k,h) 压成一维 m = (i*6 + k)*H + h；下面三个数组是反查表
     # flat index m = (i*6 + k)*H + h
     seg = np.repeat(np.arange(M), 6 * H)
     kpt = np.tile(np.repeat(np.arange(6), H), M)
     hidx = np.tile(np.arange(H), M * 6)
     g = np.zeros(Nc); nrm = np.zeros((Nc, 3)); dist = np.zeros(Nc); Rarr = np.zeros(Nc)
     dgdt = np.zeros(Nc); trust = np.ones(Nc, dtype=bool)
+    q_alpha = _pred_margin(opt)   # 人预测余量（conformal Q_α 或 deterministic 可达 reach；只对球）
+    eps = _eps_track(opt)         # 执行管子半径（常数，对每个硬障碍都加：球 + 墙）
     t_rep = np.array([_seg_rep_time(tr, i) for i in range(M)])   # (M,)
     t_pt = tr.control_point_times()                             # (M,6)
     idx_all = (np.arange(M)[:, None] * 6 + np.arange(6)[None, :]) * H  # (M,6) base idx
-    G_NEG = -1.0e9   # large-negative g -> forced inactive (untrusted points)
+    G_NEG = -1.0e9   # 极大负数：把不可信的点强制设为「永不激活」
     for h, obs in enumerate(hard_obs):
         d_safe = _hard_d_safe(obs, avoid_cfg)
-        idx = idx_all + h                              # (M,6) flat indices for this h
-        if hasattr(obs, "centre0"):                   # sphere -> tight halfspace
-            R = float(obs.radius) + d_safe
+        idx = idx_all + h                              # 这个障碍 h 对应的扁平下标 (M,6)
+        if hasattr(obs, "centre0"):                   # 球体 -> 用支撑半空间
+            R = float(obs.radius) + d_safe + q_alpha + eps  # 球半径 + d_safe + conformal + 管子
             moving_st = spacetime and _is_moving(obs)
             if moving_st:
-                # per-control-point times + per-control-point normals (S4a)
-                c = (obs.centre0[None, None, :]
-                     + obs.vel[None, None, :] * t_pt[:, :, None])    # (M,6,3)
+                # 会动的人：每个控制点用自己的时刻定位人（S4a，CA: predict(t)）
+                c = obs.predict(t_pt)                              # (M,6,3)
             else:
-                # Stage-3 single segment-END time, broadcast across k
+                # Stage 3：所有控制点共用「段末」单一时刻（CA: predict(t_rep)）
                 c = np.broadcast_to(
-                    (obs.centre0[None, :] + obs.vel[None, :] * t_rep[:, None])[:, None, :],
-                    (M, 6, 3))
-            a = normals[:, :, h, :]                    # (M,6,3) frozen normals
+                    obs.predict(t_rep)[:, None, :], (M, 6, 3))
+            a = normals[:, :, h, :]                    # (M,6,3) 冻结的法向
             diff = P - c                               # (M,6,3)
-            proj = np.einsum("mkd,mkd->mk", a, diff)   # a^T(P-c) per (i,k)
-            g_h = R - proj                             # (M,6)
+            proj = np.einsum("mkd,mkd->mk", a, diff)   # a^T(P-c)：控制点在法向上离人多远
+            g_h = R - proj                             # (M,6) 还差多少才够安全（>0=没躲够）
             dist_h = np.linalg.norm(diff, axis=2) - float(obs.radius)
             g[idx] = g_h
             nrm[idx] = a
             dist[idx] = dist_h
             Rarr[idx] = R
             if moving_st:
-                # dg/dt_{i,k} = +a_{i,k,h} . vel_h  (POSITIVE sign; opposite dL/dP)
-                dgdt[idx] = np.einsum("mkd,d->mk", a, obs.vel)
-                # S4b trust mask: FROZEN form (trust_mask) preferred so a point
-                # crossing tau_trust does NOT flip HARD<->SOFT inside L-BFGS-B
-                # (keeps the inner cost smooth). Fall back to the current-T mask
-                # only when no frozen mask is supplied (T-fixed contexts).
+                # 会动的人才有：g 对墙上时刻的导数 dg/dt_{i,k} = +a·velocity_at(t_{i,k})
+                # （正号，和 dL/dP 相反）。CA 下瞬时速度 vel+accel·t 逐控制点变化；
+                # accel=0 时 velocity_at 退回常数 vel，逐字节回到 a·vel。
+                if not np.any(obs.accel):
+                    dgdt[idx] = np.einsum("mkd,d->mk", a, obs.vel)        # CV 回退
+                else:
+                    dgdt[idx] = np.einsum("mkd,mkd->mk", a, obs.velocity_at(t_pt))  # CA
+                # S4b 信任掩码：优先用「冻结的」掩码，这样某点在内层迭代中跨过 tau_trust 时
+                # 不会在硬/软之间来回切换（保证内层代价光滑，硬约束集合只在外层之间变）。
+                # 只有在没传冻结掩码（T 固定的场景）时，才退而用当前 T 算的掩码。
                 if trust_mask is not None:
                     tmask = np.asarray(trust_mask, dtype=bool)
                 elif opt is not None:
@@ -874,21 +1213,26 @@ def _alm_constraints(tr: MinjerkTraj, hard_obs, avoid_cfg, normals=None,
                 else:
                     tmask = np.ones((M, 6), dtype=bool)
                 trust[idx] = tmask
-                g[idx] = np.where(tmask, g_h, G_NEG)
+                g[idx] = np.where(tmask, g_h, G_NEG)       # 不可信的点 g 压成极大负数
                 dgdt[idx] = np.where(tmask, dgdt[idx].reshape(M, 6), 0.0)
-        else:                                          # AABB -> per-pt signed dist
+        else:                                          # 墙(AABB) -> 逐控制点用带符号距离
             for i in range(M):
                 for k in range(6):
                     m = (i * 6 + k) * H + h
                     d, ddp, _ = _signed_dist_and_grad(obs, P[i, k], float(t_rep[i]))
-                    g[m] = d_safe - d; nrm[m] = ddp; dist[m] = d; Rarr[m] = d_safe
+                    # 墙也加执行管子 eps（无人机自身位置误差，与障碍类型无关）；不加 conformal
+                    g[m] = (d_safe + eps) - d; nrm[m] = ddp; dist[m] = d; Rarr[m] = d_safe + eps
     return {"g": g, "n": nrm, "seg": seg, "kpt": kpt, "hidx": hidx,
             "dist": dist, "R": Rarr, "dgdt": dgdt, "trust": trust}, P
 
 
 def _alm_term(tr: MinjerkTraj, hard_obs, avoid_cfg, lam: np.ndarray, rho: float,
               normals=None, opt: OptParams = None, trust_mask=None):
-    """(cost, dcost_dc (6M,3), dcost_dT_explicit (M,), cons) for the ALM penalty.
+    """ALM（增广拉格朗日 PHR）罚函数的代价及其解析梯度。
+    返回 (代价, 对系数 c 的梯度 (6M,3), 对每段时间 T 的显式梯度 (M,), 约束记录 cons)。
+    PHR 罚的形式：对每条约束 g，令 z = lambda + rho·g；z>0 时这条约束「激活」、罚它，否则不罚。
+    lambda 是乘子、rho 是罚重，由外层循环 _alm_solve 慢慢调。
+    (cost, dcost_dc (6M,3), dcost_dT_explicit (M,), cons) for the ALM penalty.
 
     `normals` are the FROZEN supporting-halfspace normals (per outer iter); if
     None they are recomputed from tr (used for the standalone check_grad gate at
@@ -910,38 +1254,39 @@ def _alm_term(tr: MinjerkTraj, hard_obs, avoid_cfg, lam: np.ndarray, rho: float,
                                trust_mask=trust_mask)
     g = cons["g"]
     z = lam + rho * g                            # (Nc,)
-    active = z > 0.0
+    active = z > 0.0                             # z>0 的约束才被罚
+    # PHR 罚的代价值：激活的约束算 (1/2rho)z^2，再统一减掉 lambda^2/(2rho)
     # PHR cost: (rho/2) z^2 - lambda^2/(2 rho) on active, else -lambda^2/(2 rho)
     cost = 0.0
     cost += float(np.sum((0.5 / rho) * (z[active] ** 2)))
     cost -= float(np.sum((lam ** 2) / (2.0 * rho)))
-    # dL/dg = z on active (0 otherwise); dL/dP_ik = z * dg/dP = z * (-n)
-    w = np.where(active, z, 0.0)                 # (Nc,) — untrusted rows already w=0
-    dLdP_seg = np.zeros((M, 6, 3))               # accumulate per-(seg,ctrl)
+    # 罚对约束的导数 dL/dg = z（激活时，否则 0）；再链到控制点：dL/dP = z·dg/dP = z·(-n)
+    w = np.where(active, z, 0.0)                 # (Nc,) — 不可信的行 w 已经是 0
+    dLdP_seg = np.zeros((M, 6, 3))               # 按 (段,控制点) 累加梯度
     seg = cons["seg"]; kpt = cons["kpt"]; nrm = cons["n"]
-    contrib = (-w)[:, None] * nrm                # (Nc,3) = z * (-n)
-    np.add.at(dLdP_seg, (seg, kpt), contrib)
-    # chain dP -> dc and explicit dP/dT per segment (vectorized over M):
-    # (A) implicit: dL/dc_i = D(T_i) * (C2B^T @ G_i)
+    contrib = (-w)[:, None] * nrm                # (Nc,3) = z·(-n)
+    np.add.at(dLdP_seg, (seg, kpt), contrib)     # 把每条约束的贡献加到对应控制点上
+    # 接下来把「对控制点 P 的梯度」往回链到优化变量 (c, T)（MINCO 那套链式法则）：
+    # (A) 隐式那条：dL/dc_i = D(T_i) · (C2B^T @ G_i)，C2B 是系数->Bernstein 控制点的转换
     T = tr.T
-    Dvec = np.stack([np.ones(M), T, T**2, T**3, T**4, T**5], axis=1)  # (M,6)
+    Dvec = np.stack([np.ones(M), T, T**2, T**3, T**4, T**5], axis=1)  # (M,6) 时间幂缩放
     CtG = np.einsum("kj,mkd->mjd", C2B, dLdP_seg)            # (M,6,3) = C2B^T @ G
     dc = Dvec[:, :, None] * CtG                              # (M,6,3)
     dcost_dc += dc.reshape(n6, 3)
-    # (B) explicit-T Source 1: sum_{k,d} G_i[k,d] * dP_i/dT_i[k,d]
+    # (B) 对 T 的显式梯度·来源1（曲线几何）：控制点位置 P 本身随 T 变（那个 T^j 缩放是个坑）
     dP_dT = tr.control_points_dT_explicit()                 # (M,6,3)
     dT_exp += np.einsum("mkd,mkd->m", dLdP_seg, dP_dT)
-    # (B) explicit-T Source 2: moving-human absolute-time chain (S4a).
-    # dL/dt_{i,k} = sum_h w * (a.vel) = w * dgdt; chain via dt_{i,k}/dT_j.
+    # (B) 对 T 的显式梯度·来源2（新增，会动的人的绝对时刻链）：
+    # dL/dt_{i,k} = Σ_h w·(a·vel) = w·dgdt；再通过 dt_{i,k}/dT_j 链到各段 T。静态的人 dgdt=0，这段恒为 0。
     dgdt = cons.get("dgdt")
     if dgdt is not None and np.any(dgdt != 0.0):
-        S_flat = w * dgdt                                    # (Nc,) = dCost/dt per (i,k,h)
+        S_flat = w * dgdt                                    # (Nc,) = 每条约束对其时刻的 dCost/dt
         S = np.zeros((M, 6))
-        np.add.at(S, (seg, kpt), S_flat)                    # (M,6) summed over h
-        kfrac = np.arange(6) / float(MinjerkTraj.DEG)       # k/5
-        dT_abs = np.einsum("k,mk->m", kfrac, S)             # same-segment local fraction
+        np.add.at(S, (seg, kpt), S_flat)                    # (M,6) 对障碍 h 求和后
+        kfrac = np.arange(6) / float(MinjerkTraj.DEG)       # k/5：本段内第 k 个控制点的时间占比
+        dT_abs = np.einsum("k,mk->m", kfrac, S)             # 本段内的局部分量
         seg_sum = S.sum(axis=1)                             # (M,)
-        # cross-segment: dt_{i,k}/dT_j = 1 for ALL j<i -> dT_abs[j] += sum_{i>j} seg_sum[i]
+        # 跨段：t_{i,k} 还等于前面所有段时长之和，所以 dt/dT_j=1 对所有 j<i -> 用反向累加加回去
         if M > 1:
             dT_abs[:-1] += np.cumsum(seg_sum[::-1])[::-1][1:]
         dT_exp += dT_abs
@@ -953,7 +1298,12 @@ def _minco_cost_grad(x: np.ndarray, start: np.ndarray, goal: np.ndarray, M: int,
                      v0=None, a0=None, vf=None, af=None,
                      hard_obs=None, alm_lambda=None, alm_rho=0.0, alm_normals=None,
                      alm_trust_mask=None):
-    """THE analytic value+gradient. x = [q.ravel(), T]; returns (f, grad) with
+    """【整个 MINCO 求解的核心】解析地算出总代价 f 和它对优化变量的梯度 grad。
+    这就是喂给 scipy L-BFGS-B 的「目标函数 + 梯度」。x = [q 拉平, T]；
+    grad 顺序和 x 一致：[dCost/dq 拉平, dCost/dT]。
+    把所有代价项（软障碍 + 速度 + 加速度 + 时间锚 + 平滑 + 硬约束 ALM）的梯度都累加到
+    同一组 (dcost_dc, dT_exp) 里，最后用 MINCO 的链式法则一次性转成对 (q, T) 的梯度。
+    THE analytic value+gradient. x = [q.ravel(), T]; returns (f, grad) with
     grad ordered identically to x: [dCost/dq.ravel(), dCost/dT].
 
     `obstacles` here is the SOFT set (EGO field). `hard_obs`/`alm_lambda`/
@@ -961,44 +1311,49 @@ def _minco_cost_grad(x: np.ndarray, start: np.ndarray, goal: np.ndarray, M: int,
     HARD set (with FROZEN supporting-halfspace normals). `alm_trust_mask` is the
     FROZEN (M,6) S4b hard/soft mask (frozen alongside the normals per outer
     iter so the inner cost stays smooth as T moves)."""
+    # 从优化变量拆出内部路点 q 和各段时间 T，重建 MINCO 轨迹（端点结构性钉死，v0/a0 等是起终边界条件）
     nq = 3 * (M - 1)
     q = x[:nq].reshape(M - 1, 3) if M > 1 else np.zeros((0, 3))
     T = x[nq:].astype(np.float64)
     tr = MinjerkTraj.from_endpoints(start, goal, q, T, v0=v0, a0=a0, vf=vf, af=af)
 
-    # accumulate the shared-hook terms (obstacle + vel + accel) into one adjoint
+    # 把各项的梯度都累加进同一对 (对系数 c 的梯度, 对段时间 T 的显式梯度)，最后统一回链
     n = tr.NC * M
     dcost_dc = np.zeros((n, 3))
     dT_exp = np.zeros(M)
 
+    # 软障碍（EGO 场）
     c_obs, gc, gT = _minco_obstacle_term(tr, obstacles, avoid_cfg, opt)
     dcost_dc += opt.w_obs * gc
     dT_exp += opt.w_obs * gT
     f = opt.w_obs * c_obs
 
+    # 超速罚
     c_vel, gc, gT = _minco_dynamic_term(tr, 1, opt.vmax, opt.w_vel, opt)
     dcost_dc += gc; dT_exp += gT; f += c_vel
 
+    # 超加速度罚
     c_acc, gc, gT = _minco_dynamic_term(tr, 2, opt.amax, opt.w_accel, opt)
     dcost_dc += gc; dT_exp += gT; f += c_acc
 
-    # time anchor: pure explicit-T term
+    # 时间锚：只跟总时长有关，纯显式-T 项
     Ttot = float(np.sum(T))
     rel = (Ttot - T_target) / max(T_target, 1e-9)
     f += opt.w_time * rel * rel
     dT_exp += 2.0 * opt.w_time * (Ttot - T_target) / (max(T_target, 1e-9) ** 2)
 
-    # Stage 3: augmented-Lagrangian penalty for the HARD set (one more
-    # contributor stacked into the SAME dcost_dc / dT_exp before the adjoint)
+    # 硬约束（人）的 ALM 罚——再叠一项进同一组梯度里（只有传了 hard_obs 且 rho>0 才算）
     if hard_obs and alm_rho > 0.0:
         c_alm, gc, gT, _ = _alm_term(tr, hard_obs, avoid_cfg, alm_lambda, alm_rho,
                                      normals=alm_normals, opt=opt,
                                      trust_mask=alm_trust_mask)
         dcost_dc += gc; dT_exp += gT; f += c_alm
 
+    # 关键一步：把「对系数 c 的梯度 + 对 T 的显式梯度」一次性转成「对 (q, T) 的梯度」
+    # （这里面包含了 c=M(T)^{-1}b 的隐式依赖，由 MINCO 自己处理）
     gq, gT_total = tr.grad_from_dcost_dc(dcost_dc, dcost_dT_explicit=dT_exp)
 
-    # smoothness via the verified energy_grad (its own adjoint + explicit dJ/dT)
+    # 平滑项（最小急动度能量）用 MINCO 自带的、已验证过的 energy_grad（它自己处理 c 和 T 的依赖）
     J, gq_e, gT_e = tr.energy_grad()
     f += opt.w_smooth * J
     gq = gq + opt.w_smooth * gq_e
@@ -1011,15 +1366,18 @@ def _minco_cost_grad(x: np.ndarray, start: np.ndarray, goal: np.ndarray, M: int,
 # ---- MINCO seed + per-seed solve ------------------------------------------
 
 def _minco_seed(seed_path: np.ndarray, opt: OptParams):
-    """Init from an A* polyline: arc-length resample to M+1 pts, T0=len/vmax.
+    """从 A* 折线初始化 MINCO 优化变量：按弧长重采样成 M+1 个路点（段数 M 受 M_cap 限制），
+    每段初始时间 T0 = 段长 / vmax（不低于 dt_min 两倍）。
+    返回 (起点, 终点, 内部路点 q0 (M-1,3), 各段时间 T0 (M,))。
+    Init from an A* polyline: arc-length resample to M+1 pts, T0=len/vmax.
 
     Returns (start, goal, q0 (M-1,3), T0 (M,))."""
     seed_path = np.asarray(seed_path, dtype=np.float64)
     seg_lens = np.linalg.norm(np.diff(seed_path, axis=0), axis=1)
     path_len = float(seg_lens.sum())
-    M = int(np.clip(round(len(seed_path) / 2.0), 2, opt.M_cap))
+    M = int(np.clip(round(len(seed_path) / 2.0), 2, opt.M_cap))   # 段数，夹在 [2, M_cap]
     wp = _resample_polyline(seed_path, M + 1)
-    wp[0] = seed_path[0]; wp[-1] = seed_path[-1]   # pin exact endpoints
+    wp[0] = seed_path[0]; wp[-1] = seed_path[-1]   # 强制对齐精确的起终点 / pin exact endpoints
     seg = np.linalg.norm(np.diff(wp, axis=0), axis=1)
     T0 = np.maximum(seg / max(opt.vmax, 1e-6), opt.dt_min * 2.0)
     start = wp[0].copy(); goal = wp[-1].copy()
@@ -1030,7 +1388,10 @@ def _minco_seed(seed_path: np.ndarray, opt: OptParams):
 # ---- Stage 3 feasibility = continuous-time convex-hull / dense clearance ---
 
 def hard_clearance(tr: MinjerkTraj, hard_obs, avoid_cfg, K_eval: int = 2000):
-    """Densely-sampled continuous-time min HARD-human clearance (signed_dist) and
+    """沿轨迹密集采样（默认 2000 点），算对【硬】障碍（人）的最小间隙和最严重侵入量。
+    只看硬障碍，墙/软的排除在外。这是「安全」指标的真实度量，比凸包证书更直接。
+    返回 (最小间隙, 最大侵入量)。最大侵入量 <= 0 表示每个采样点都离每个硬障碍够远（安全）。
+    Densely-sampled continuous-time min HARD-human clearance (signed_dist) and
     the worst per-class breach (d_safe - signed_dist).  Walls/soft excluded.
 
     Returns (min_clearance, max_breach). max_breach <= 0 means every hard
@@ -1053,7 +1414,10 @@ def hard_clearance(tr: MinjerkTraj, hard_obs, avoid_cfg, K_eval: int = 2000):
 
 
 def _certificate_margin(cons) -> float:
-    """Analytic convex-hull certificate margin = min over ctrl-pts of
+    """凸包「安全证书」的裕度 = 所有控制点中 (带符号距离 - d_safe) 的最小值 = -max g。
+    >= 0 就表示整个控制多边形都安全，因此（凸包性质）整条曲线连续时间都安全。
+    这是静态/关 space-time 时用的紧裕度。
+    Analytic convex-hull certificate margin = min over ctrl-pts of
     (signed_dist - d_safe) = -max_m g_m.  >= 0 => control polygon clears."""
     if cons is None:
         return float("inf")
@@ -1062,17 +1426,36 @@ def _certificate_margin(cons) -> float:
 
 def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
                                   opt: OptParams, trust_mask=None) -> float:
-    """CONTINUOUS-TIME clearance certificate for MOVING humans (S4a/S4b).
+    """会动的人的「连续时间」安全证书（S4a/S4b）。保证一整段时间都安全，不只是采样点。
+    用的是「相对轨迹」支撑半空间（**不是**早期那种各向同性球膨胀 R=r+d_safe+||v||·T_i——
+    那个对快速人严重过保守、会假报 cert<0，已被取代）。
 
-    Per segment i use ONE inflated-radius supporting halfspace:
-        a_i = unit(centroid_k(P_{i,k}) - c_h(t_i^0)),  t_i^0 = _cum[i]
-        R_i = r_h + d_safe + ||vel_h|| * T_i
-        margin_i = min over trusted k of (a_i^T (P_{i,k} - c_h(t_i^0)) - R_i)
-    By the inflated-radius theorem (start-time sphere Minkowski-inflated by
-    ||vel||*T_i), margin >= 0 over a segment implies signed_dist(p(t),t)>=d_safe
-    for EVERY t in that segment (not just the 6 nodes). Asserted only over
-    TRUSTED control points (the trust window). Static humans / spacetime-off use
-    _certificate_margin (the Stage-3 tight per-point form) instead.
+    做法：把人在该段的**完整 CA 运动** c(s)=c0+v_eff·s+½·accel·s²（s∈[0,T_i]，
+    v_eff=velocity_at(t0)）升次成它的五次 Bernstein 控制点 c_k，与轨迹控制点 P_{i,k} 做差得
+    相对控制点 D_{i,k}=P_{i,k}-c_k，再对 D 架一道（每段冻结的）支撑半空间。
+    ★关键：c(s) 是 degree-2 多项式，升到 degree-5 Bernstein 是**精确**的——所以加速度项 ½a·s²
+    被 c_k 一字不差地吸收（见代码里的 quad 项 = ½a·s² 的精确 Bernstein 系数），R **不需要**任何
+    速度或加速度膨胀。只在「可信」控制点上检查（信任窗口内）；静态/关 space-time 用 _certificate_margin。
+    CONTINUOUS-TIME clearance certificate for MOVING humans (S4a/S4b).
+
+    Uses a RELATIVE-TRAJECTORY supporting halfspace (NOT the early isotropic ball
+    inflation R = r + d_safe + ||v||*T_i, which was over-conservative for fast humans
+    and has been replaced). Per segment i, degree-elevate the human's FULL CA motion
+        c(s) = c0 + v_eff*s + 0.5*accel*s^2,   s in [0, T_i],  v_eff = velocity_at(t0)
+    to its exact degree-5 Bernstein control points c_k, subtract from the trajectory
+    control points (D_{i,k} = P_{i,k} - c_k), freeze a normal a_i = unit(mean_k D_{i,k}),
+    and certify:
+        R_i = r_h + d_safe + Q_alpha        (Q_alpha = conformal margin, see _q_conformal)
+        margin_i = min over trusted k of (a_i^T D_{i,k} - R_i)
+    SOUNDNESS: both p(s) and c(s) are degree-5 Bernstein, so p(s)-c(s) = sum_k B_k(s) D_{i,k}
+    is a convex combination; a^T D_k >= R for all k => a^T(p(s)-c(s)) >= R for ALL s in the
+    segment => ||p(s)-c(s)|| >= R (continuous-time, not just the 6 nodes).
+    ACCELERATION is handled EXACTLY, not by inflation: c(s) is degree 2, and degree
+    elevation to degree 5 is exact, so the 0.5*accel*s^2 term lives in c_k verbatim
+    (the `quad` term below). R therefore needs NO ||v||*T or 0.5*||a||*T^2 padding — the
+    only residual assumption is that the human follows CA up to the conformal error Q_alpha
+    (unmodelled jerk etc.), which is exactly what Q_alpha absorbs. Asserted only over
+    TRUSTED control points (the trust window). Static / spacetime-off use _certificate_margin.
 
     Returns the minimum margin over all (segment, trusted-k, moving-human)."""
     M = tr.M
@@ -1088,17 +1471,33 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
                 and _is_moving(obs)):
             continue
         d_safe = _hard_d_safe(obs, avoid_cfg)
-        vnorm = float(np.linalg.norm(obs.vel))
-        c0 = obs.centre0[None, :] + obs.vel[None, :] * t0[:, None]   # (M,3)
-        a = centroid - c0                                   # (M,3)
-        nrm = np.linalg.norm(a, axis=1)
+        T = tr.T                                            # (M,) 各段时长
+        c0 = obs.predict(t0)                                # (M,3) 人在各段起始时刻位置
+        # 相对轨迹证书（取代旧的各向同性球膨胀）：旧法用 c0 + ||v||·T_i 球膨胀，人朝单一方向
+        # 快速移动时各向同性放大严重过保守，高速人下会把安全轨迹假报成 cert<0（实测 -5.7 vs 真实
+        # +4.0）。改法：把人的局部 CA 运动 c(s)=c0+v_eff·s+0.5·accel·s^2（s∈[0,T_i]，
+        # v_eff=velocity_at(t0)=vel+accel·t0）升次成它的五次 Bernstein 控制点 c_k，与轨迹控制点
+        # 做差得相对控制点 D_{i,k}=P_{i,k}-c_k，对 D 做一道支撑半空间。
+        # Soundness：c(s)、P(s) 都是五次 Bernstein 凸组合 → P(s)-c(s)=Σ_k B_k(s)·D_{i,k}（凸组合），
+        # a^T D_k>=R ∀k ⇒ a^T(P(s)-c(s))>=R ⇒ ||P(s)-c(s)||>=a^T(...)>=R，整段连续时间成立，
+        # 且精确处理人移动方向、不各向同性放大 → 比球膨胀紧得多，高速人下不再假阴性。
+        v_eff = obs.vel[None, :] + obs.accel[None, :] * t0[:, None]    # (M,3) velocity_at(t0)
+        kf = np.arange(6, dtype=np.float64)                            # 0..5
+        # 五次 Bernstein 控制点：单项 u^j 的 degree-5 控制点系数 = C(k,j)/C(5,j)，s=T·u
+        #   线性项 v_eff·s -> v_eff·T·(k/5)；二次项 0.5·accel·s^2 -> 0.5·accel·T^2·k(k-1)/10
+        lin = v_eff[:, None, :] * ((kf / 5.0)[None, :, None] * T[:, None, None])
+        quad = obs.accel[None, None, :] * ((T * T)[:, None, None]
+                                           * (kf * (kf - 1.0) / 40.0)[None, :, None])
+        c_bern = c0[:, None, :] + lin + quad                # (M,6,3) c(s) 的五次 Bernstein 控制点
+        D = P - c_bern                                      # (M,6,3) 相对控制点
+        cD = D.mean(axis=1)                                 # (M,3) 相对质心 -> 冻结法向
+        nrm = np.linalg.norm(cD, axis=1)
         ok = nrm > 1e-12
-        a = np.where(ok[:, None], a / np.where(ok[:, None], nrm[:, None], 1.0),
+        a = np.where(ok[:, None], cD / np.where(ok[:, None], nrm[:, None], 1.0),
                      np.array([1.0, 0.0, 0.0]))
-        diff = P - c0[:, None, :]                           # (M,6,3)
-        proj = np.einsum("md,mkd->mk", a, diff)             # (M,6)
-        R = float(obs.radius) + d_safe + vnorm * tr.T       # (M,)
-        m_ik = proj - R[:, None]                            # (M,6)
+        proj = np.einsum("md,mkd->mk", a, D)                # (M,6) 相对控制点在法向上的投影
+        R = float(obs.radius) + d_safe + _pred_margin(opt) + _eps_track(opt)  # +预测余量 +执行管子
+        m_ik = proj - R                                     # (M,6) 每点裕度
         if np.any(trust_mask):
             margin = min(margin, float(np.min(m_ik[trust_mask])))
     return margin
@@ -1107,7 +1506,11 @@ def _certificate_margin_spacetime(tr: MinjerkTraj, hard_obs, avoid_cfg,
 def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
                         lam: np.ndarray, rho: float, normals=None,
                         opt: OptParams = None, trust_mask=None) -> list:
-    """Per-(human,segment,ctrl-pt) drawable records for the interpretability API.
+    """给「可解释性」用的可视化记录：每条 (人, 段, 控制点) 约束都生成一条可画出来的记录，
+    包含控制点位置 P、对应时刻人的位置 c_h、有效半径 R、间隙、约束值 g、乘子 lambda、
+    是否激活 active、是否在信任窗口内 trust、以及这条约束施加的「推力」force=lambda·法向。
+    这就是 SANDO 那种「每一步都看得见为什么」的卖点：能直接画出来人在哪、约束在推哪。
+    Per-(human,segment,ctrl-pt) drawable records for the interpretability API.
 
     For a MOVING human under spacetime the record anchors c_h at the control
     point's OWN time t_{i,k} (the avoid-at-the-right-moment instant) and exposes
@@ -1121,6 +1524,9 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
     g = cons["g"]; z = lam + rho * g
     t_pt = tr.control_point_times()                          # (M,6)
     trust = cons["trust"]
+    pred_m = _pred_margin(opt)         # 预测余量（conformal Q_α 或 deterministic reach；硬球体 R 已含）
+    eps_tr = _eps_track(opt)           # 执行管子半径（每个硬障碍 R 里已含；单独暴露给可视化）
+    det_mode = getattr(opt, "safety_mode", "conformal") == "deterministic"
     recs = []
     for m in range(g.size):
         i = int(cons["seg"][m]); k = int(cons["kpt"][m]); h = int(cons["hidx"][m])
@@ -1140,9 +1546,20 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
             "ctrl_pt": k,
             "P": P[i, k].copy(),
             "c_h": np.asarray(c_h, dtype=np.float64).copy(),
+            # R = 强制的有效半径（球半径 + d_safe + conformal 余量 Q_alpha）；
+            # clearance = 原始几何间隙 dist - d_safe（不含 Q_alpha，所以加大 Q 时它不变）；
+            # R = enforced effective radius (radius + d_safe + pred_margin + epsilon_track).
+            # `clearance` is the RAW geometric gap dist - d_safe (margin-INDEPENDENT — it does
+            # NOT drop as the margins grow). `pred_margin` (spheres only; = conformal Q_alpha OR
+            # the deterministic reach radius, per safety_mode) and `epsilon_track` (every hard
+            # obstacle) expose the uncertainty slices of R; `safety_mode` says which the pred
+            # slice is (statistical-1-alpha vs physical-worst-case).
             "R": float(cons["R"][m]),
             "dist": float(cons["dist"][m]),
             "clearance": float(cons["dist"][m] - _hard_d_safe(obs, avoid_cfg)),
+            "pred_margin": float(pred_m) if hasattr(obs, "centre0") else 0.0,
+            "safety_mode": "deterministic" if det_mode else "conformal",
+            "epsilon_track": float(eps_tr),
             "g": float(g[m]),
             "lambda": lam_m,
             "rho": float(rho),
@@ -1155,7 +1572,15 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
 
 def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParams,
                v0=None, a0=None):
-    """Augmented-Lagrangian outer loop wrapping the L-BFGS-B inner solve.
+    """增广拉格朗日的「外层循环」，里面套着 L-BFGS-B 的「内层无约束求解」。
+    这是 MINCO 硬约束求解的总调度。每轮外层：
+      1) 冻结当前迭代的支撑半空间法向 + 信任窗口掩码（这样内层里 g 对 P 线性、代价光滑）；
+      2) 内层跑一遍 L-BFGS-B（在当前 lambda/rho/法向下做无约束优化）；
+      3) 更新乘子 lambda <- max(0, lambda + rho·g)；约束没改善（卡住）就放大罚重 rho；
+      4) 最大违反量 < 容差 就收敛退出；到外层上限还没好就停（判 STOP）。
+    x 和 lambda 在外层之间热启动（接着上一轮继续）。
+    返回一个候选字典，带 ALM 的各种遥测信息 + 连续时间安全证书。
+    Augmented-Lagrangian outer loop wrapping the L-BFGS-B inner solve.
 
     Outer: lambda <- max(0, lambda + rho*g); grow rho on stalled violation;
     stop at max-violation < tol or outer cap. Warm-start x and lambda.
@@ -1165,8 +1590,10 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
     nq = 3 * (M - 1)
     x = np.concatenate([q0.ravel(), T0]) if M > 1 else T0.copy()
     T_target = float(np.sum(T0))
+    # q 无界，T 受 dt_min 下界
     bounds = [(None, None)] * nq + [(opt.dt_min, None)] * M
 
+    # 先数一下硬约束有多少条，初始化乘子 lambda（全 0）和罚重 rho
     tr0 = MinjerkTraj.from_endpoints(start, goal, q0, T0, v0=v0, a0=a0)
     if hard_obs:
         cons0, _ = _alm_constraints(tr0, hard_obs, avoid_cfg)
@@ -1177,7 +1604,7 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
     rho = float(opt.alm_rho0)
 
     soft_args = (start, goal, M, list(soft_obs), avoid_cfg, opt, T_target, v0, a0)
-    f0, _ = _minco_cost_grad(x, *soft_args)
+    f0, _ = _minco_cost_grad(x, *soft_args)   # 记一下初始代价（只算软项，给 info 用）
 
     lambda_hist = []; rho_hist = []
     prev_viol = float("inf")
@@ -1185,6 +1612,7 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
     total_inner_iters = 0
     result = None
     if not hard_obs:
+        # 没有硬约束（纯软/纯平滑）-> 直接一次无约束求解搞定，不用外层
         # no hard constraints -> a single unconstrained solve (pure soft / smooth)
         result = scipy.optimize.minimize(
             _minco_cost_grad, x, args=soft_args, jac=True, method="L-BFGS-B",
@@ -1193,7 +1621,7 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
         total_inner_iters = int(result.nit)
     else:
         normals = None
-        for outer in range(opt.alm_outer_iters):
+        for outer in range(opt.alm_outer_iters):    # ALM 外层循环
             outer_iters = outer + 1
             # FREEZE the supporting-halfspace normals from the current iterate
             # (GCOPTER SFC discipline) so g is linear in P during the inner solve
@@ -1205,8 +1633,8 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
             # tau_trust during the inner solve does NOT flip HARD<->SOFT -> the
             # inner cost stays smooth; the active hard set changes only here).
             tmask = _trust_mask(tr, opt)
-            # inner unconstrained L-BFGS-B at the current (lambda, rho, normals);
-            # the ALM kwargs go through a closure (minimize passes positional args)
+            # 内层：在当前冻结的 (lambda, rho, 法向, 信任掩码) 下做一次无约束 L-BFGS-B。
+            # 用闭包把 ALM 的那些关键字参数塞进去（scipy 只会按位置传 args）
             result = scipy.optimize.minimize(
                 lambda xx, lam=lam, rho=rho, nrm=normals, tm=tmask: _minco_cost_grad(
                     xx, *soft_args, hard_obs=hard_obs, alm_lambda=lam, alm_rho=rho,
@@ -1218,22 +1646,21 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
             qf = x[:nq].reshape(M - 1, 3) if M > 1 else np.zeros((0, 3))
             Tf = x[nq:]
             tr = MinjerkTraj.from_endpoints(start, goal, qf, Tf, v0=v0, a0=a0)
-            # re-evaluate g at the SAME frozen normals + trust mask
+            # 在「同一套冻结的法向+掩码」下重新算 g（保证和内层用的约束一致）
             cons, _ = _alm_constraints(tr, hard_obs, avoid_cfg, normals=normals,
                                        opt=opt, trust_mask=tmask)
             g = cons["g"]
-            # multiplier update (PHR): lambda <- max(0, lambda + rho*g)
+            # 乘子更新 (PHR)：lambda <- max(0, lambda + rho·g)
             lam = np.maximum(0.0, lam + rho * g)
-            max_viol = float(np.max(np.maximum(g, 0.0)))
+            max_viol = float(np.max(np.maximum(g, 0.0)))   # 当前最大违反量
             lambda_hist.append(float(np.max(lam)) if lam.size else 0.0)
             rho_hist.append(float(rho))
-            if max_viol < opt.alm_viol_tol:
+            if max_viol < opt.alm_viol_tol:   # 约束都满足了 -> 收敛
                 break
-            # STALL early-exit: if rho is already maxed AND the violation barely
-            # improved, further outer iters won't help -> stop (surfaces as STOP).
+            # 卡死提前退出：rho 已经顶到上限、且违反量几乎没改善 -> 再迭代也没用，停（表现为 STOP）
             if rho >= opt.alm_rho_max and max_viol > 0.98 * prev_viol:
                 break
-            # grow rho only if the violation did not shrink enough (stalled)
+            # 违反量没缩小够（卡住了）才放大 rho
             if max_viol > 0.5 * prev_viol:
                 rho = min(rho * opt.alm_rho_grow, opt.alm_rho_max)
             prev_viol = max_viol
@@ -1246,17 +1673,15 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
     final_normals = None
     final_trust = None
     if hard_obs:
-        # certificate margin is computed with FRESHLY-recomputed normals at the
-        # final iterate (the tight halfspace test on the achieved curve)
+        # 证书裕度在「最终曲线」上用「重新算的」法向来检（对最终轨迹做紧的半空间检验）
         final_normals = _seg_normals(tr, hard_obs, opt=opt)
         final_trust = _trust_mask(tr, opt)
         cons_final, _ = _alm_constraints(tr, hard_obs, avoid_cfg,
                                          normals=final_normals, opt=opt,
                                          trust_mask=final_trust)
         max_viol_final = float(np.max(np.maximum(cons_final["g"], 0.0)))
-        # MOVING humans -> the conservative inflated-radius single-halfspace gate
-        # (continuous-time sound); static / spacetime-off -> the Stage-3 tight
-        # per-point margin. Walls (AABB) are reported via the tight margin too.
+        # 有会动的人 -> 用保守的「膨胀半径单半空间」连续时间证书；
+        # 静态/关 space-time -> 用 Stage 3 的紧逐点裕度。墙(AABB)也走紧裕度那条。
         has_moving = any(opt.spacetime_hard and _is_moving(o) for o in hard_obs)
         if has_moving:
             cert_margin = _certificate_margin_spacetime(
@@ -1280,13 +1705,18 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
 
 def _optimise_one_minco(seed_path: np.ndarray, obstacles, avoid_cfg,
                         opt: OptParams, v0=None, a0=None) -> dict:
-    """One ALM(hard) + soft-field solve from a seed polyline. Candidate dict.
+    """从一条种子折线出发，跑一次「硬约束 ALM + 软场」的 MINCO 求解，返回这个候选的记录字典。
+    按类别分派：障碍用 resolve_mode 分成软（EGO 场）和硬（ALM 凸包约束）两堆。
+    One ALM(hard) + soft-field solve from a seed polyline. Candidate dict.
 
     Class dispatch: obstacles split by resolve_mode(obs, avoid_cfg, override)
     into soft (EGO field) and hard (ALM convex-hull constraint)."""
     start, goal, q0, T0 = _minco_seed(seed_path, opt)
     M = T0.size
     nq = 3 * (M - 1)
+    # deterministic SPEED-reach mode: treat moving humans as static at c0 (don't trust direction);
+    # the v_max*tau reach covers any speed-bounded motion. No-op in every other mode.
+    obstacles = _safety_surrogate(obstacles, opt)
     soft_obs, hard_obs = _partition_obstacles(obstacles, avoid_cfg, opt.avoid_override)
 
     sol = _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt,
@@ -1295,22 +1725,28 @@ def _optimise_one_minco(seed_path: np.ndarray, obstacles, avoid_cfg,
     result = sol["result"]
     Tf = sol["x"][nq:]
 
-    # feasibility = continuous-time clearance + kinematics, NOT the scipy flag.
+    # 可行性 = 连续时间间隙 + 运动学限制，不看 scipy 的收敛标志（两者独立）
     feas = dict(check_feasibility(tr, obstacles, avoid_cfg, opt))
     K_dense = max(int(opt.K), 200)
-    # The SAFETY metric / STOP decision use the NATURAL hard set (override=None)
-    # so the ablation arms are comparable: all-soft still reports the human
-    # breach (a person is a person regardless of the ablation switch).
+    # 安全指标/STOP 判定一律用「天然的」硬集合（override=None），这样消融对照组才可比：
+    # 哪怕这次跑的是「全软」消融，人撞了照样要报出来——人就是人，跟消融开关无关
     _, safety_obs = _partition_obstacles(obstacles, avoid_cfg, None)
     min_clr, max_breach = hard_clearance(tr, safety_obs, avoid_cfg, K_eval=K_dense)
 
-    # Clearance validity is judged ONLY against HARD obstacles. Soft obstacles
-    # (walls) are *meant* to be grazed -- that is the whole per-class point --
-    # so their proximity is recorded in feas metrics but must NOT invalidate the
-    # trajectory. check_feasibility measures every obstacle uniformly, so a soft
-    # graze can trip its clearance_violation; re-derive the verdict here from the
-    # hard set, falling back to the (class-agnostic) kinematic checks.
-    hard_violation = bool(safety_obs) and (max_breach > opt.clearance_tol)
+    # 「间隙是否合格」只用硬障碍来判。软障碍（墙）本来就是设计成可以蹭着走的——这正是
+    # per-class 的核心意义——所以它们的接近度只记录进 feas 指标，绝不能因此把轨迹判为无效。
+    # check_feasibility 是一视同仁量所有障碍的，软墙蹭一下就可能触发它的 clearance_violation；
+    # 这里重新只按硬集合下结论，若硬集合没问题就退回到（与类别无关的）运动学检查。
+    # 有效性必须按**强制的**有效半径判:除了 d_safe,还要算进预测余量 (conformal Q_α 或
+    # deterministic reach) + 执行管子 eps_track——否则 ALM 没顶到要求的裕度时会被假报 valid
+    # (确定性「人做最坏机动也不撞」的保证就空了)。max_breach 是相对裸 d_safe 的,平移一个常数即可。
+    # 默认两余量都 0 -> max_breach 不变 -> 旧行为逐字节一致。
+    # Validity must use the ENFORCED effective radius: d_safe + prediction margin (conformal Q_alpha
+    # OR deterministic reach) + execution tube eps_track. Otherwise a plan that fails to reach the
+    # inflated margin is falsely 'valid' (the deterministic worst-case guarantee would be hollow).
+    # max_breach is relative to bare d_safe, so shift it by the constant extra. Default 0 -> no change.
+    extra = _pred_margin(opt) + _eps_track(opt)
+    hard_violation = bool(safety_obs) and (max_breach + extra > opt.clearance_tol)
     if hard_violation:
         feas["trajectory_valid"] = False
         feas["failure_reason"] = "clearance_violation"
@@ -1370,15 +1806,12 @@ def plan_minco(astar_path: np.ndarray,
                opt_params: OptParams = None,
                detour_cfg: DetourConfig = None,
                v0=None, a0=None) -> Tuple[MinjerkTraj, dict]:
-    """MINCO analytic-gradient solve. Mirrors plan()'s signature + info keys.
+    """【新版主线对外接口】MINCO 解析梯度求解。签名和返回的 info 键尽量和旧版 plan() 对齐。
+    优化变量 = (内部路点 q, 各段时间 T)；起终点是「结构性钉死」的（不是用罚函数压的）。
+    绕行多起点 + 可行优先挑选这两步直接复用 B 样条那套（它们只跟 A* 折线打交道，跟轨迹类型无关）。
 
-    Decision vars = (q, T); endpoints pinned structurally (not penalised).
-    Detour multi-start + feasibility-first selection reused verbatim from the
-    B-spline path (they operate on the A* polyline, not the trajectory type).
-
-    v0/a0 clamp the START velocity/acceleration (default rest). Pass the current
-    executed state here for receding-horizon continuity, so a replan does not
-    restart from rest each tick.
+    v0/a0 = 起点的速度/加速度边界（默认从静止开始）。做 receding-horizon（滚动重规划）时，
+    把当前正在执行的状态传进来，这样每次重规划不会都从静止重新起步、能接上。
     """
     opt = opt_params or OptParams()
     detour_cfg = detour_cfg or DetourConfig()

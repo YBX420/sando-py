@@ -8,3 +8,7 @@ __pycache__/
 build/
 install/
 log/
+
+# ETH-UCY raw pedestrian data (downloaded on demand by test/_build_realdata_residuals.py;
+# the small derived residuals .npz IS committed so stage4_conformal_realdata.py is hermetic)
+test/data/obsmat_*.txt
