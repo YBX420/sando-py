@@ -124,3 +124,11 @@
 - **A(feasible-direction)+ 走廊引导**:紧贴缝穿过,**每个迭代 min 人体净空恒 = 0.800 ≥ d_safe**(任意截断都安全);对照当前 `_optimise_one_minco` 撞人(min_clr=−0.14, valid=False)。
 - **意义**:这是「绕行=局部穿不动」这个症状的**机制级解** —— B 给对的 homotopy 可行种子破 pocket + time 移动缝,A 保证截断安全。证明了路线成立。
 - **离生产「完全解决」还差(诚实)**:① 单次开环解、3 行人(非 120 障碍闭环);② 有限差分 Jacobian(非 <50ms);③ 没接进 receding-horizon 闭环。→ 生产化 = §11.1 的 (1)-(3)。
+
+### 11.3 闭环 + 密集 + 防御曲线(2026-06-05,`python/_anytime_solver.py` + `python/_exp_production.py` → `media/_exp_production.png`)
+把 §11.2 推进到 **receding-horizon 闭环 + 6 个横穿移动行人 + 防御曲线**,端到端证明 A+B 解卡住:
+- **解析 banded 梯度**(替掉有限差分):`_alm_constraints` 给逐约束解析 g + 外法向 a,`dg/dq=-aᵀ·dP/dq`,dP/dq 对固定 T 一次性算 → 每迭代不再有限差分 clearance(从 87ms/迭代降到 ~30ms/迭代)。
+- **可行性恢复**(Phase-1,堵 A 命门)+ **time-aware 拓扑种子**(B)+ **fast feasible-direction**(A,带 deadline 截断)。
+- **闭环结果**:A+B **reached=True 到达 x=14.0,全程 min 人体净空 +0.885 ≥ d_safe**;**每拍截断不变性 95%**(本拍每个迭代净空都 ≥ d_safe → 任意截断都安全);对照**当前求解器(静态快照 + optimize-then-check)卡死在 x=0.4**(复现卡住症状)。
+- **soundness 修正**:可行性检查必须用【采样连续时间净空】或 degree-elevated 时空证书 —— **解析控制点 g 对移动行人不 sound**(凸包性质只对静态成立;控制点间时刻人移动了)。这正坐实了 §11.1 发现的「冻结证书 soundness 漏洞」,且 A 的连续时间证书是它的解。
+- **唯一剩下的缺口 = <50ms**:Python+scipy ~383ms/replan(scipy SLSQP 方向子问题 + Python 开销主导)。**解析 banded 结构已就位(这是 <50ms 的前提)**,但 Python 到不了 —— <50ms 是 **C++ 端口任务**(把内层方向 QP 换成 banded 解,替掉 scipy SLSQP)。即:机制 + 闭环 + 防御曲线全部做出,<50ms 待 C++。
