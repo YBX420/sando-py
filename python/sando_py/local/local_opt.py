@@ -59,7 +59,7 @@ Cost (per seed):
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -70,6 +70,12 @@ from .bspline import UniformBSpline
 from .cost import obstacle_cost
 from .minco import MinjerkTraj, C2B
 from .obstacles import SphereObstacle
+
+# Research instrumentation (direction A / §7 experiment): set to a list to record per-OUTER-ALM-iter
+# (outer_idx, max_g, x.copy()) so an experiment can plot the human-constraint margin vs iteration and
+# show that the current optimize-then-check inner loop is INFEASIBLE at early iterates (unsafe if the
+# deadline truncates there). None -> zero overhead, no behaviour change. Not thread-safe; single-solve use.
+_ALM_OUTER_TRACE = None
 
 
 @dataclass
@@ -98,6 +104,13 @@ class OptParams:
     w_obs: float = 1.0             # MINCO 代价里软障碍项的权重
     kappa: int = 16                # 每段时间积分的采样点数（中点求积，越多越准越慢）
     M_cap: int = 12                # MINCO 种子最多切几段（内部路点数的上限）
+    # --- SFC 软飞行走廊（只给 plan_minco；默认关 -> golden 逐字节不变）---
+    # 把内部路点 q_i 拉回种子管心 corridor_centers_i 半径 R 内,抗密集软场的「口袋」局部最优。
+    # cost = w_corridor · Σ_i max(0, ||q_i - centre_i|| - R)^2,直接作用在 q(不经 MINCO 回链)。
+    # w_corridor<=0 或 corridor_radius<=0 或 corridor_centers=None -> 整项跳过,回退旧行为。
+    w_corridor: float = 0.0        # 走廊软罚权重（YAML: minco_w_corridor）
+    corridor_radius: float = 0.0   # 管子半径 R，米（YAML: minco_sfc_radius）
+    corridor_centers: object = None  # 管心 = 种子内部路点 (M-1,3)；每个种子各自的 homotopy 类
     # --- Stage 3: per-class HARD / SOFT + augmented-Lagrangian (ALM) ---
     # avoid_override: None -> per-class (mode from avoid_cfg[class].mode, fail-safe HARD);
     #                 'soft' -> force ALL obstacles soft (EGO field, ALM off) — the M2 baseline arm;
@@ -708,7 +721,7 @@ def _signed_dist_and_grad(obs, p: np.ndarray, t: float):
     if hasattr(obs, "centre0"):  # SphereObstacle
         c = obs.predict(float(t))
         diff = np.asarray(p, dtype=np.float64) - c
-        nrm = float(np.linalg.norm(diff))
+        nrm = max(float(np.linalg.norm(diff)), 1e-9)   # 防 p≡c(t)（球心退化）0 除 -> NaN；golden 不触及
         n = diff / nrm                 # 单位外法向，也是 dd/dp
         d = nrm - obs.radius
         # 障碍在动 -> 距离随时间的变化率，用瞬时速度 velocity_at(t)=vel+accel·t（CA）
@@ -870,6 +883,7 @@ def _signed_dist_and_grad_batch(obs, P: np.ndarray, t_abs: np.ndarray):
         c = obs.predict(t_abs)                                        # (κ,3) centre0+vel·t+0.5·accel·t^2
         diff = P - c
         nrm = np.linalg.norm(diff, axis=1)                            # (κ,)
+        nrm = np.maximum(nrm, 1e-9)                                   # 防球心退化 0 除 -> NaN；golden 不触及
         n = diff / nrm[:, None]
         d = nrm - obs.radius
         # dd/dt = -n·velocity_at(t)。accel=0 时瞬时速度退回常数 vel，走原来的 n@vel
@@ -1392,6 +1406,21 @@ def _minco_cost_grad(x: np.ndarray, start: np.ndarray, goal: np.ndarray, M: int,
     gq = gq + opt.w_smooth * gq_e
     gT_total = gT_total + opt.w_smooth * gT_e
 
+    # 软飞行走廊（SFC）：把内部路点 q 拉回种子管子内，直接作用在 q（不经 MINCO 回链）。
+    # cost = w · Σ_i max(0, ||q_i - centre_i|| - R)^2。关掉（centers=None / w<=0 / R<=0）时整项跳过 -> golden 逐字节不变。
+    # 与 cpp/minco_cost_grad.hpp 的走廊项逐行镜像（含 max(d,1e-12) 防零除）。
+    Cc = opt.corridor_centers
+    if (M > 1 and opt.w_corridor > 0.0 and opt.corridor_radius > 0.0 and Cc is not None
+            and Cc.shape[0] == M - 1 and Cc.shape[1] == 3):
+        R = opt.corridor_radius
+        for i in range(M - 1):
+            delta = q[i] - Cc[i]
+            d = float(np.linalg.norm(delta))
+            if d > R:
+                over = d - R
+                f += opt.w_corridor * over * over
+                gq[i] += (2.0 * opt.w_corridor * over / max(d, 1e-12)) * delta
+
     grad = np.concatenate([gq.ravel(), gT_total]) if M > 1 else gT_total.copy()
     return float(f), grad
 
@@ -1639,6 +1668,13 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
     soft_args = (start, goal, M, list(soft_obs), avoid_cfg, opt, T_target, v0, a0)
     f0, _ = _minco_cost_grad(x, *soft_args)   # 记一下初始代价（只算软项，给 info 用）
 
+    # SFC 走廊管心 = 种子内部路点 q0（本种子的 homotopy 类）。★在 f0 之后才挂上，让 f0 保持
+    # 「纯软项」语义——与 cpp/plan_minco.hpp alm_solve「Set AFTER f0」逐行对齐。挂上后重建 soft_args，
+    # 后续内层 L-BFGS-B 才带走廊罚。w_corridor<=0 或半径<=0 时整项跳过 -> golden 逐字节不变。
+    if opt.w_corridor > 0.0 and opt.corridor_radius > 0.0 and M > 1:
+        opt = replace(opt, corridor_centers=q0)
+        soft_args = (start, goal, M, list(soft_obs), avoid_cfg, opt, T_target, v0, a0)
+
     lambda_hist = []; rho_hist = []
     prev_viol = float("inf")
     outer_iters = 0
@@ -1699,6 +1735,8 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
             # 乘子更新 (PHR)：lambda <- max(0, lambda + rho·g)
             lam = np.maximum(0.0, lam + rho * g)
             max_viol = float(np.max(np.maximum(g, 0.0)))   # 当前最大违反量
+            if _ALM_OUTER_TRACE is not None:   # research trace (direction A / §7): margin vs outer iter
+                _ALM_OUTER_TRACE.append((outer, float(np.max(g)), x.copy()))
             if max_viol < opt.alm_viol_tol:
                 best_feasible_x = x.copy()   # latest certified-feasible iterate (safe to commit)
             lambda_hist.append(float(np.max(lam)) if lam.size else 0.0)

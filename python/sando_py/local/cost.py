@@ -59,6 +59,9 @@ def obstacle_cost(spline, obstacles: Iterable, config: Dict[str, AvoidParams],
     # 默认采样数随控制点多少而定,且至少 50 个,保证采样够密
     if K is None:
         K = max(50, 10 * (spline.n + 1))
+    # K<=0 无采样点 -> 没有可测代价,直接 0.0(否则下面 total/K 会 0/0 ZeroDivisionError)
+    if K <= 0:
+        return 0.0
     # 在轨迹时间区间上均匀取 K 个时刻,一次性算出这些时刻的轨迹位置
     ts = np.linspace(spline.t_start, spline.t_end, K)
     pts = spline.eval(ts)

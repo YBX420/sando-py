@@ -613,7 +613,8 @@ class SANDO {
             0);
       }
 
-      if (plan_size - 1 - k_value < 0 || plan_size - 1 - k_value >= plan_size)
+      // upper bound index>=plan_size impossible (k_value=max(...,0)>=0 -> index<=plan_size-1); only guard <0
+      if (plan_size - 1 - k_value < 0)
         k_value = plan_size - 1;
 
       A_out = plan[plan_size - 1 - k_value];
@@ -962,6 +963,8 @@ class SANDO {
     opt.vmax = v_eff;
     opt.amax = par.a_max;
     opt.w_time = par.minco_w_time;   // time-anchor weight: higher -> faster (YAML-tunable)
+    opt.w_vel = par.minco_w_vel;     // velocity-hinge weight: higher -> respects v_max harder
+    opt.w_accel = par.minco_w_accel; // acceleration-hinge weight: higher -> respects a_max harder
     opt.sfc_radius = par.minco_sfc_radius;   // SFC: tube radius around guide seed (0=off)
     opt.w_corridor = par.minco_w_corridor;   // SFC: corridor penalty weight (0=off)
     // gatekeeper / anytime: hard compute deadline + deterministic topology seed (mirrors
@@ -996,25 +999,40 @@ class SANDO {
       replanning_failure_count += 1;
       return false;
     }
-    if (!mj_ptr || !info.trajectory_valid) {
+    // retime-on-overshoot: a pure vel/accel overshoot is collision-SAFE -> instead of holding,
+    // dilate the committed setpoints so executed speed respects v_max. Clearance/hard still hold.
+    bool valid = info.trajectory_valid;
+    double retime_s = 1.0;
+    if (!valid && mj_ptr && par.minco_retime_overshoot &&
+        (info.failure_reason == "velocity_violation" ||
+         info.failure_reason == "acceleration_violation")) {
+      double sv = (par.v_max > 1e-6) ? info.feasibility.max_v / par.v_max : 1.0;
+      double sa = (par.a_max > 1e-6) ? std::sqrt(std::max(0.0, info.feasibility.max_a / par.a_max)) : 1.0;
+      retime_s = std::max(1.0, std::max(sv, sa));
+      valid = true;
+    }
+    if (!mj_ptr || !valid) {
       replanning_failure_count += 1;
       return false;
     }
     MinjerkTraj& mj = *mj_ptr;
 
-    // Fill goal_setpoints (load-bearing).
+    // Fill goal_setpoints (load-bearing). retime_s>=1 dilates execution: at wall-step (i+1)*dc the
+    // drone sits at trajectory-time (i+1)*dc/retime_s -> velocity scaled by 1/retime_s <= v_max.
+    // retime_s==1 (valid traj or flag off) -> identical to the original sampling -> golden byte-safe.
     double dc = par.dc;
     double t_end = mj.t_end;
-    int n_samples = std::max(2, static_cast<int>(std::ceil(t_end / dc)));
+    double inv_s = 1.0 / retime_s;
+    int n_samples = std::max(2, static_cast<int>(std::ceil(t_end * retime_s / dc)));
     std::vector<RobotState> setpoints;
     for (int i = 0; i < n_samples; ++i) {
-      double t_local = std::min((i + 1) * dc, t_end - 1e-6);
+      double t_local = std::min((i + 1) * dc * inv_s, t_end - 1e-6);
       RobotState s;
       s.t = A_time_local + t_local;
       s.pos = mj.eval_deriv(t_local, 0);
-      s.vel = mj.eval_deriv(t_local, 1);
-      s.accel = mj.eval_deriv(t_local, 2);
-      s.jerk = mj.eval_deriv(t_local, 3);
+      s.vel = mj.eval_deriv(t_local, 1) * inv_s;
+      s.accel = mj.eval_deriv(t_local, 2) * (inv_s * inv_s);
+      s.jerk = mj.eval_deriv(t_local, 3) * (inv_s * inv_s * inv_s);
       setpoints.push_back(s);
     }
 

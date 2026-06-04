@@ -12,6 +12,7 @@
 #include <map>
 #include <string>
 #include <cmath>
+#include <algorithm>
 #include <tuple>
 #include "sando_cpp/obstacles.hpp"
 #include "sando_cpp/minjerk_traj.hpp"
@@ -105,7 +106,7 @@ inline BatchDistGrad signed_dist_and_grad_batch(const Obstacle* obs,
       double t = t_abs(j);
       Eigen::Vector3d c = sph->predict(t);
       Eigen::Vector3d diff = P.row(j).transpose() - c;
-      double nrm = diff.norm();
+      double nrm = std::max(diff.norm(), 1e-9);   // guard p≡c(t) centre singularity -> NaN; golden-untouched
       Eigen::Vector3d n = diff / nrm;
       r.d(j) = nrm - sph->radius;
       r.ndp.row(j) = n.transpose();

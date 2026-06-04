@@ -20,10 +20,12 @@ import numpy as np
 # locate + load the DLL (built by: g++ -shared cpp/capi/sando_capi.cpp ...)
 # --------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
+# repo layout: <repo>/python/sando_cpp_bridge.py  +  <repo>/cpp/...
+_REPO = os.path.dirname(_HERE)
 _CANDIDATES = [
     os.path.join(_HERE, "sando_capi.dll"),
-    os.path.join(_HERE, "cpp", "capi", "sando_capi.dll"),
-    os.path.join(_HERE, "cpp", "build", "sando_capi.dll"),
+    os.path.join(_REPO, "cpp", "capi", "sando_capi.dll"),
+    os.path.join(_REPO, "cpp", "build", "sando_capi.dll"),
 ]
 
 
@@ -129,6 +131,8 @@ _DEFAULTS = {
     "factor_final": 2.5, "factor_constant_step_size": 0.1, "obst_max_vel": 0.5,
     "obst_position_error": 0.0, "max_gurobi_comp_time_sec": 1.0, "jerk_smooth_weight": 10.0,
     "minco_time_budget_ms": 0.0, "minco_use_topology": False, "minco_w_time": 10.0,
+    "minco_retime_overshoot": False,
+    "minco_w_vel": 100.0, "minco_w_accel": 100.0,
     "minco_human_slow_vmax": 0.0, "minco_human_slow_near": 3.0, "minco_human_slow_far": 9.0,
     "minco_sfc_radius": 0.0, "minco_w_corridor": 0.0,
     "traj_lifetime": 7.0, "alpha_k_value_filtering": 0.9, "k_value_factor": 5.0,

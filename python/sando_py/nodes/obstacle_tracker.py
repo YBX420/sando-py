@@ -477,7 +477,10 @@ class ObstacleTrackerNode(Node):
             # 把 3 次拟合结果塞进 pwp(单段分段多项式,带绝对起止时间)——这是给规划器用的主形式。
             pwp = PieceWisePol()
             t0 = self._ros_now()
-            pwp.times = [t0, t0 + self.prediction_horizon]
+            # 外推样本只到 t=(num_steps-1)*dt(= t_arr[-1]),比 prediction_horizon 短一个 dt;
+            # 宣告窗口必须缩到数据实际末点,否则多项式在 (t_arr[-1], horizon] 区间外插超出拟合数据。
+            t_end_rel = float(t_arr[-1])
+            pwp.times = [t0, t0 + t_end_rel]
             pwp.coeff_x = [np.array([beta_x[0], beta_x[1], beta_x[2], beta_x[3]])]
             pwp.coeff_y = [np.array([beta_y[0], beta_y[1], beta_y[2], beta_y[3]])]
             pwp.coeff_z = [np.array([beta_z[0], beta_z[1], beta_z[2], beta_z[3]])]
@@ -505,7 +508,7 @@ class ObstacleTrackerNode(Node):
             msg.poly_coeffs_y = [float(c) for c in beta_y_quintic]
             msg.poly_coeffs_z = [float(c) for c in beta_z_quintic]
             msg.poly_start_time = float(t0)
-            msg.poly_end_time = float(t0 + self.prediction_horizon)
+            msg.poly_end_time = float(t0 + t_end_rel)   # 同 pwp.times:窗口缩到拟合数据末点,不外插
             # is_agent=False:明确告诉规划器「这是障碍,不是另一架飞机」。
             msg.pos.x = float(state.x[0]); msg.pos.y = float(state.x[1]); msg.pos.z = float(state.x[2])
             msg.is_agent = False

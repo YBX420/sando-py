@@ -322,6 +322,12 @@ class MinjerkTraj:
         给一个全局时刻 t,找出它落在第几段 (i),以及在那一段内部走了多久 (tau)。
         每段多项式用的是从 0 开始的"本段局部时间",所以要先减掉前面段的累计时间。
         """
+        t = float(t)
+        # 只允许 1e-6 浮点噪声的越界（夹回去）；超出就是 A_time/段时长 没对齐，宁可炸出来也别静默掩盖
+        if t < self.t_start - 1e-6 or t > self.t_end + 1e-6:
+            raise ValueError(
+                f"_locate: t={t!r} outside [{self.t_start!r}, {self.t_end!r}] "
+                f"beyond 1e-6 float noise (likely A_time/段时长 misalignment)")
         t = float(np.clip(t, self.t_start, self.t_end))
         if t >= self.t_end:
             i = self.M - 1
@@ -371,6 +377,10 @@ class MinjerkTraj:
         else:
             # vectorised _locate: clip, segment via searchsorted, local tau
             # 向量化版的 _locate:夹到有效区间 -> 二分定位每个 t 在第几段 -> 算本段局部时间
+            if ts.size and (ts.min() < self.t_start - 1e-6 or ts.max() > self.t_end + 1e-6):
+                raise ValueError(
+                    f"eval_deriv: t outside [{self.t_start!r}, {self.t_end!r}] "
+                    f"beyond 1e-6 float noise (likely segment-duration misalignment)")
             tc = np.clip(ts, self.t_start, self.t_end)
             idx = np.searchsorted(self._cum, tc, side="right") - 1
             idx = np.clip(idx, 0, self.M - 1)

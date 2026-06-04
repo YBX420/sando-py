@@ -23,6 +23,7 @@ template <class Spline>
 double obstacle_cost(const Spline& spline, const std::vector<const Obstacle*>& obstacles,
                      const std::map<std::string, AvoidParams>& config, int K) {
   if (obstacles.empty()) return 0.0;
+  if (K <= 0) return 0.0;   // 无采样点 -> 没有可测代价(否则下面 total/K = 0/0 -> NaN);镜像 Python cost.py
   // ts = linspace(t_start, t_end, K)
   std::vector<double> ts(K);
   const double a = spline.t_start, b = spline.t_end;

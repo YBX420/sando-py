@@ -251,6 +251,16 @@ class Parameters:
     minco_use_topology: bool = False    # True -> deterministic H-signature passing-side seed
     minco_w_time: float = 10.0          # MINCO time-anchor weight: HIGHER -> faster (pushes time
                                         #   allocation toward v_max/a_max), lower -> smoother/slower
+    # SFC soft flight-corridor: pull the MINCO solve back into a tube around the seed waypoints so
+    # the soft (wall) repulsion field can't drift it into a "pocket" local minimum in dense clutter.
+    # OFF by default (every golden byte-identical); activates only when both are > 0.
+    minco_w_corridor: float = 0.0       # corridor soft-penalty weight (YAML: minco_w_corridor)
+    minco_sfc_radius: float = 0.0       # corridor tube radius in metres (YAML: minco_sfc_radius)
+    # velocity/acceleration hinge weights (enforce v_max/a_max in the MINCO solve). HIGHER -> the
+    # solve respects the limits harder -> fewer over-limit trajectories rejected by the validity gate
+    # (which would otherwise make the gatekeeper brake/hold -> lost average speed). Default 100 = old.
+    minco_w_vel: float = 100.0
+    minco_w_accel: float = 100.0
     # speed-aware per-class avoidance: ramp v_max DOWN as a human gets close so the planner can
     # SWERVE AROUND instead of braking to a stop; full speed when clear. Off when slow_vmax<=0.
     minco_human_slow_vmax: float = 0.0  # routing-feasible v_max used right next to a human (0=off)

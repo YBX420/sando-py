@@ -146,13 +146,18 @@ check("I.5 negative order raises",
       raises(lambda: MinjerkTraj(np.zeros((2,3)), [1.0]).eval_deriv(0.5, -1)))
 
 
-# ---------------------------------------------------------------- J. domain clipping
-print("\n--- J. out-of-domain t clips ---")
+# ---------------------------------------------------------------- J. domain guard
+# 契约变更:域外超 1e-6 浮点噪声 -> 主动 raise(暴露 A_time/段时长 misalignment),不再静默夹回。
+# 1e-6 以内的越界(t_end+ε 这类良性浮点噪声)仍夹回端点,给正常采样留活路。
+print("\n--- J. out-of-domain t raises; float-noise overshoot still clips ---")
 wp = np.array([[0.,0,0],[1.,1,1],[2.,0,2]])
 tr = MinjerkTraj(wp, [1.0,1.0])
-check("J.0 t<t_start clips to start", np.allclose(tr.eval_deriv(-3.0,0), tr.eval_deriv(0.0,0)))
-check("J.1 t>t_end clips to end", np.allclose(tr.eval_deriv(99.0,0), tr.eval_deriv(tr.t_end,0)))
-check("J.2 deriv(order>5)==0", np.allclose(tr.eval_deriv(np.linspace(0,2,5),6), 0.0))
+check("J.0 t<<t_start raises", raises(lambda: tr.eval_deriv(-3.0,0), ValueError))
+check("J.1 t>>t_end raises", raises(lambda: tr.eval_deriv(99.0,0), ValueError))
+check("J.2 vectorised OOB raises", raises(lambda: tr.eval_deriv(np.array([0.5, 99.0]),0), ValueError))
+check("J.3 t_end+1e-9 noise still clips", np.allclose(tr.eval_deriv(tr.t_end+1e-9,0), tr.eval_deriv(tr.t_end,0)))
+check("J.4 t_start-1e-9 noise still clips", np.allclose(tr.eval_deriv(-1e-9,0), tr.eval_deriv(0.0,0)))
+check("J.5 deriv(order>5)==0", np.allclose(tr.eval_deriv(np.linspace(0,2,5),6), 0.0))
 
 
 # ---------------------------------------------------------------- K. scalar/vector parity
