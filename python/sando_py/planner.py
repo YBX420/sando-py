@@ -901,8 +901,9 @@ class SANDO:
                     0
                 )
 
-            # 中文:防越界——索引算出来不合法就退回"用计划末端那个点"。
-            if plan_size - 1 - self.k_value < 0 or plan_size - 1 - self.k_value >= plan_size:
+            # 中文:防越界——索引算出来 <0(k_value 比队列还长)就退回"用计划末端那个点"。
+            # 注:上界 index>=plan_size 不可能(k_value=max(...,0)≥0 -> index≤plan_size-1),故只查下界。
+            if plan_size - 1 - self.k_value < 0:
                 self.k_value = plan_size - 1
 
             # 中文:A = 计划队列里第 (末尾-k_value) 个点;A_time = 当前时间 + 这么多个 dc 后的时刻。
@@ -1300,7 +1301,11 @@ class SANDO:
                 frac = min(1.0, max(0.0, (dmin - near) / max(far - near, 1e-6)))
                 v_eff = slow_v + (float(self.par.v_max) - slow_v) * frac
         opt = OptParams(vmax=v_eff, amax=float(self.par.a_max),
-                        w_time=float(getattr(self.par, "minco_w_time", 10.0)))
+                        w_time=float(getattr(self.par, "minco_w_time", 10.0)),
+                        w_vel=float(getattr(self.par, "minco_w_vel", 100.0)),
+                        w_accel=float(getattr(self.par, "minco_w_accel", 100.0)),
+                        w_corridor=float(getattr(self.par, "minco_w_corridor", 0.0)),
+                        corridor_radius=float(getattr(self.par, "minco_sfc_radius", 0.0)))
         # gatekeeper / anytime: 硬计算 deadline + 确定性拓扑种子(都默认关 -> 行为不变)。
         # plan_minco 在预算内只返回「认证可行」轨迹;不认证就走下面的 valid 门 -> return False
         # -> planner 保持上一条已 commit 的安全计划(这就是 gatekeeper 的「不 commit 未认证」)。

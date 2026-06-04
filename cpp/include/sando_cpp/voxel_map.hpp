@@ -135,7 +135,7 @@ class VoxelMapUtil {
   // read_map — build the planning grid
   // ------------------------------------------------------------------
   // cloud_occ: (M,3) point cloud (each row a world point). obst_pos/obst_bbox:
-  // dynamic obstacle centers / half-extents.
+  // dynamic obstacle centers / FULL extents (matches DynTraj.bbox + MINCO side; halved internally).
   void read_map(long cells_x, long cells_y, long cells_z,
                 const Eigen::Vector3d& center_map,
                 const std::vector<Eigen::Vector3d>& cloud_occ,
@@ -144,6 +144,10 @@ class VoxelMapUtil {
                 const std::vector<Eigen::Vector3d>& obst_bbox,
                 double traj_max_time) {
     const double r = res;
+    // factor-2 fix: obst_bbox is FULL extent (DynTraj.bbox + MINCO side); downstream occupancy/heat
+    // math expects HALF extent -> halve once at entry, mirror of Python read_map. Downstream untouched.
+    std::vector<Eigen::Vector3d> bbox_h(obst_bbox.size());
+    for (size_t i = 0; i < obst_bbox.size(); ++i) bbox_h[i] = 0.5 * obst_bbox[i];
     // 1) Padding so the inflation kernel fits inside the map
     long pad = static_cast<long>(std::ceil(5.0 * inflation / r));
     long dX = cells_x + pad;
@@ -198,23 +202,23 @@ class VoxelMapUtil {
     // 6) Dynamic obstacles as occupied (current)
     dyn_occ_mask.assign(static_cast<size_t>(total), 0);
     if (dynamic_as_occupied_current) {
-      size_t n = std::min(obst_pos.size(), obst_bbox.size());
+      size_t n = std::min(obst_pos.size(), bbox_h.size());
       for (size_t k = 0; k < n; ++k) {
         Eigen::Vector3d half;
         double add = std::max(dyn_base_inflation_m, inflation);
         for (int i = 0; i < 3; ++i)
-          half(i) = std::max(obst_bbox[k](i) + add, 0.0);
+          half(i) = std::max(bbox_h[k](i) + add, 0.0);
         _rasterize_aabb(obst_pos[k], half, true);
       }
     }
 
     // 7) Dynamic obstacles as occupied (future cone)
     if (dynamic_as_occupied_future && traj_max_time > 0) {
-      size_t n = std::min(obst_pos.size(), obst_bbox.size());
+      size_t n = std::min(obst_pos.size(), bbox_h.size());
       for (size_t k = 0; k < n; ++k) {
         Eigen::Vector3d half;
         for (int i = 0; i < 3; ++i)
-          half(i) = obst_bbox[k](i) + obst_max_vel * traj_max_time;
+          half(i) = bbox_h[k](i) + obst_max_vel * traj_max_time;
         _rasterize_aabb(obst_pos[k], half, true);
       }
     }
@@ -238,7 +242,7 @@ class VoxelMapUtil {
       heat.assign(static_cast<size_t>(total), 0.0f);
     else
       heat.clear();
-    if (dynamic_heat_enabled) _compose_dynamic_heat(obst_pos, obst_bbox, traj_max_time);
+    if (dynamic_heat_enabled) _compose_dynamic_heat(obst_pos, bbox_h, traj_max_time);
     if (static_heat_enabled) _compose_static_heat();
 
     initialized = true;

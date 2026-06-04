@@ -90,6 +90,19 @@ int main(int argc, char** argv) {
     opt.est_pos_err   = num["EST_POS_ERR"][0];
     opt.est_vel_err   = num["EST_VEL_ERR"][0];
 
+    // optional SFC corridor (only present in cases that exercise it; absent -> term OFF -> parity).
+    // corridor_centers must outlive the minco_cost_grad call below (declared in this case scope).
+    Eigen::MatrixXd corridor_centers;
+    if (num.count("W_CORRIDOR")) {
+      opt.w_corridor      = num["W_CORRIDOR"][0];
+      opt.corridor_radius = num["CORRIDOR_RADIUS"][0];
+      const auto& cc = num["CORRIDOR_CENTERS"];   // (M-1)*3 flat
+      corridor_centers.resize(M - 1, 3);
+      for (int i = 0; i < M - 1; ++i)
+        for (int j = 0; j < 3; ++j) corridor_centers(i, j) = cc[i * 3 + j];
+      opt.corridor_centers = &corridor_centers;
+    }
+
     // avoid config: start from default_config, override per dumped class so the lookups
     // (mode for the soft/hard split, d_safe/weight for the soft term) all match Python.
     std::map<string, sando::AvoidParams> cfg = sando::default_config();

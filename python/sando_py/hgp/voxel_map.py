@@ -224,8 +224,12 @@ class VoxelMapUtil:
         #       把动态障碍也画成障碍 -> 加边界墙 -> 叠热度场。
         # 入参:cells_*=各方向格数;center_map=地图中心世界坐标;cloud_occ=占据点云(M,3);
         #       z_ground/z_max=高度上下限;inflation=障碍膨胀(米,给无人机留余量);
-        #       obst_pos/obst_bbox=动态障碍中心/半尺寸;traj_max_time=本次轨迹的总时长。
+        #       obst_pos/obst_bbox=动态障碍中心/全尺寸(内部按半尺寸用);traj_max_time=本次轨迹的总时长。
         res = self.res
+        # factor-2 修复:obst_bbox 入参约定是「全尺寸」(与 DynTraj.bbox 生产端 + MINCO 侧 _obstacles_from_snapshot
+        # 一致);本函数下游的占用/热度数学全部按「半尺寸」写,旧代码漏了这次折半 -> 动态障碍在全局图里被胀成 2 倍。
+        # 在入口一次性折半,下游一字不改,Py↔C++ 镜像天然一致。
+        obst_bbox = [0.5 * np.asarray(b, dtype=np.float64) for b in obst_bbox]
         # 1) Padding so the inflation kernel fits inside the map
         # 1) 多留点边(padding),好让障碍「膨胀」时不会被地图边界截掉
         pad = int(np.ceil(5.0 * inflation / res))

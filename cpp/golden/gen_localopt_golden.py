@@ -1,7 +1,7 @@
 """Golden generator for local_opt.py geometric core: _signed_dist_and_grad + _seg_vander."""
 import os, sys
 import numpy as np
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 sys.path.insert(0, ROOT)
 from sando_py.local.obstacles import SphereObstacle, AABBObstacle
 from sando_py.local.local_opt import _signed_dist_and_grad, _seg_vander

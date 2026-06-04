@@ -173,6 +173,9 @@ class MinjerkTraj {
   Eigen::Vector3d eval_deriv(double t, int order = 0) const {
     if (order < 0) throw std::invalid_argument("order must be >= 0");
     if (order > DEG) return Eigen::Vector3d::Zero();
+    // only float-noise overshoot (<=1e-6) is clamped; beyond that = segment misalignment, surface it
+    if (t < t_start - 1e-6 || t > t_end + 1e-6)
+      throw std::out_of_range("eval_deriv: t outside [t_start, t_end] beyond 1e-6 float noise");
     const double tc = std::min(std::max(t, t_start), t_end);
     const int idx = locate_idx(tc);
     const double tau = tc - cum(idx);

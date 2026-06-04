@@ -605,7 +605,14 @@ struct Parameters {
   // every golden byte-identical; the deterministic certificate-first stack activates only when set.
   double minco_time_budget_ms = 0.0;   // >0 -> hard per-replan compute deadline for plan_minco
   bool minco_use_topology = false;     // True -> deterministic H-signature passing-side seed
+  // retime-on-overshoot: a pure velocity/acceleration overshoot is collision-SAFE; instead of the
+  // gatekeeper holding (braking to 0 -> large average-speed loss), dilate the committed setpoints so
+  // EXECUTED speed respects v_max (fly the same path a bit slower). Clearance/hard violations still
+  // hold. Default OFF -> every golden byte-identical (retime factor stays 1).
+  bool minco_retime_overshoot = false;
   double minco_w_time = 10.0;          // MINCO time-anchor weight: higher -> faster, lower -> smoother
+  double minco_w_vel = 100.0;          // velocity-hinge weight: higher -> respects v_max harder (fewer rejects)
+  double minco_w_accel = 100.0;        // acceleration-hinge weight: higher -> respects a_max harder
   // speed-aware per-class avoidance: ramp v_max down near a human so the planner swerves instead
   // of braking; full speed when clear. Off when slow_vmax<=0.
   double minco_human_slow_vmax = 0.0;  // routing-feasible v_max next to a human (0=off)
