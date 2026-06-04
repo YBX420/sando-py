@@ -59,7 +59,7 @@ import numpy as np
 
 from .hgp.hgp_manager import HGPManager
 from .local.avoid_config import default_config as _avoid_default_config
-from .local.local_opt import plan_minco, DetourConfig
+from .local.local_opt import plan_minco, DetourConfig, OptParams
 from .local.minco import MinjerkTraj
 from .local.obstacles import AABBObstacle, SphereObstacle
 from .solver_gurobi import SolverGurobi
@@ -878,7 +878,17 @@ class SANDO:
             return False, RobotState(), 0.0
 
         if self.par.use_state_update:
-            if not self.use_adapt_k_value:
+            budget_ms = float(getattr(self.par, "minco_time_budget_ms", 0.0))
+            if budget_ms > 0.0:
+                # computation-invariant commit: bound the commit-ahead by the BUDGET (a constant),
+                # NOT the measured/variable compute time. The deadline caps one replan at ~budget,
+                # so committing ceil(budget/dc) points ahead never over-commits a stale plan; if a
+                # replan still overruns, the drone simply runs out of committed plan and HOLDS
+                # (safe) rather than flying blind into where a human has since moved. This breaks
+                # the compute->commit->safety coupling that made the wall-clock-fed loop collide.
+                commit_ahead = max(1, int(np.ceil(budget_ms / 1000.0 / self.par.dc)))
+                self.k_value = max(plan_size - 1 - commit_ahead, 0)
+            elif not self.use_adapt_k_value:
                 self.k_value = max(plan_size - self.par.default_k_value, 0)
                 if self.num_replanning != 1:
                     self.store_computation_times.append(last_replanning_computation_time)
@@ -1271,6 +1281,32 @@ class SANDO:
         a0 = local_A.accel.copy()
         astar_path = np.asarray(seed_path, dtype=np.float64)
 
+        # 把 YAML 的限速/限加速度透传进 MINCO 解(否则用 OptParams 默认 vmax=3/amax=3,
+        # 无人机被卡在 ~3 m/s 飞不快)。其余优化超参仍用 OptParams 的默认值。
+        # speed-aware per-class avoidance: as a HUMAN gets close, ramp v_max DOWN to a routing-
+        # feasible speed so the planner SWERVES AROUND instead of braking to a stop; full speed when
+        # clear. At 15 m/s a crossing human can't be routed (too little space) -> the planner brakes;
+        # slowing to ~5 m/s near humans makes the detour feasible. Off when slow_vmax<=0.
+        v_eff = float(self.par.v_max)
+        slow_v = float(getattr(self.par, "minco_human_slow_vmax", 0.0))
+        if slow_v > 0.0 and obst_pos:
+            near = float(getattr(self.par, "minco_human_slow_near", 3.0))
+            far = float(getattr(self.par, "minco_human_slow_far", 9.0))
+            dmin = float("inf")
+            for i, c in enumerate(obst_class):
+                if c != "wall":  # hard human class
+                    dmin = min(dmin, float(np.linalg.norm(obst_pos[i] - local_A.pos)))
+            if dmin < float("inf"):
+                frac = min(1.0, max(0.0, (dmin - near) / max(far - near, 1e-6)))
+                v_eff = slow_v + (float(self.par.v_max) - slow_v) * frac
+        opt = OptParams(vmax=v_eff, amax=float(self.par.a_max),
+                        w_time=float(getattr(self.par, "minco_w_time", 10.0)))
+        # gatekeeper / anytime: 硬计算 deadline + 确定性拓扑种子(都默认关 -> 行为不变)。
+        # plan_minco 在预算内只返回「认证可行」轨迹;不认证就走下面的 valid 门 -> return False
+        # -> planner 保持上一条已 commit 的安全计划(这就是 gatekeeper 的「不 commit 未认证」)。
+        budget = float(getattr(self.par, "minco_time_budget_ms", 0.0)) or None
+        use_topo = bool(getattr(self.par, "minco_use_topology", False))
+
         t0 = time.perf_counter()
         try:
             # RT: try ONE warm-started solve from the hgp global path first (it is
@@ -1279,10 +1315,17 @@ class SANDO:
             # single seed is infeasible do we fall back to the multi-start detour
             # (slower, but rare) so hard scenes still get solved.
             mj, info = plan_minco(astar_path, obstacles, avoid_cfg, v0=v0, a0=a0,
-                                  detour_cfg=DetourConfig(enabled=False))
+                                  opt_params=opt, time_budget_ms=budget,
+                                  detour_cfg=DetourConfig(enabled=use_topo, use_topology=use_topo))
             if not info.get("trajectory_valid"):
+                # share the budget: the fallback gets the REMAINING budget so the two calls
+                # together stay bounded by one budget (else detour-off + detour-on = 2x budget).
+                rem = budget
+                if budget is not None:
+                    rem = max(1.0, budget - (time.perf_counter() - t0) * 1000.0)
                 mj, info = plan_minco(astar_path, obstacles, avoid_cfg, v0=v0, a0=a0,
-                                      detour_cfg=DetourConfig(enabled=True))
+                                      opt_params=opt, time_budget_ms=rem,
+                                      detour_cfg=DetourConfig(enabled=True, use_topology=use_topo))
         except Exception:  # plan_minco can RAISE 'all seeds failed'
             # 中文:plan_minco 在"所有起点都失败"时会直接抛异常,这里兜住当作本拍规划失败。
             self.replanning_failure_count += 1

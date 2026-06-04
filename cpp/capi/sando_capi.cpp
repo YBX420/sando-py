@@ -54,6 +54,9 @@ SANDO_API void params_set_double(void* ph, const char* name, double v) {
   D(dynamic_factor_initial_mean); D(factor_initial); D(factor_final); D(factor_constant_step_size);
   D(obst_max_vel); D(obst_position_error); D(max_gurobi_comp_time_sec); D(jerk_smooth_weight);
   D(traj_lifetime); D(alpha_k_value_filtering); D(k_value_factor); D(alpha_filter_dyaw); D(w_max);
+  D(minco_time_budget_ms); D(minco_w_time);
+  D(minco_human_slow_vmax); D(minco_human_slow_near); D(minco_human_slow_far);
+  D(minco_sfc_radius); D(minco_w_corridor);
   D(w_max_yawing); D(yaw_spinning_dyaw); D(default_goal_z); D(hover_avoidance_d_trigger);
   D(hover_avoidance_h); D(hover_avoidance_min_repulsion_norm);
   I(visual_level); I(hgp_timeout_duration_ms); I(max_num_expansion); I(los_cells); I(heat_p);
@@ -77,6 +80,7 @@ SANDO_API void params_set_bool(void* ph, const char* name, int v) {
   B(static_heat_enabled); B(static_heat_boundary_only); B(static_heat_apply_on_unknown);
   B(static_heat_exclude_dynamic); B(use_soft_cost_obstacles); B(use_dynamic_factor);
   B(inflate_unknown_boundary); B(using_variable_elimination); B(skip_initial_yawing);
+  B(minco_use_topology);
   B(force_goal_z); B(debug_verbose); B(ignore_other_trajs); B(hover_avoidance_enabled);
   B(hover_avoidance_2d);
   else std::printf("[sando_capi][warn] params_set_bool: unknown field '%s', skipped\n", name);
