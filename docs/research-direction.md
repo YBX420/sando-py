@@ -81,3 +81,37 @@
 
 **逐级门槛**:RAL/ICRA = 你的栈 + 单域 + 两条截断不变曲线(现在就能);Science Robotics = + 命名原理 + optimizer⊗fallback 耦合定理 + 有说服力的(近)真实人群 demo;Nature = + 跨域(无人机+车/机械臂)**或**深到意外的通用定理。
 **关键**:不管冲哪级,**第一步实验都是 §7 那个**——它既是会议论文核心,又是证明这条原理的第一个实例。
+
+---
+
+## 11. 综合裁决:锁定「A 主攻 + B 前端」(2026-06-04,第 5 个 deep-research:时空穿移动缝 SOTA + novelty gap)
+> 24 篇主源(UPenn GRASP / TU Delft AMR / MIT-ACL / HKUST / JHU)、25 条断言 3 票对抗验证(23 确认 2 枪毙)。**结论:确认并收紧 §0–§10 —— 主攻 A(per-class anytime-feasible 证书),B(timing-aware 时空拓扑)降级为前端配件,C 为最终落地。**
+
+**新增的承重证据(literature 没有,你这两天实测独有 = 最强 motivation 图):**
+- **「算力越多越差」**:budget 给足 → 完全收敛的解反而在密集移动 clutter 卡死(avg 0.7,90% 无效);anytime 截断在中间迭代反而能走。这是 optimize-then-check 架构坏掉的铁证 → 直接论证「要的是可证明可行的中间解,不是收敛解」。
+- **超速→validity gate 拒→gatekeeper 刹停**:卡死的直接根因 = 收敛解不可行被后验拒。**anytime-feasible(每迭代可行)从构造上消灭这个拒绝** → §7 实验的 before/after 对照天然成立(before=卡死,after=穿过)。
+- 实测可行配置:dyn_base_inflation_m=1.2 + minco_w_time=2500 + v_max=12 → **持续巡航 8.48 m/s 穿密集移动场**(安全 clr+1.15);但高 w_time/v_max 时**解算崩(plan_minco 抛 all-seeds-failed)** → 印证「需要可行性恢复 / 可行种子」这条命门。
+
+**三轴 novelty gap(每个 SOTA 只占两格,空交集 = 你):**
+| 方法 | 时空穿移动缝 | 硬安全(证书级) | anytime-feasible <50ms |
+|---|:-:|:-:|:-:|
+| T-MPC++ (2401.06021) | ✓ | ✗ 软 | ~ 截断**选优**,非逐迭代可行 |
+| MIGHTY (MIT-ACL 2511.10822) | ✓ | ✗ 软 EGO 线 | ✗;硬件 6.7 m/s 静态 |
+| SS-QCQP (JHU 2511.19675) | ✗ | ✓ 离散时间前向不变 | ✓ |
+| P-CBF (2606.00297) | ~ horizon | ✓ | ~ |
+| ST-GCS (IROS'25) / SSC (HKUST RA-L'19) | ✓ 硬走廊 | ✓ | ✗ 秒级离线/多机预约 |
+| SPOT (2602.01189, 2026-02) | ✓ 4D | ✗ 软 + 纯静态势场兜底 | ✗ |
+| **你(目标)** | ✓ | ✓ | ✓ |
+
+**A 与 B 互锁(不是两个独立大工程)**:A 的命门是「SS-QCQP 要每拍可行初值 g(x⁰)≤0」;**B(时空拓扑向导)正是喂可行种子 + time 准移动缝的前端**,且直接复用现有 detour/topology 扩到时空即可,别在 B 上猛投 novelty。报告 open-Q#3 原话:**「没有任何文献把 per-class 差异化机制和 anytime-feasible 求解器结合」——这就是最独有的空位**。
+
+**收紧后三篇必读**:SS-QCQP `2511.19675`(anytime-feasible primitive + 修 Maratos 丢不变性)、T-MPC++ `2401.06021`(时空 H-signature 拓扑,有开源 tud-amr/mpc_planner)、SIMP/UTVD `2409.10647`(穿移动缝的时空拓扑等价判据,UPenn Kumar 组 ICRA'25)。补充:P-CBF `2606.00297`(整段 horizon 硬证书,和你 ALM 证书哲学契合)。
+
+**第一步 = §7 实验**(不变):把一次 ALM 内层换成 feasible-direction + deadline 截断,量(i)任意截断时刻人净空 ≥ 阈值、(ii)anytime 版穿过去而 optimize-then-check 卡死(对照基线已有)、(iii)5 行人 <50ms。
+
+### 11.1 第一个结果(2026-06-04,原型已跑通 → 核心主张证实)
+- **探针**:`python/sando_py/local/local_opt.py` 加了门控 `_ALM_OUTER_TRACE`(默认 None,零开销,golden 安全)记录每个外层 ALM 迭代的 (max_g, x)。
+- **BEFORE**(`python/_exp_anytime_margin.py`):密集移动行人下,当前 optimize-then-check 的 ALM **每个迭代都人体不可行**(min_clr<0,在撞人),first-certified-feasible = None → 早截断没有可 commit 的安全轨迹。**额外挖到**:冻结法向证书会报 max_g<0(声称可行)而真实 min_clr<0(在撞)—— 现有 validity gate 的 soundness 漏洞,待复核。
+- **AFTER**(`python/_exp_anytime_feasible.py` → `media/_exp_anytime_feasible.png`):实现了 **feasible-direction 内层原型**(SS-QCQP-lite:方向 u=argmin ½‖u+∇f‖² s.t. ∇gₐ·u ≤ −α gₐ via SLSQP + 回溯到真实可行)。从一个可行起点出发:**feasible-direction 的每一个迭代 min_clr ≥ d_safe(绿线全程在阈值上,边优化边保持)**;而 plain cost-descent(当前内层本质)第 3 迭代就跌破 d_safe(橙线进不安全区)。**= computation-invariant 行人安全这条主张的第一张实证图。**
+- **原型 caveats(诚实)**:① 约束 Jacobian 用有限差分(非 <50ms 级)→ 下一步要用 MINCO banded 结构的解析 ∇g;② 静态行人 + 手工可行起点 → 下一步上动态行人 + 可行性恢复(命门 open-Q#1:每拍可行 warm-start);③ 还没接进生产 `_alm_solve`(门控接入是后续)。
+- **下一步顺序**:(1) 解析 banded ∇g 替掉有限差分 + 量单解 ms;(2) 动态行人 + 用拓扑/上一帧解做可行 warm-start;(3) 门控接进 `_alm_solve`(默认关→golden 安全)+ 闭环测「截断率 vs 行人密度」「截断后净空恒≥阈」两条防御曲线。
