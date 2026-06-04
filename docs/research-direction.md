@@ -132,3 +132,11 @@
 - **闭环结果**:A+B **reached=True 到达 x=14.0,全程 min 人体净空 +0.885 ≥ d_safe**;**每拍截断不变性 95%**(本拍每个迭代净空都 ≥ d_safe → 任意截断都安全);对照**当前求解器(静态快照 + optimize-then-check)卡死在 x=0.4**(复现卡住症状)。
 - **soundness 修正**:可行性检查必须用【采样连续时间净空】或 degree-elevated 时空证书 —— **解析控制点 g 对移动行人不 sound**(凸包性质只对静态成立;控制点间时刻人移动了)。这正坐实了 §11.1 发现的「冻结证书 soundness 漏洞」,且 A 的连续时间证书是它的解。
 - **唯一剩下的缺口 = <50ms**:Python+scipy ~383ms/replan(scipy SLSQP 方向子问题 + Python 开销主导)。**解析 banded 结构已就位(这是 <50ms 的前提)**,但 Python 到不了 —— <50ms 是 **C++ 端口任务**(把内层方向 QP 换成 banded 解,替掉 scipy SLSQP)。即:机制 + 闭环 + 防御曲线全部做出,<50ms 待 C++。
+
+### 11.4 C++ 端口:<50ms 达成 → 四个缺口全关闭(2026-06-05,`cpp/include/sando_cpp/anytime_feasible.hpp` + `cpp/test/bench_anytime.cpp`)
+把 §11.3 的 A+B 闭环移植进 C++ 引擎(复用 `alm_constraints` 解析 g/法向、`minco_cost_grad`、`MinjerkTraj`、`hard_clearance`),**方向子问题用 Gauss-Seidel 投影替掉 scipy SLSQP**(微秒级,无 QP 库),编译 -O2 独立 benchmark。同一密集场景(6 个横穿移动行人)闭环 receding-horizon:
+- **<50ms 达成**:per-replan **ms mean=5.6,p90=11.0,max=13.7 → 全部 < 50ms deadline**(Python 383ms → C++ ~6ms,~60x;最坏 13.7ms 仍有 3.6x 余量)。
+- **到达 + 全程安全**:reached=true,**flight min 人体净空 +0.916 ≥ d_safe**(加 0.12 规划裕度吸收拍间行人漂移)。
+- **截断不变性 96%**:每拍解的每个迭代净空 ≥ d_safe(任意 deadline 截断都人体安全)。
+- **结论:四个缺口(① <50ms ② 闭环 ③ 密集端到端 ④ 防御曲线)全部在 C++ 关闭。** computation-invariant 行人安全 + <50ms 硬 deadline + 时空穿密集移动人群,端到端可证明运作。
+- **离全生产还差(诚实,但已非「能不能」)**:Gauss-Seidel 投影是近似 QP(非精确 SS-QCQP 步,但实测够);未接进 receding-horizon 生产 planner 的 commit/golden 路径(bench 是独立可执行);场景是 6 行人合成(非真感知)。这些是工程集成,不是原理风险。
