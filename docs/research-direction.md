@@ -115,3 +115,12 @@
 - **AFTER**(`python/_exp_anytime_feasible.py` → `media/_exp_anytime_feasible.png`):实现了 **feasible-direction 内层原型**(SS-QCQP-lite:方向 u=argmin ½‖u+∇f‖² s.t. ∇gₐ·u ≤ −α gₐ via SLSQP + 回溯到真实可行)。从一个可行起点出发:**feasible-direction 的每一个迭代 min_clr ≥ d_safe(绿线全程在阈值上,边优化边保持)**;而 plain cost-descent(当前内层本质)第 3 迭代就跌破 d_safe(橙线进不安全区)。**= computation-invariant 行人安全这条主张的第一张实证图。**
 - **原型 caveats(诚实)**:① 约束 Jacobian 用有限差分(非 <50ms 级)→ 下一步要用 MINCO banded 结构的解析 ∇g;② 静态行人 + 手工可行起点 → 下一步上动态行人 + 可行性恢复(命门 open-Q#1:每拍可行 warm-start);③ 还没接进生产 `_alm_solve`(门控接入是后续)。
 - **下一步顺序**:(1) 解析 banded ∇g 替掉有限差分 + 量单解 ms;(2) 动态行人 + 用拓扑/上一帧解做可行 warm-start;(3) 门控接进 `_alm_solve`(默认关→golden 安全)+ 闭环测「截断率 vs 行人密度」「截断后净空恒≥阈」两条防御曲线。
+
+### 11.2 A+B 集成原型:卡住问题(机制级)已解(2026-06-05,`python/_exp_solve_stall.py` → `media/_exp_solve_stall.png`)
+动态密集行人场景(3 个横穿走廊的行人)端到端跑通 A+B,**当前求解器撞人/失败处 A+B 安全穿过**:
+- **B(time-aware 拓扑种子)**:每个路点按「它将抵达的时刻」选过障侧、取偏离最小的清空 y(紧贴缝穿)。
+  实测 **time-aware 种子 min-clr=0.766 vs static-snapshot 0.049** —— 量化了时空价值:静态快照选错侧正是当前规划器卡死的根因。
+- **Phase-1 可行性恢复**(`restore_feasible`,梯度下降总违反量)把种子推进可行集(0.984 ≥ d_safe)—— 堵 A 的命门 open-Q#1(每拍可行 warm-start)。
+- **A(feasible-direction)+ 走廊引导**:紧贴缝穿过,**每个迭代 min 人体净空恒 = 0.800 ≥ d_safe**(任意截断都安全);对照当前 `_optimise_one_minco` 撞人(min_clr=−0.14, valid=False)。
+- **意义**:这是「绕行=局部穿不动」这个症状的**机制级解** —— B 给对的 homotopy 可行种子破 pocket + time 移动缝,A 保证截断安全。证明了路线成立。
+- **离生产「完全解决」还差(诚实)**:① 单次开环解、3 行人(非 120 障碍闭环);② 有限差分 Jacobian(非 <50ms);③ 没接进 receding-horizon 闭环。→ 生产化 = §11.1 的 (1)-(3)。
