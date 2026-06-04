@@ -83,6 +83,12 @@ struct CostGradOptParams {
   double v_max_human = 0.0;
   double est_pos_err = 0.0;
   double est_vel_err = 0.0;
+  // Soft flight-corridor (SFC): keep interior waypoints inside a tube of radius `corridor_radius`
+  // around `corridor_centers` (the guide/seed waypoints, (M-1,3)). OFF when centers null or
+  // w_corridor<=0 or radius<=0 -> term skipped -> golden byte-identical. Counters soft-field drift.
+  const Eigen::MatrixXd* corridor_centers = nullptr;
+  double corridor_radius = 0.0;
+  double w_corridor = 0.0;
 
   // Build the HardAlmOptParams used by alm_term (every field the inner ALM reads).
   HardAlmOptParams hard_alm() const {
@@ -252,6 +258,25 @@ inline CostGradResult minco_cost_grad(
   f        += opt.w_smooth * J;
   gq        = gq + opt.w_smooth * gq_e;
   gT_total  = gT_total + opt.w_smooth * gT_e;
+
+  // --- soft flight-corridor (SFC): penalise interior waypoints leaving the guide tube ----
+  // cost = w · Σ_i max(0, ||q_i - centre_i|| - R)^2 ; acts directly on q (no MINCO back-prop).
+  // OFF by default (centres null / w<=0 / R<=0) -> golden byte-identical.
+  if (opt.w_corridor > 0.0 && opt.corridor_radius > 0.0 && opt.corridor_centers &&
+      opt.corridor_centers->rows() == M - 1 && opt.corridor_centers->cols() == 3) {
+    const Eigen::MatrixXd& Cc = *opt.corridor_centers;
+    const double R = opt.corridor_radius;
+    for (int i = 0; i < M - 1; ++i) {
+      Eigen::Vector3d delta = q.row(i).transpose() - Cc.row(i).transpose();
+      const double d = delta.norm();
+      if (d > R) {
+        const double over = d - R;
+        f += opt.w_corridor * over * over;
+        const Eigen::Vector3d gdir = (2.0 * opt.w_corridor * over / std::max(d, 1e-12)) * delta;
+        gq(i, 0) += gdir(0); gq(i, 1) += gdir(1); gq(i, 2) += gdir(2);
+      }
+    }
+  }
 
   // --- assemble grad in x-order: [gq.ravel(), gT_total] (M=1 => just gT_total) --------
   CostGradResult res;

@@ -593,7 +593,14 @@ class SANDO {
     RobotState A_out;
     double A_time_out;
     if (par.use_state_update) {
-      if (!use_adapt_k_value) {
+      if (par.minco_time_budget_ms > 0.0) {
+        // computation-invariant commit: bound the commit-ahead by the BUDGET (a constant), NOT
+        // the measured/variable compute time. If a replan still overruns, the drone runs out of
+        // committed plan and HOLDS (safe) rather than over-committing a stale plan into where a
+        // human has moved. Breaks the compute->commit->safety coupling. Mirrors planner.py.
+        int commit_ahead = std::max(1, (int)std::ceil(par.minco_time_budget_ms / 1000.0 / par.dc));
+        k_value = std::max(plan_size - 1 - commit_ahead, 0);
+      } else if (!use_adapt_k_value) {
         k_value = std::max(plan_size - par.default_k_value, 0);
         if (num_replanning != 1)
           store_computation_times.push_back(last_replanning_computation_time);
@@ -932,17 +939,56 @@ class SANDO {
     for (int i = 0; i < static_cast<int>(seed_path.size()); ++i)
       astar_path.row(i) = seed_path[i].transpose();
 
+    // speed-aware per-class avoidance: ramp v_max DOWN near a human so the planner SWERVES instead
+    // of braking to a stop; full speed when clear (mirrors planner.py). At 15 m/s a crossing human
+    // can't be routed -> the planner brakes; slowing to ~5 m/s near humans makes the detour feasible.
+    double v_eff = par.v_max;
+    if (par.minco_human_slow_vmax > 0.0 && !opos.empty()) {
+      double dmin = std::numeric_limits<double>::infinity();
+      for (size_t i = 0; i < opos.size(); ++i)
+        if (oclass[i] != "wall")  // hard human class
+          dmin = std::min(dmin, (opos[i] - local_A.pos).norm());
+      if (std::isfinite(dmin)) {
+        double frac = std::min(1.0, std::max(0.0,
+            (dmin - par.minco_human_slow_near) /
+            std::max(par.minco_human_slow_far - par.minco_human_slow_near, 1e-6)));
+        v_eff = par.minco_human_slow_vmax + (par.v_max - par.minco_human_slow_vmax) * frac;
+      }
+    }
+
     PlanOptParams opt;  // defaults mirror local_opt.py:OptParams
+    // pass the YAML speed/accel limits into the MINCO solve (else stuck at the
+    // OptParams default vmax=3 -> drone capped ~3 m/s). Mirrors planner.py.
+    opt.vmax = v_eff;
+    opt.amax = par.a_max;
+    opt.w_time = par.minco_w_time;   // time-anchor weight: higher -> faster (YAML-tunable)
+    opt.sfc_radius = par.minco_sfc_radius;   // SFC: tube radius around guide seed (0=off)
+    opt.w_corridor = par.minco_w_corridor;   // SFC: corridor penalty weight (0=off)
+    // gatekeeper / anytime: hard compute deadline + deterministic topology seed (mirrors
+    // planner.py). Both default OFF -> behaviour unchanged. plan_minco returns only certified-
+    // feasible trajectories within the budget; an uncertified solve fails the valid gate below
+    // -> keeps the previously committed safe plan (gatekeeper: never commit uncertified).
+    double budget = (par.minco_time_budget_ms > 0.0) ? par.minco_time_budget_ms : -1.0;
+    bool use_topo = par.minco_use_topology;
+    auto _plan_t0 = std::chrono::steady_clock::now();
     std::shared_ptr<MinjerkTraj> mj_ptr;
     PlanInfo info;
     try {
-      DetourConfig dc_off; dc_off.enabled = false;
-      auto pr = plan_minco(astar_path, obstacles, avoid_cfg, opt, dc_off, v0, a0);
+      DetourConfig dc_off; dc_off.enabled = use_topo; dc_off.use_topology = use_topo;
+      auto pr = plan_minco(astar_path, obstacles, avoid_cfg, opt, dc_off, v0, a0, budget);
       mj_ptr = std::make_shared<MinjerkTraj>(pr.first);
       info = pr.second;
       if (!info.trajectory_valid) {
-        DetourConfig dc_on; dc_on.enabled = true;
-        auto pr2 = plan_minco(astar_path, obstacles, avoid_cfg, opt, dc_on, v0, a0);
+        // share the budget: the fallback gets the REMAINING budget so the TWO calls together
+        // stay bounded by one budget (else detour-off + detour-on = 2x budget -> p99 doubles).
+        double rem = budget;
+        if (budget > 0.0) {
+          double el = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - _plan_t0).count();
+          rem = std::max(1.0, budget - el);
+        }
+        DetourConfig dc_on; dc_on.enabled = true; dc_on.use_topology = use_topo;
+        auto pr2 = plan_minco(astar_path, obstacles, avoid_cfg, opt, dc_on, v0, a0, rem);
         mj_ptr = std::make_shared<MinjerkTraj>(pr2.first);
         info = pr2.second;
       }

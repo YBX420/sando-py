@@ -601,6 +601,22 @@ struct Parameters {
   double jerk_smooth_weight = 10.0;
   bool using_variable_elimination = true;
 
+  // Anytime-feasible / gatekeeper (computation-invariant safety). Default OFF -> baseline +
+  // every golden byte-identical; the deterministic certificate-first stack activates only when set.
+  double minco_time_budget_ms = 0.0;   // >0 -> hard per-replan compute deadline for plan_minco
+  bool minco_use_topology = false;     // True -> deterministic H-signature passing-side seed
+  double minco_w_time = 10.0;          // MINCO time-anchor weight: higher -> faster, lower -> smoother
+  // speed-aware per-class avoidance: ramp v_max down near a human so the planner swerves instead
+  // of braking; full speed when clear. Off when slow_vmax<=0.
+  double minco_human_slow_vmax = 0.0;  // routing-feasible v_max next to a human (0=off)
+  double minco_human_slow_near = 3.0;  // m: at/below -> slow_vmax
+  double minco_human_slow_far = 9.0;   // m: at/above -> full v_max
+  // Safe Flight Corridor (SFC): tube of radius minco_sfc_radius around the global-guide seed
+  // waypoints; minco_w_corridor penalises leaving it. Stops the soft local optimiser drifting
+  // off the guide into a clutter pocket. Both 0 => OFF (golden byte-identical).
+  double minco_sfc_radius = 0.0;       // m: tube radius (0=off)
+  double minco_w_corridor = 0.0;       // corridor penalty weight (0=off)
+
   // Dynamic obstacles
   double traj_lifetime = 7.0;
 

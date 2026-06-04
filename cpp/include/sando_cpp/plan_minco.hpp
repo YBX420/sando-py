@@ -47,6 +47,7 @@
 #include <vector>
 #include <map>
 #include <string>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <algorithm>
@@ -99,6 +100,10 @@ struct PlanOptParams {
   double v_max_human = 0.0;
   double est_pos_err = 0.0;
   double est_vel_err = 0.0;
+  // Soft flight-corridor (SFC): tube radius + weight. 0 => OFF (golden-safe). The tube CENTRES
+  // (seed/guide waypoints) are wired in alm_solve where q0 is known.
+  double sfc_radius  = 0.0;
+  double w_corridor  = 0.0;
 
   // Project to the CostGradOptParams the inner objective reads.
   CostGradOptParams cost_grad() const {
@@ -111,6 +116,7 @@ struct PlanOptParams {
     o.reach_model = reach_model; o.a_max_human = a_max_human;
     o.v_max_human = v_max_human; o.est_pos_err = est_pos_err;
     o.est_vel_err = est_vel_err;
+    o.corridor_radius = sfc_radius; o.w_corridor = w_corridor;  // centres set by caller (alm_solve)
     return o;
   }
   // Project to the HardAlmOptParams the ALM constraint helpers read.
@@ -136,7 +142,23 @@ struct DetourConfig {
   int    max_seeds = 5;
   int    K_eval = 100;
   int    perturb_window = 3;
+  bool   use_topology = false;      // deterministic H-signature passing-side single seed
+  int    topology_max_obstacles = 6;
 };
+
+// _passing_side: deterministic side to pass an obstacle (mirrors local_opt.py:_passing_side).
+// Horizontal perpendicular u to axis; pass BEHIND a crossing obstacle (side it is leaving).
+inline Eigen::Vector3d passing_side(const Eigen::Vector3d& axis, const Obstacle* obs) {
+  Eigen::Vector3d z(0.0, 0.0, 1.0);
+  Eigen::Vector3d u = axis.cross(z);
+  double n = u.norm();
+  u = (n > 1e-6) ? (u / n) : Eigen::Vector3d(0.0, 1.0, 0.0);
+  Eigen::Vector3d vel = Eigen::Vector3d::Zero();   // walls (AABB) are static -> zero (mirrors getattr default)
+  if (auto* sph = dynamic_cast<const SphereObstacle*>(obs)) vel = sph->velocity_at(0.0);
+  double vu = vel.dot(u);
+  if (std::abs(vu) > 1e-3) return -((vu > 0) ? 1.0 : -1.0) * u;
+  return u;
+}
 
 // ---------------------------------------------------------------------------
 // _orthonormal_pair(axis): two unit vectors orthogonal to `axis` and each other.
@@ -280,6 +302,25 @@ inline std::vector<std::pair<std::string, Eigen::MatrixXd>> generate_detour_seed
   // sort by -violation (most-violated first); stable to mirror Python's list.sort key
   std::stable_sort(violators.begin(), violators.end(),
                    [](const Viol& a, const Viol& b) { return a.violation > b.violation; });
+  if (dc.use_topology) {
+    // deterministic single seed: bulge the path on the correct passing side of EACH violator
+    // (homotopy class chosen geometrically, no ±u/±v brute force). [original, topology].
+    Eigen::MatrixXd new_path = astar_path;
+    int cap = std::min((int)violators.size(), dc.topology_max_obstacles);
+    for (int vi = 0; vi < cap; ++vi) {
+      const Viol& V = violators[vi];
+      Eigen::Vector3d centre = obstacle_geom(V.obs).first;
+      int pidx = std::min(V.i_path, (int)new_path.rows() - 1);
+      Eigen::Vector3d path_pt = new_path.row(pidx).transpose();
+      Eigen::Vector3d axis = centre - path_pt;
+      if (axis.norm() < 1e-6)
+        axis = astar_path.row(astar_path.rows() - 1).transpose() - astar_path.row(0).transpose();
+      Eigen::Vector3d d = passing_side(axis, V.obs);
+      new_path = make_detour_path(new_path, V.obs, d, V.d_safe, dc);
+    }
+    seeds.push_back({"topology", new_path});
+    return seeds;
+  }
   int top_k = std::min((int)violators.size(), dc.top_k_obstacles);
   for (int vi = 0; vi < top_k; ++vi) {
     const Viol& V = violators[vi];
@@ -484,6 +525,8 @@ struct AlmSolveResult {
   double result_fun = 0.0;        // L-BFGS-B final objective (== last inner fx)
   bool   result_success = true;   // converged within maxiter (gradient/objective test)
   bool   has_result = false;
+  bool   anytime_feasible = true; // a certified-feasible iterate was found within the deadline
+  bool   truncated = false;       // the outer loop stopped on the wall-clock deadline
 };
 
 // The inner-objective functor for LBFGSpp: f(x, grad) = minco_cost_grad(...).
@@ -495,8 +538,15 @@ struct MincoObjective {
   const Eigen::Vector3d* v0; const Eigen::Vector3d* a0;
   const Eigen::Vector3d* vf; const Eigen::Vector3d* af;
   const AlmState* alm;
+  // hard anytime deadline: checked on EVERY cost-grad eval (every inner iter + line-search step)
+  // so the inner L-BFGS-B is interrupted mid-solve; alm_solve catches and keeps the best feasible.
+  const std::chrono::steady_clock::time_point* t0 = nullptr;
+  double deadline_s = -1.0;
 
   double operator()(const Eigen::VectorXd& x, Eigen::VectorXd& grad) {
+    if (deadline_s >= 0.0 && t0 &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - *t0).count() >= deadline_s)
+      throw std::runtime_error("anytime deadline");
     CostGradResult r = minco_cost_grad(x, *start, *goal, M, *soft_obs, *avoid_cfg,
                                        *opt, T_target, *v0, *a0, *vf, *af, *alm);
     grad = r.grad;
@@ -525,7 +575,7 @@ inline AlmSolveResult alm_solve(
     const std::vector<const Obstacle*>& soft_obs,
     const std::vector<const Obstacle*>& hard_obs,
     const std::map<std::string, AvoidParams>& avoid_cfg, const PlanOptParams& opt,
-    const Eigen::Vector3d& v0, const Eigen::Vector3d& a0) {
+    const Eigen::Vector3d& v0, const Eigen::Vector3d& a0, double deadline_s = -1.0) {
   const int M = (int)T0.size();
   const int nq = 3 * (M - 1);
   const Eigen::Vector3d zero3 = Eigen::Vector3d::Zero();
@@ -543,7 +593,7 @@ inline AlmSolveResult alm_solve(
   for (int i = 0; i < nq; ++i) { lb(i) = -inf; ub(i) = inf; }
   for (int i = 0; i < M; ++i) { lb(nq + i) = opt.dt_min; ub(nq + i) = inf; }
 
-  const CostGradOptParams cgopt = opt.cost_grad();
+  CostGradOptParams cgopt = opt.cost_grad();
   const HardAlmOptParams halmopt = opt.hard_alm();
 
   // Count Nc and init lam=0, rho=rho0.
@@ -569,10 +619,18 @@ inline AlmSolveResult alm_solve(
                                         T_target, v0, a0, zero3, zero3, empty);
     R.f0 = r0.f;
   }
+  // SFC tube centres = the SEED interior waypoints q0 (derived from the collision-free global
+  // guide). Fixed for the whole solve so the optimiser cannot drift off-guide into a pocket.
+  // Set AFTER f0 so f0 stays the pure soft-only cost. No-op unless w_corridor>0 && radius>0.
+  cgopt.corridor_centers = &q0;
 
   double prev_viol = inf;
   int outer_iters = 0, total_inner = 0;
   bool has_result = false; double result_fun = 0.0; bool result_success = true;
+  // anytime-feasible: remember the latest CERTIFIED-FEASIBLE iterate so a deadline truncation
+  // returns a SAFE trajectory (margin owned by the hard-ALM certificate, not solver convergence).
+  auto _t_start = std::chrono::steady_clock::now();
+  Eigen::VectorXd best_feasible_x; bool has_best = false; bool _truncated = false;
 
   auto rebuild = [&](const Eigen::VectorXd& xv) {
     Eigen::MatrixXd wp(M + 1, 3); wp.row(0) = start.transpose();
@@ -588,6 +646,7 @@ inline AlmSolveResult alm_solve(
     AlmState empty; empty.rho = 0.0;
     MincoObjective obj{&start, &goal, M, &soft_obs, &avoid_cfg, &cgopt, T_target,
                        &v0, &a0, &zero3, &zero3, &empty};
+    obj.t0 = &_t_start; obj.deadline_s = deadline_s;
     LBFGSpp::LBFGSBParam<double> p = make_lbfgsb_param(opt.maxiter, 1e-6);
     LBFGSpp::LBFGSBSolver<double> solver(p);
     double fx = 0.0; int nit = 0;
@@ -607,6 +666,12 @@ inline AlmSolveResult alm_solve(
     std::vector<double> normals;
     for (int outer = 0; outer < opt.alm_outer_iters; ++outer) {
       outer_iters = outer + 1;
+      // anytime deadline: stop before a new (costly) outer iteration once the wall-clock
+      // budget is spent; we then return best_feasible_x (or signal infeasible).
+      if (deadline_s >= 0.0 &&
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - _t_start).count() >= deadline_s) {
+        _truncated = true; break;
+      }
       // FREEZE normals + trust mask from the current iterate.
       MinjerkTraj tr = rebuild(x);
       normals = seg_normals(tr, hard_obs, halmopt);
@@ -618,6 +683,7 @@ inline AlmSolveResult alm_solve(
       alm.normals = normals; alm.trust_mask = tmask;
       MincoObjective obj{&start, &goal, M, &soft_obs, &avoid_cfg, &cgopt, T_target,
                          &v0, &a0, &zero3, &zero3, &alm};
+      obj.t0 = &_t_start; obj.deadline_s = deadline_s;
       LBFGSpp::LBFGSBParam<double> p = make_lbfgsb_param(opt.alm_inner_maxiter, 1e-7);
       LBFGSpp::LBFGSBSolver<double> solver(p);
       double fx = 0.0; int nit = 0;
@@ -641,7 +707,7 @@ inline AlmSolveResult alm_solve(
       for (int m = 0; m < Nc; ++m) lam(m) = std::max(0.0, lam(m) + rho * g(m));
       double max_viol = 0.0;
       for (int m = 0; m < Nc; ++m) max_viol = std::max(max_viol, std::max(g(m), 0.0));
-      if (max_viol < opt.alm_viol_tol) break;
+      if (max_viol < opt.alm_viol_tol) { best_feasible_x = x; has_best = true; break; }
       if (rho >= opt.alm_rho_max && max_viol > 0.98 * prev_viol) break;
       if (max_viol > 0.5 * prev_viol)
         rho = std::min(rho * opt.alm_rho_grow, opt.alm_rho_max);
@@ -649,12 +715,15 @@ inline AlmSolveResult alm_solve(
     }
   }
 
-  // final trajectory
+  // final trajectory — anytime: prefer the latest CERTIFIED-FEASIBLE iterate (a truncated
+  // final inner solve may be infeasible; the best feasible iterate is safe to commit).
+  if (has_best) x = best_feasible_x;
   MinjerkTraj trf = rebuild(x);
   R.tr = trf;
   R.x = x; R.lam = lam; R.rho = rho;
   R.outer_iters = outer_iters; R.total_inner_iters = total_inner;
   R.result_fun = result_fun; R.result_success = result_success; R.has_result = has_result;
+  R.anytime_feasible = has_best || hard_obs.empty(); R.truncated = _truncated;
 
   if (!hard_obs.empty()) {
     std::vector<double> fn = seg_normals(trf, hard_obs, halmopt);
@@ -690,6 +759,8 @@ struct MincoCandidate {
   double alm_lambda_max = 0.0;
   double continuous_min_clearance = 0.0;
   double certificate_margin = 0.0;
+  bool anytime_feasible = true;
+  bool truncated = false;
   std::string seed_name;
 };
 
@@ -697,7 +768,8 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
                                          const std::vector<const Obstacle*>& obstacles,
                                          const std::map<std::string, AvoidParams>& avoid_cfg,
                                          const PlanOptParams& opt,
-                                         const Eigen::Vector3d& v0, const Eigen::Vector3d& a0) {
+                                         const Eigen::Vector3d& v0, const Eigen::Vector3d& a0,
+                                         double deadline_s = -1.0) {
   MincoSeed S = minco_seed(seed_path, opt);
   const int M = (int)S.T0.size();
   const int nq = 3 * (M - 1);
@@ -710,7 +782,7 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
   partition_obstacles(obs_eff, avoid_cfg, opt.avoid_override, soft_obs, hard_obs);
 
   AlmSolveResult sol = alm_solve(S.start, S.goal, S.q0, S.T0, soft_obs, hard_obs,
-                                 avoid_cfg, opt, v0, a0);
+                                 avoid_cfg, opt, v0, a0, deadline_s);
   const MinjerkTraj& tr = sol.tr;
   Eigen::VectorXd Tf(M); for (int i = 0; i < M; ++i) Tf(i) = sol.x(nq + i);
 
@@ -768,6 +840,8 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
   } else {
     C.certificate_margin = std::numeric_limits<double>::infinity();
   }
+  C.anytime_feasible = sol.anytime_feasible;
+  C.truncated = sol.truncated;
   return C;
 }
 
@@ -825,6 +899,8 @@ struct PlanInfo {
   double alm_lambda_max = 0.0;
   double continuous_min_clearance = 0.0;
   double certificate_margin = 0.0;
+  bool anytime_feasible = true;
+  bool truncated = false;
 };
 
 inline std::pair<MinjerkTraj, PlanInfo> plan_minco(
@@ -832,7 +908,8 @@ inline std::pair<MinjerkTraj, PlanInfo> plan_minco(
     const std::map<std::string, AvoidParams>& avoid_cfg,
     const PlanOptParams& opt = PlanOptParams(), const DetourConfig& detour_cfg = DetourConfig(),
     const Eigen::Vector3d& v0 = Eigen::Vector3d::Zero(),
-    const Eigen::Vector3d& a0 = Eigen::Vector3d::Zero()) {
+    const Eigen::Vector3d& a0 = Eigen::Vector3d::Zero(),
+    double time_budget_ms = -1.0) {
   if (astar_path.rows() < 2 || astar_path.cols() != 3)
     throw std::invalid_argument("astar_path must be (M>=2, 3)");
 
@@ -840,11 +917,22 @@ inline std::pair<MinjerkTraj, PlanInfo> plan_minco(
 
   std::vector<MincoCandidate> candidates;
   std::vector<std::string> names;
+  auto _t0 = std::chrono::steady_clock::now();
+  double _budget = (time_budget_ms > 0.0) ? (time_budget_ms / 1000.0) : -1.0;
   for (auto& sd : seeds) {
+    // anytime: stop spawning solves once the wall-clock budget is spent; each solve gets the
+    // REMAINING budget as its own deadline so the TOTAL stays bounded.
+    double _elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - _t0).count();
+    if (_budget > 0.0 && _elapsed >= _budget) break;
+    double _dl = (_budget > 0.0) ? (_budget - _elapsed) : -1.0;
     try {
-      MincoCandidate rec = optimise_one_minco(sd.second, obstacles, avoid_cfg, opt, v0, a0);
+      MincoCandidate rec = optimise_one_minco(sd.second, obstacles, avoid_cfg, opt, v0, a0, _dl);
+      bool _valid = rec.feasibility.trajectory_valid, _af = rec.anytime_feasible;
       rec.seed_name = sd.first;
       candidates.push_back(std::move(rec));
+      // in deadline mode the gatekeeper only needs ONE certified-feasible trajectory: early-exit
+      // on the first valid + anytime-feasible candidate (deterministic; collapses the multi-start).
+      if (_budget > 0.0 && _valid && _af) break;
     } catch (const std::exception&) {
       continue;  // one seed failed numerically -> skip
     }
@@ -877,6 +965,8 @@ inline std::pair<MinjerkTraj, PlanInfo> plan_minco(
   info.alm_lambda_max = best.alm_lambda_max;
   info.continuous_min_clearance = best.continuous_min_clearance;
   info.certificate_margin = best.certificate_margin;
+  info.anytime_feasible = best.anytime_feasible;
+  info.truncated = best.truncated;
   return {best.spline, info};
 }
 
