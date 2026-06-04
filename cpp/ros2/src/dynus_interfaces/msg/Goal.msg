@@ -1,0 +1,10 @@
+std_msgs/Header header
+geometry_msgs/Vector3 p
+geometry_msgs/Vector3 v
+geometry_msgs/Vector3 a
+geometry_msgs/Vector3 j
+float64 yaw
+float64 dyaw
+bool power
+int32 mode_xy
+int32 mode_z

@@ -244,6 +244,19 @@ class Parameters:
     jerk_smooth_weight: float = 10.0
     using_variable_elimination: bool = True
 
+    # Anytime-feasible / gatekeeper (computation-invariant safety). Defaults OFF so the
+    # baseline (and every golden) is byte-identical; the deterministic certificate-first
+    # stack activates only when these are set.
+    minco_time_budget_ms: float = 0.0   # >0 -> hard per-replan compute deadline for plan_minco
+    minco_use_topology: bool = False    # True -> deterministic H-signature passing-side seed
+    minco_w_time: float = 10.0          # MINCO time-anchor weight: HIGHER -> faster (pushes time
+                                        #   allocation toward v_max/a_max), lower -> smoother/slower
+    # speed-aware per-class avoidance: ramp v_max DOWN as a human gets close so the planner can
+    # SWERVE AROUND instead of braking to a stop; full speed when clear. Off when slow_vmax<=0.
+    minco_human_slow_vmax: float = 0.0  # routing-feasible v_max used right next to a human (0=off)
+    minco_human_slow_near: float = 3.0  # m: at/below this human distance -> slow_vmax
+    minco_human_slow_far: float = 9.0   # m: at/above this human distance -> full v_max
+
     # Dynamic obstacles
     traj_lifetime: float = 7.0
 

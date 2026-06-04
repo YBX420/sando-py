@@ -58,6 +58,7 @@ Cost (per seed):
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Tuple
 
@@ -230,6 +231,8 @@ class DetourConfig:
     max_seeds: int = 5                # 候选种子总数硬上限
     K_eval: int = 100                 # 沿折线采样多少点来查间隙/判断是否触发
     perturb_window: int = 3           # 鼓包时影响的路点半窗宽（前后各几个点跟着挪）
+    use_topology: bool = False        # True -> 确定性 H-signature passing-side 单种子(替 ±u/±v 盲搜)
+    topology_max_obstacles: int = 6   # 拓扑种子最多绕开几个违反者(按严重度排序取前几)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +334,22 @@ def _make_detour_path(path: np.ndarray, obstacle, direction: np.ndarray,
     return new_path
 
 
+def _passing_side(axis: np.ndarray, obs) -> np.ndarray:
+    """确定性选「绕哪边过」:取垂直于 axis 的水平方向 u;若障碍在横穿(速度有 u 分量),
+    选从它**背后**过的那侧(-sign(v·u)·u);静止则默认 +u。替代 ±u/±v 盲搜的单侧确定性选择。
+    Deterministic passing-side: horizontal perpendicular u to axis; pass BEHIND a crossing
+    obstacle (the side it is leaving), else default side. Replaces the ±u/±v multi-start guess."""
+    z = np.array([0.0, 0.0, 1.0])
+    u = np.cross(axis, z)                         # axis ⟂ 的水平方向
+    n = float(np.linalg.norm(u))
+    u = (u / n) if n > 1e-6 else np.array([0.0, 1.0, 0.0])
+    vel = np.asarray(getattr(obs, "vel", np.zeros(3)), dtype=float)
+    vu = float(np.dot(vel, u))
+    if abs(vu) > 1e-3:
+        return -np.sign(vu) * u                   # 从横穿者背后过
+    return u
+
+
 def _generate_detour_seeds(astar_path: np.ndarray, obstacles, avoid_cfg, opt: OptParams,
                            detour_cfg: DetourConfig) -> List[Tuple[str, np.ndarray]]:
     """生成候选种子路径列表，第一个永远是原始 A* 折线 'original'。
@@ -352,6 +371,20 @@ def _generate_detour_seeds(astar_path: np.ndarray, obstacles, avoid_cfg, opt: Op
     if not violators:
         return seeds
     violators.sort(key=lambda v: -v[0])  # 违反最严重的排前面 / most-violated first
+    if detour_cfg.use_topology:
+        # 确定性单种子:对每个违反者按 passing-side 把折线鼓到正确一侧(homotopy 类几何选定,
+        # 不跑 ±u/±v 盲搜)。返回 [original, topology] 两个种子,early-exit 会先试 topology。
+        new_path = astar_path
+        for violation, i, obs, d_safe, i_path in violators[: detour_cfg.topology_max_obstacles]:
+            centre, _r = _obstacle_geom(obs)
+            path_pt = new_path[min(i_path, len(new_path) - 1)]
+            axis = centre - path_pt
+            if float(np.linalg.norm(axis)) < 1e-6:
+                axis = astar_path[-1] - astar_path[0]
+            d = _passing_side(axis, obs)
+            new_path = _make_detour_path(new_path, obs, d, d_safe, detour_cfg)
+        seeds.append(("topology", new_path))
+        return seeds
     # 只给前 top_k 个最严重的障碍生成绕行
     for violation, i, obs, d_safe, i_path in violators[: detour_cfg.top_k_obstacles]:
         centre, _r = _obstacle_geom(obs)
@@ -1571,7 +1604,7 @@ def _build_certificates(tr: MinjerkTraj, hard_obs, avoid_cfg,
 
 
 def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParams,
-               v0=None, a0=None):
+               v0=None, a0=None, deadline_s=None):
     """增广拉格朗日的「外层循环」，里面套着 L-BFGS-B 的「内层无约束求解」。
     这是 MINCO 硬约束求解的总调度。每轮外层：
       1) 冻结当前迭代的支撑半空间法向 + 信任窗口掩码（这样内层里 g 对 P 线性、代价光滑）；
@@ -1611,6 +1644,13 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
     outer_iters = 0
     total_inner_iters = 0
     result = None
+    # anytime-feasible bookkeeping: remember the latest CERTIFIED-FEASIBLE iterate so a
+    # deadline truncation returns a SAFE trajectory (the margin is owned by the hard-ALM
+    # certificate, NOT by solver convergence). Stays None if no feasible iterate is found
+    # within the budget -> the planner's gatekeeper then commits the braking backup.
+    t_start = time.perf_counter()
+    best_feasible_x = None
+    truncated = False
     if not hard_obs:
         # 没有硬约束（纯软/纯平滑）-> 直接一次无约束求解搞定，不用外层
         # no hard constraints -> a single unconstrained solve (pure soft / smooth)
@@ -1623,6 +1663,12 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
         normals = None
         for outer in range(opt.alm_outer_iters):    # ALM 外层循环
             outer_iters = outer + 1
+            # anytime deadline: stop before starting a new (costly) outer iteration once
+            # the wall-clock budget is spent; we then return best_feasible_x (or signal
+            # infeasible). Checked per-outer so total time <= deadline + one inner solve.
+            if deadline_s is not None and (time.perf_counter() - t_start) >= deadline_s:
+                truncated = True
+                break
             # FREEZE the supporting-halfspace normals from the current iterate
             # (GCOPTER SFC discipline) so g is linear in P during the inner solve
             qf = x[:nq].reshape(M - 1, 3) if M > 1 else np.zeros((0, 3))
@@ -1653,6 +1699,8 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
             # 乘子更新 (PHR)：lambda <- max(0, lambda + rho·g)
             lam = np.maximum(0.0, lam + rho * g)
             max_viol = float(np.max(np.maximum(g, 0.0)))   # 当前最大违反量
+            if max_viol < opt.alm_viol_tol:
+                best_feasible_x = x.copy()   # latest certified-feasible iterate (safe to commit)
             lambda_hist.append(float(np.max(lam)) if lam.size else 0.0)
             rho_hist.append(float(rho))
             if max_viol < opt.alm_viol_tol:   # 约束都满足了 -> 收敛
@@ -1665,6 +1713,10 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
                 rho = min(rho * opt.alm_rho_grow, opt.alm_rho_max)
             prev_viol = max_viol
 
+    # anytime: hand back the latest CERTIFIED-FEASIBLE iterate. A truncated final inner
+    # solve may be infeasible; the best feasible iterate is the safe thing to commit.
+    if best_feasible_x is not None:
+        x = best_feasible_x
     qf = x[:nq].reshape(M - 1, 3) if M > 1 else np.zeros((0, 3))
     Tf = x[nq:]
     tr = MinjerkTraj.from_endpoints(start, goal, qf, Tf, v0=v0, a0=a0)
@@ -1691,6 +1743,8 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
 
     return {
         "tr": tr, "x": x, "lam": lam, "rho": rho,
+        "anytime_feasible": best_feasible_x is not None,
+        "truncated": truncated,
         "outer_iters": outer_iters,
         "total_inner_iters": total_inner_iters,
         "max_violation": max_viol_final,
@@ -1704,7 +1758,7 @@ def _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt: OptParam
 
 
 def _optimise_one_minco(seed_path: np.ndarray, obstacles, avoid_cfg,
-                        opt: OptParams, v0=None, a0=None) -> dict:
+                        opt: OptParams, v0=None, a0=None, deadline_s=None) -> dict:
     """从一条种子折线出发，跑一次「硬约束 ALM + 软场」的 MINCO 求解，返回这个候选的记录字典。
     按类别分派：障碍用 resolve_mode 分成软（EGO 场）和硬（ALM 凸包约束）两堆。
     One ALM(hard) + soft-field solve from a seed polyline. Candidate dict.
@@ -1720,7 +1774,7 @@ def _optimise_one_minco(seed_path: np.ndarray, obstacles, avoid_cfg,
     soft_obs, hard_obs = _partition_obstacles(obstacles, avoid_cfg, opt.avoid_override)
 
     sol = _alm_solve(start, goal, q0, T0, soft_obs, hard_obs, avoid_cfg, opt,
-                     v0=v0, a0=a0)
+                     v0=v0, a0=a0, deadline_s=deadline_s)
     tr = sol["tr"]
     result = sol["result"]
     Tf = sol["x"][nq:]
@@ -1795,6 +1849,8 @@ def _optimise_one_minco(seed_path: np.ndarray, obstacles, avoid_cfg,
         "hard_certificates": certs,
         "continuous_min_clearance": float(min_clr),
         "certificate_margin": float(sol["certificate_margin"]),
+        "anytime_feasible": bool(sol.get("anytime_feasible", True)),
+        "truncated": bool(sol.get("truncated", False)),
         "avoid_modes": avoid_modes,
     }
 
@@ -1805,6 +1861,7 @@ def plan_minco(astar_path: np.ndarray,
                *,
                opt_params: OptParams = None,
                detour_cfg: DetourConfig = None,
+               time_budget_ms: float = None,
                v0=None, a0=None) -> Tuple[MinjerkTraj, dict]:
     """【新版主线对外接口】MINCO 解析梯度求解。签名和返回的 info 键尽量和旧版 plan() 对齐。
     优化变量 = (内部路点 q, 各段时间 T)；起终点是「结构性钉死」的（不是用罚函数压的）。
@@ -1823,14 +1880,29 @@ def plan_minco(astar_path: np.ndarray,
     seeds = _generate_detour_seeds(astar_path, obstacles_list, avoid_cfg, opt, detour_cfg)
 
     candidates: List[dict] = []
+    _t0 = time.perf_counter()
+    _budget = (time_budget_ms / 1000.0) if time_budget_ms else None
     for name, seed_path in seeds:
+        # anytime: stop spawning new solves once the wall-clock budget is spent; each solve
+        # gets the REMAINING budget as its own deadline so the TOTAL stays bounded.
+        _elapsed = time.perf_counter() - _t0
+        if _budget is not None and _elapsed >= _budget:
+            break
+        _dl = (_budget - _elapsed) if _budget is not None else None
         try:
             rec = _optimise_one_minco(seed_path, obstacles_list, avoid_cfg, opt,
-                                      v0=v0, a0=a0)
+                                      v0=v0, a0=a0, deadline_s=_dl)
         except Exception:
             continue
         rec["seed_name"] = name
         candidates.append(rec)
+        # in deadline mode the gatekeeper only needs ONE certified-feasible trajectory:
+        # early-exit on the first valid + anytime-feasible candidate (deterministic speedup;
+        # collapses the multi-start). Default (no budget) keeps trying ALL seeds -> golden
+        # behaviour is byte-identical.
+        if (_budget is not None and rec["feasibility"]["trajectory_valid"]
+                and rec.get("anytime_feasible", True)):
+            break
     if not candidates:
         raise RuntimeError("all seeds failed to optimise")
 
@@ -1863,5 +1935,7 @@ def plan_minco(astar_path: np.ndarray,
         "continuous_min_clearance": best["continuous_min_clearance"],
         "certificate_margin": best["certificate_margin"],
         "avoid_modes": best["avoid_modes"],
+        "anytime_feasible": best.get("anytime_feasible", True),
+        "truncated": best.get("truncated", False),
     }
     return best["spline"], info
