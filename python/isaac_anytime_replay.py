@@ -1,21 +1,24 @@
-r"""在 Isaac Sim 里【回放】A+B 在 tunnel 内穿密集动态硬人群的运行(3D 渲染)。
-读 media/_gif_path.csv / _gif_hum.csv / _gif_meta.csv(由 cpp/test/viz_tunnel_gif 生成),
-spawn 无人机 + 16 行人 + tunnel 两道墙 + 目标,逐帧把它们摆到录制位置并 render。
+r"""在 Isaac Sim 里【回放】A+B 在 tunnel 内穿密集动态硬人群的运行(真实 3D)。
+读 media/_gif_path.csv (t,x,y,z,clr,ms) / _gif_hum.csv / _gif_meta.csv(由 cpp/test/viz_tunnel_gif 生成)。
 
-⚠️ 这是【回放】录制好的 A+B 结果(轨迹/安全/<50ms 已在 C++ 验过),不是 Isaac 里现场跑求解器
-   —— 现场 A+B 需把 C++ 求解器接进 C-ABI DLL(生产集成,待办)。回放给你看 3D 画面。
+关键:这是【真 3D】避障 —— tunnel 只约束 y(|y|≤W),z 自由,所以在 y-lane 挤不过去的最密处,
+无人机会【抬高 z 飞过】最近的人(z 最高到 ~3.2,人在 z=2.0),全程 3D 净空 0.927≥d_safe,真实无碰撞。
+之前「回放撞了」是因为旧回放把 z 拍平到同一平面、丢了高度差;这版按真实 z 渲染,会看到它真的飞高越过人群。
+
+⚠️ 这是【回放】录制好的 A+B 结果(轨迹/3D 安全/<50ms 已在 C++ 验过),不是 Isaac 里现场跑求解器
+   —— 现场 A+B 需把 C++ 求解器接进 C-ABI DLL(生产集成,待办)。
 
 跑(你本机,需 Isaac Sim):
    E:\isssacsim\python.bat D:\Projects\sando_py\sando-py\python\isaac_anytime_replay.py
-数据若缺:先在 cpp/ 下编译跑 viz_tunnel_gif 生成 media/_gif_*.csv。
+数据若缺:在 cpp/ 下 `c++ -O2 -std=c++17 -I include -I third_party -I third_party/eigen test/viz_tunnel_gif.cpp -o build/viz_tunnel_gif.exe` 再从 cpp/ 跑 build/viz_tunnel_gif.exe。
 """
 import os, sys, csv, time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, ROOT)
 MED = os.path.join(ROOT, "media")
+HUMAN_Z = 2.0   # 规划里行人(障碍球)所在平面;无人机巡航也在 ~2.0,挤时抬到 ~3.2 飞过
 
-# ---- load recorded run ----
 def _csv(fn):
     return list(csv.DictReader(open(os.path.join(MED, fn))))
 
@@ -24,12 +27,10 @@ W = float(meta["W"]); D_SAFE = float(meta["d_safe"]); GOALX = float(meta["goalx"
 path = _csv("_gif_path.csv")
 hum_by_t = {}
 for r in _csv("_gif_hum.csv"):
-    hum_by_t.setdefault(round(float(r["t"]), 3), []).append((float(r["x"]), float(r["y"]), float(r["r"])))
-NH = max(len(v) for v in hum_by_t.values())
-DRONE_Z = 1.5   # 规划是 2D 单一高度 -> 无人机与障碍【同一平面】,避免「身高立柱」错觉
-# 每个行人的真实半径(障碍尺寸)+ d_safe 安全半径(画成淡环,看清无人机始终在安全区外)
-t0 = round(float(path[0]["t"]), 3)
+    hum_by_t.setdefault(r["t"], []).append((float(r["x"]), float(r["y"]), float(r["r"])))
+t0 = path[0]["t"]
 R_HUM = [h[2] for h in hum_by_t[t0]]
+NH = len(R_HUM)
 
 # ---- Isaac (SimulationApp 必须最先) ----
 from isaacsim import SimulationApp
@@ -51,57 +52,49 @@ _st = omni.usd.get_context().get_stage()
 UsdLux.DomeLight.Define(_st, Sdf.Path("/World/Dome")).CreateIntensityAttr(1000.0)
 UsdLux.DistantLight.Define(_st, Sdf.Path("/World/Sun")).CreateIntensityAttr(3000.0)
 
-# tunnel 两道墙(y = ±W),长在 x、薄在 y、立在 z
+# tunnel 两道墙(y = ±W),长在 x、薄在 y、高在 z(只约束 y,所以无人机能从顶上 z 飞越)
 for s, yy in [("hi", W), ("lo", -W)]:
     world.scene.add(VisualCuboid(prim_path=f"/World/tunnel_{s}", name=f"tunnel_{s}",
-        position=np.array([GOALX / 2, yy, 1.25]), scale=np.array([GOALX + 2, 0.05, 2.5]),
+        position=np.array([GOALX / 2, yy, HUMAN_Z]), scale=np.array([GOALX + 2, 0.05, 3.0]),
         color=np.array([0.2, 0.45, 0.9])))
 
-# 无人机
+# 无人机(真实 3D 位置,会看到它在最挤处爬升)
 drone = world.scene.add(VisualCuboid(prim_path="/World/drone", name="drone",
-    position=np.array([0, 0, DRONE_Z]), scale=np.array([0.4, 0.4, 0.4]), color=np.array([1.0, 0.9, 0.1])))
+    position=np.array([0, 0, HUMAN_Z]), scale=np.array([0.4, 0.4, 0.4]), color=np.array([1.0, 0.9, 0.1])))
 # 目标
 world.scene.add(VisualCuboid(prim_path="/World/goal", name="goal",
-    position=np.array([GOALX, 0, DRONE_Z]), scale=np.array([0.3, 0.3, 0.3]), color=np.array([0.1, 0.9, 0.2])))
-# 16 行人:真实障碍尺寸(直径 2r)的小盒,与无人机【同一平面 z=DRONE_Z】(忠实 2D 规划)
+    position=np.array([GOALX, 0, HUMAN_Z]), scale=np.array([0.3, 0.3, 0.3]), color=np.array([0.1, 0.9, 0.2])))
+# 16 行人:真实障碍尺寸(直径 2r)的红盒,在飞行平面 z=2.0(无人机从顶上飞越时高度差看得见)
 humans = [world.scene.add(VisualCuboid(prim_path=f"/World/hum_{i}", name=f"hum_{i}",
-    position=np.array([0, 0, DRONE_Z]),
+    position=np.array([0, 0, HUMAN_Z]),
     scale=np.array([2 * R_HUM[i], 2 * R_HUM[i], 2 * R_HUM[i]]), color=np.array([0.9, 0.2, 0.2])))
     for i in range(NH)]
-# d_safe 安全环:半径 r+d_safe 的淡色盒(无人机始终在它【外面】= 安全可见)
-halos = [world.scene.add(VisualCuboid(prim_path=f"/World/halo_{i}", name=f"halo_{i}",
-    position=np.array([0, 0, DRONE_Z]),
-    scale=np.array([2 * (R_HUM[i] + D_SAFE), 2 * (R_HUM[i] + D_SAFE), 0.02]),
-    color=np.array([1.0, 0.7, 0.7])))
-    for i in range(NH)]
-# 面包屑
+# 面包屑(真实 3D,显示爬升轨迹)
 N_TRAIL = 400
 trail = [world.scene.add(VisualCuboid(prim_path=f"/World/tr_{k}", name=f"tr_{k}",
     position=np.array([0, 0, -5]), scale=np.array([0.09, 0.09, 0.09]), color=np.array([0.1, 1.0, 0.3])))
     for k in range(N_TRAIL)]
 
 world.reset()
-print(f"[replay] {NH} humans, tunnel ±{W}, {len(path)} frames. 回放 A+B 穿密集人群...", flush=True)
+print(f"[replay] {NH} humans, tunnel ±{W}, {len(path)} frames. 真 3D 回放:无人机在最挤处抬高飞越人群...", flush=True)
 
 ti = 0
 while simulation_app.is_running():
     row = path[ti % len(path)]
-    t = round(float(row["t"]), 3)
-    dpos = np.array([float(row["x"]), float(row["y"]), DRONE_Z])
+    t = row["t"]
+    dpos = np.array([float(row["x"]), float(row["y"]), float(row["z"])])  # 真实 z
     drone.set_world_pose(position=dpos)
     hs = hum_by_t.get(t, [])
     for i, h in enumerate(humans):
         if i < len(hs):
             hx, hy, r = hs[i]
-            h.set_world_pose(position=np.array([hx, hy, DRONE_Z]))
-            halos[i].set_world_pose(position=np.array([hx, hy, DRONE_Z - 0.25]))  # 安全环平铺在下方一点
+            h.set_world_pose(position=np.array([hx, hy, HUMAN_Z]))
         else:
             h.set_world_pose(position=np.array([0, 0, -5]))
-            halos[i].set_world_pose(position=np.array([0, 0, -5]))
     trail[ti % N_TRAIL].set_world_pose(position=dpos.copy())
     world.step(render=True)
     ti += 1
-    if ti % len(path) == 0:   # 一轮放完,清面包屑重放
+    if ti % len(path) == 0:
         for tr in trail:
             tr.set_world_pose(position=np.array([0, 0, -5]))
     time.sleep(0.03)
