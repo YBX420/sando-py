@@ -1068,8 +1068,22 @@ class SANDO {
     std::map<std::string, AvoidParams> avoid_cfg;
     obstacles_from_snapshot(opos, obbox, oclass, ovel, oaccel, owned, obstacles, avoid_cfg);
 
-    const double horizon = 0.6, step = 0.6;
+    // MONITOR/gate (the ABS/gatekeeper switch): only YIELD when a HARD HUMAN is actually close
+    // (the committed plan is about to be unsafe). A failed replan alone just means "no new plan
+    // this tick" -> keep flying the committed (still-certified) plan, exactly like before. Without
+    // this gate, recovery over-triggers into a yield-loop that REGRESSES the nominal/escapable case
+    // (verified by _isaac_recovery_test.py: ON 280 fails / did-not-reach vs OFF reached).
+    const double horizon = 0.6, step = 0.6, mon_buffer = 0.5;
+    std::vector<const Obstacle*> humans;
+    for (size_t i = 0; i < obstacles.size(); ++i)
+      if (i >= oclass.size() || oclass[i] != "wall") humans.push_back(obstacles[i]);
+    if (humans.empty()) return false;
+    double d_safe_h = 0.8;
+    { auto it = avoid_cfg.find("human"); if (it != avoid_cfg.end()) d_safe_h = it->second.d_safe; }
+    if (reach_avoid_clearance(local_A.pos, humans, 0.0, horizon) >= d_safe_h + mon_buffer)
+      return false;                                  // no human danger -> hold (do not yield)
     Eigen::Vector3d path_dir = get_G().pos - local_A.pos;
+    // yield vs ALL obstacles (so it does not retreat into a wall), gate on humans only
     Eigen::Vector3d target = yield_target(local_A.pos, path_dir, obstacles, 0.0, horizon, step);
     double dc = par.dc;
     std::vector<RobotState> setpoints;
