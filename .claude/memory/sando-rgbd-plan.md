@@ -316,3 +316,12 @@ mammoth 上有同名计划 [[sando-rgbd-plan-v2]] + 更全的旧背景 memory。
 - 很堵走廊(硬墙车道 |y|<=1.3 + 5/3 个迎面人,plan_minco 真失败→必须等)。**baseline 冻住 → 被走进来撞穿身体 min_human=−0.290(HIT)**;**recovery-v1 主动让位(最大化净空的移动,可退到走廊外开阔区)→ +2.97(5人)/+3.70(3人),≥d_safe 且都到达**。前瞻监视器(余量<d_safe+0.5 早让)在此 = reactive。→ **安全半场机制成立**:不冻住、主动退让保净空、人过了再走 = hold-or-thread 的「安全等」那半。
 - **诚实边界**:kinematic bench + 几何让位(5 候选方向),**还没接进生产 planner**;退得保守(退到开阔区,净空很大)。
 - **下一步(生产化)= audit Q5**:`reach_avoid.hpp`(复用证书 margin `-max(g)` 当 reach-avoid 监视器,plan_minco.hpp:834)+ `recovery.hpp`(yield/brake 注入 deque)+ HOLDING/YIELDING 枚举,接进 `planner.hpp` replan 的失败/breach 处({false,true} 冻住 → 改主动让位)。test_planner golden 大概率不受影响(nominal 不走失败路)。
+
+### ★ 安全半场 生产接线 + 端到端验证 + bug 修复(2026-06-05,commits 42d7a3f / 5933b39)
+- **建好的**:`reach_avoid.hpp`(监视器,复用 Obstacle::signed_dist 当 reach-avoid 余量)+ `recovery.hpp`(`yield_target` 最大化净空的让位)+ `planner.hpp::recovery_yield()` 接进 replan 失败处 + `types.hpp recovery_enabled`(默认 true)+ capi/bridge 加 `recovery_enabled` toggle。走廊默认 50/0.6。ctest 19/19 全程绿。
+- **★ 端到端验证暴露的两件事(`python/_isaac_recovery_test.py`,经生产 DLL A/B)**:
+  1. **真系统里 freeze-gets-hit 罕见**:墙是软的 → 无人机直接**飞出走廊躲硬人**(max|y|=4.12 ≫ lane 1.3)→ 不会冻在走廊被撞。bench 的「冻住被撞」是**硬墙 artifact**。
+  2. **我第一版 recovery 是回归**:挂在「plan 失败」上 = 过度触发(失败≠危险),用让位替掉还安全的前进计划 → 让位死循环。A/B:ON **280 fails / 到不了** vs OFF 到达。
+- **修复(5933b39)**:`recovery_yield` 自带**人体危险门**——只在「硬人 clearance < d_safe+0.5(0.6s horizon)」才让位,否则 return false 照常 hold(像旧行为)。修后 A/B **ON ≡ OFF(都到达、min_human +2.863、4 fails)= 回归消除**。recovery 现在是**有门控的安全网**(有逃生口时 no-op)。
+- **教训**:bench 隔离验证 ≠ 生产验证;端到端一验就抓出过度触发 + 软墙逃生口两个真相。**recovery 触发条件该是监视器(committed 计划余量),不是规划失败**——现用「当前人体 clearance 门」是其简化版,够修回归;完整版 = 每拍监视 committed 计划。
+- **未做**:还没构造「真无逃生口(开阔四面围人)」场景证明 recovery 正向有用(软墙系统里很难造)。SLIM-2(agile 抵达时刻种子+两侧比较移 C++)仍待做。
