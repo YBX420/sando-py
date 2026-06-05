@@ -140,3 +140,12 @@
 - **截断不变性 96%**:每拍解的每个迭代净空 ≥ d_safe(任意 deadline 截断都人体安全)。
 - **结论:四个缺口(① <50ms ② 闭环 ③ 密集端到端 ④ 防御曲线)全部在 C++ 关闭。** computation-invariant 行人安全 + <50ms 硬 deadline + 时空穿密集移动人群,端到端可证明运作。
 - **离全生产还差(诚实,但已非「能不能」)**:Gauss-Seidel 投影是近似 QP(非精确 SS-QCQP 步,但实测够);未接进 receding-horizon 生产 planner 的 commit/golden 路径(bench 是独立可执行);场景是 6 行人合成(非真感知)。这些是工程集成,不是原理风险。
+
+### 11.5 tunnel(lane)约束内穿人群(2026-06-05,`cpp/test/bench_tunnel.cpp`)
+回答「能否在 tunnel 限制内穿梭人群、有无证明」:给 feasible-direction 叠加 tunnel(y-band)约束
+(控制点 |y|<=W,凸包→曲线在 lane 内,spatial sound),扫宽度:
+- **安全(可证):** 每迭代同时保持人体 g<=0 + tunnel |y|<=W -> 任意截断,提交轨迹都人体安全且在 lane 内。
+  实测所有宽度均 in-lane/safe(连窄 tunnel 也不撞、不出 lane;无缝时 gatekeeper 刹停held)。
+- **到达(场景相关):** W=1.6 够宽 -> 在 lane 内穿过整个移动人群到达(THREADED,min_clr 0.831, max|y| 0.874, <50ms);
+  W<=1.2 太窄 -> lane 内无时机缝 -> 正确刹停held(仍安全),而非冲出/撞。
+- 结论:**「tunnel 内安全」是构造性证明 + 已验;「tunnel 内能穿到」当且仅当 lane 容得下时机缝(W=1.6 已证可)。**
