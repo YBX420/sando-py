@@ -37,7 +37,7 @@ int main() {
   HardAlmOptParams hopt; hopt.spacetime_hard = true; hopt.tau_trust = 100;
   const double RD = 0.2, T_MAX = 22.0, GOAL_R = 0.7, BUDGET = 50.0, vmax = 4.0, d_plan = d_safe + 0.12, W = 2.2;
 
-  FILE* fp = std::fopen("../python/media/_gif_path.csv", "w"); std::fprintf(fp, "t,x,y,clr,ms\n");
+  FILE* fp = std::fopen("../python/media/_gif_path.csv", "w"); std::fprintf(fp, "t,x,y,z,clr,ms\n");
   FILE* fh = std::fopen("../python/media/_gif_hum.csv", "w"); std::fprintf(fh, "t,hid,x,y,r\n");
   FILE* fm = std::fopen("../python/media/_gif_meta.csv", "w"); std::fprintf(fm, "W,d_safe,goalx\n%.2f,%.2f,%.1f\n", W, d_safe, goal[0]);
   std::fclose(fm);
@@ -45,7 +45,7 @@ int main() {
   Eigen::Vector3d p = start; double t = 0; bool reached = false, held = false; double msmax = 0;
   auto dump = [&](double tt) {
     double mn = 1e18; for (auto& s : SPEC) { Eigen::Vector3d c(s.x, hy_at(s, tt), 2.0); mn = std::min(mn, (p - c).norm() - s.r); }
-    std::fprintf(fp, "%.3f,%.4f,%.4f,%.4f,%.2f\n", tt, p[0], p[1], mn, msmax);
+    std::fprintf(fp, "%.3f,%.4f,%.4f,%.4f,%.4f,%.2f\n", tt, p[0], p[1], p[2], mn, msmax);
     int hid = 0; for (auto& s : SPEC) { std::fprintf(fh, "%.3f,%d,%.4f,%.4f,%.3f\n", tt, hid++, s.x, hy_at(s, tt), s.r); }
   };
   dump(0);
