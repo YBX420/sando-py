@@ -17,6 +17,10 @@ path = list(csv.DictReader(open(os.path.join(MED, "_gif_path.csv"))))
 T = np.array([float(r["t"]) for r in path]); X = np.array([float(r["x"]) for r in path])
 Y = np.array([float(r["y"]) for r in path]); C = np.array([float(r["clr"]) for r in path])
 MS = np.array([float(r["ms"]) for r in path])
+# z(高度):tunnel 只约束 y,z 自由 -> 最挤处无人机抬高飞越人(z 远离人面 2.0)。
+# 注意:2D 俯视图里无人机会和最近的人「叠」,那是把 3D 飞越投影到平面的假象;clr 是真 3D 净空(恒>=d_safe)。
+Z = np.array([float(r.get("z", 2.0)) for r in path])
+HUMAN_Z = 2.0
 
 hum_by_t = {}
 for r in csv.DictReader(open(os.path.join(MED, "_gif_hum.csv"))):
@@ -52,14 +56,18 @@ def upd(fi):
             halos[j].set_visible(False); bodies[j].set_visible(False)
     trail.set_data(X[:i + 1], Y[:i + 1]); drone.set_data([X[i]], [Y[i]])
     safe = C[i] >= D_SAFE - 1e-3
-    txt.set_text(f"t={T[i]:4.1f}s  x={X[i]:4.1f}  min human clr={C[i]:+.2f} "
-                 f"({'SAFE' if safe else 'tight'})  replan {MS[i]:.0f}ms (<50)")
-    drone.set_color("yellow" if safe else "orange")
+    over = Z[i] > HUMAN_Z + 0.4   # 明显抬高 = 正在从顶上飞越人
+    txt.set_text(f"t={T[i]:4.1f}s  x={X[i]:4.1f}  z={Z[i]:4.2f}{'  (climbs OVER)' if over else ''}  "
+                 f"3D clr={C[i]:+.2f} ({'SAFE' if safe else 'tight'})  replan {MS[i]:.0f}ms (<50)")
+    drone.set_color("cyan" if over else ("yellow" if safe else "orange"))
+    drone.set_markersize(14 if over else 10)
     return halos + bodies + [trail, drone, txt]
 
 
 ani = anim.FuncAnimation(fig, upd, frames=len(frames), interval=60, blit=False)
-fig.suptitle(f"A+B threads a DENSE moving crowd (12 dynamic-hard humans) WITHIN a tunnel (±{W:.1f}), <50ms/replan, human-safe", fontsize=10)
+_nh = max((len(v) for v in hum_by_t.values()), default=16)
+fig.suptitle(f"A+B threads a DENSE moving crowd ({_nh} dynamic-hard humans) within a y-tunnel (±{W:.1f}); "
+             f"z is free, so at the tightest pinch the drone CLIMBS OVER (cyan) — real 3D clr stays ≥d_safe, <50ms/replan", fontsize=9)
 fig.tight_layout()
 ani.save(os.path.join(MED, "_tunnel_crowd.gif"), writer=anim.PillowWriter(fps=16))
 print("wrote media/_tunnel_crowd.gif")
