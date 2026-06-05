@@ -711,10 +711,12 @@ class SANDO:
         obst_pos.clear(); obst_bbox.clear(); pred_samples.clear(); pred_times.clear()
         local_trajs = self.get_trajs()
 
-        # per-class snapshot tags (swap point for a real classifier): class keyed on
-        # the DynTraj id range (200<=id<300 -> wall/SOFT, else human/HARD) and the
-        # current obstacle velocity (so a moving human reaches plan_minco as a moving
-        # SphereObstacle -> genuine dynamic, space-time avoidance).
+        # per-class snapshot tags: the class comes from the REAL label on the
+        # trajectory (traj.obst_class, set by a perception/RGBD/tracker classifier).
+        # The DynTraj id range (200<=id<300 -> wall, else human) is now only a
+        # LEGACY FALLBACK for trajectories that carry no label, not the primary
+        # source. Velocity is carried alongside so a moving human reaches plan_minco
+        # as a moving SphereObstacle -> genuine dynamic, space-time avoidance.
         obst_class: List[str] = []
         obst_vel: List[np.ndarray] = []
         obst_accel: List[np.ndarray] = []
@@ -728,10 +730,15 @@ class SANDO:
                 continue
             obst_pos.append(p)
             obst_bbox.append(np.array(traj.bbox, dtype=float))
-            # 中文:这里是"分类的临时占位规则"——目前靠障碍 id 区间判类别(200~299 当作墙/软避障,
-            # 其余当作人/硬避障)。将来换成真正的 RGBD/跟踪分类器只需替换这一行。
-            tid = int(getattr(traj, "id", 0))
-            obst_class.append("wall" if 200 <= tid < 300 else "human")
+            # 中文:类别来源。① 优先用感知/跟踪器给的真实标签 traj.obst_class('human'/'wall');
+            # ② 拿不到(空/未知)才退回旧的 id 区间启发式(200~299=墙,其余=人)——这条只是
+            #    没有真分类器时的过渡兜底,真分类器只要给 DynTraj.obst_class 赋值即可,无需改这里;
+            # ③ 任何判不出的情况最终按 'human'/硬约束处理(更保守、更安全)。
+            cls = str(getattr(traj, "obst_class", "") or "").strip().lower()
+            if cls not in ("human", "wall"):
+                tid = int(getattr(traj, "id", 0))
+                cls = "wall" if 200 <= tid < 300 else "human"
+            obst_class.append(cls)
             try:
                 v = np.asarray(traj.velocity(current_time), dtype=float).reshape(3)
             except Exception:
@@ -1183,9 +1190,10 @@ class SANDO:
         its current velocity so the Stage-4 space-time ALM avoids it at the right
         moment); wall -> AABBObstacle (SOFT EGO field, grazeable).
 
-        The class tag is currently keyed on the DynTraj id range upstream
-        (_compute_obst_pos_and_traj_max_time); a real RGBD/tracker classifier
-        swaps in there. Missing tag -> 'human'/HARD (fail-safe), missing vel -> 0.
+        The class tag comes from the real label DynTraj.obst_class upstream
+        (_compute_obst_pos_and_traj_max_time); the id range is only a legacy
+        fallback for unlabelled trajectories. Missing tag -> 'human'/HARD
+        (fail-safe), missing vel -> 0.
         obst_accel[k] -> the human's current acceleration for the CA (constant-
         acceleration) space-time prediction; missing -> 0 (falls back to CV).
 
@@ -1321,7 +1329,8 @@ class SANDO:
             # (slower, but rare) so hard scenes still get solved.
             mj, info = plan_minco(astar_path, obstacles, avoid_cfg, v0=v0, a0=a0,
                                   opt_params=opt, time_budget_ms=budget,
-                                  detour_cfg=DetourConfig(enabled=use_topo, use_topology=use_topo))
+                                  detour_cfg=DetourConfig(enabled=use_topo, use_topology=use_topo,
+                                                          time_aware_seed=use_topo))
             if not info.get("trajectory_valid"):
                 # share the budget: the fallback gets the REMAINING budget so the two calls
                 # together stay bounded by one budget (else detour-off + detour-on = 2x budget).
@@ -1330,7 +1339,8 @@ class SANDO:
                     rem = max(1.0, budget - (time.perf_counter() - t0) * 1000.0)
                 mj, info = plan_minco(astar_path, obstacles, avoid_cfg, v0=v0, a0=a0,
                                       opt_params=opt, time_budget_ms=rem,
-                                      detour_cfg=DetourConfig(enabled=True, use_topology=use_topo))
+                                      detour_cfg=DetourConfig(enabled=True, use_topology=use_topo,
+                                                              time_aware_seed=use_topo))
         except Exception:  # plan_minco can RAISE 'all seeds failed'
             # 中文:plan_minco 在"所有起点都失败"时会直接抛异常,这里兜住当作本拍规划失败。
             self.replanning_failure_count += 1

@@ -248,7 +248,9 @@ class Parameters:
     # baseline (and every golden) is byte-identical; the deterministic certificate-first
     # stack activates only when these are set.
     minco_time_budget_ms: float = 0.0   # >0 -> hard per-replan compute deadline for plan_minco
-    minco_use_topology: bool = False    # True -> deterministic H-signature passing-side seed
+    minco_use_topology: bool = False    # True -> deterministic arrival-time homotopy passing-side seed
+                                        #   (topology seed is arrival-time-aware by default; static
+                                        #    obstacles degenerate to the t=0 geometry, byte-identical)
     minco_w_time: float = 10.0          # MINCO time-anchor weight: HIGHER -> faster (pushes time
                                         #   allocation toward v_max/a_max), lower -> smoother/slower
     # SFC soft flight-corridor: pull the MINCO solve back into a tube around the seed waypoints so
@@ -654,6 +656,10 @@ class DynTraj:
     current_pos: np.ndarray = field(default_factory=lambda: np.zeros(3))
     is_agent: bool = False
     id: int = -1
+    # 中文:感知/跟踪器给的真实类别标签('human' 硬 / 'wall' 软),空字符串=未知。
+    # 这是 per-class 避障的"真·类别来源":规划器优先用它分类,真分类器只要给这个字段赋值即可。
+    # 为空(未知)时规划器才退回按 id 区间的旧启发式,最终任何判不出的情况一律按 'human'/硬约束兜底。
+    obst_class: str = ""
     time_received: float = 0.0
     tracking_utility: float = 0.0
     communication_delay: float = 0.0

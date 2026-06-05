@@ -246,6 +246,8 @@ class DetourConfig:
     perturb_window: int = 3           # 鼓包时影响的路点半窗宽（前后各几个点跟着挪）
     use_topology: bool = False        # True -> 确定性 H-signature passing-side 单种子(替 ±u/±v 盲搜)
     topology_max_obstacles: int = 6   # 拓扑种子最多绕开几个违反者(按严重度排序取前几)
+    time_aware_seed: bool = False     # True -> 按"抵达时刻"看动态障碍预测位置来判违反/选边/鼓包(见缝就穿);
+                                      #   只对会动的障碍生效,静态障碍 + 此项关掉 = 逐字节不变
 
 
 # ---------------------------------------------------------------------------
@@ -301,14 +303,22 @@ def _resample_polyline(path: np.ndarray, K: int) -> np.ndarray:
     return np.stack([np.interp(target, cum, path[:, d]) for d in range(path.shape[1])], axis=1)
 
 
-def _min_clearance_per_obstacle(path: np.ndarray, obstacles, K_eval: int):
+def _min_clearance_per_obstacle(path: np.ndarray, obstacles, K_eval: int, speed=None):
     """对每个障碍，算折线离它最近的「带符号距离」以及最近发生在哪个折线顶点附近。
     返回每个障碍一条 (最小间隙, 最近折线点下标)。
-    Return list of (min_clearance, closest_path_index) per obstacle."""
+    Return list of (min_clearance, closest_path_index) per obstacle.
+
+    speed (>0):按"抵达时刻"评估——每个采样点的时间 = 沿折线累计弧长 / speed,动态障碍会被看在
+    "无人机经过它时它预测所在的位置"(space-time 间隙)。speed=None -> 全部 t=0(逐字节不变)。"""
     samples = _resample_polyline(path, K_eval)
+    if speed and float(speed) > 0.0:
+        _seg = np.linalg.norm(np.diff(samples, axis=0), axis=1)
+        tsamp = np.concatenate([[0.0], np.cumsum(_seg)]) / float(speed)
+    else:
+        tsamp = np.zeros(K_eval)
     out = []
     for obs in obstacles:
-        ds = np.array([obs.signed_dist(samples[i], 0.0) for i in range(K_eval)])
+        ds = np.array([obs.signed_dist(samples[i], float(tsamp[i])) for i in range(K_eval)])
         i_min = int(np.argmin(ds))
         # 采样点是在重采样后的密集序列上找的，这里按比例换算回原折线的顶点下标
         # map sample index back to path index (proportional)
@@ -318,7 +328,8 @@ def _min_clearance_per_obstacle(path: np.ndarray, obstacles, K_eval: int):
 
 
 def _make_detour_path(path: np.ndarray, obstacle, direction: np.ndarray,
-                      d_safe: float, detour_cfg: DetourConfig) -> np.ndarray:
+                      d_safe: float, detour_cfg: DetourConfig,
+                      centre_override=None) -> np.ndarray:
     """把折线沿给定方向「鼓」出一个包，绕开这个障碍。
     做法：找到离障碍中心最近的折线点，算出绕行目标点
     (中心 + 方向 · (半径 + 安全距离 + 余量))，然后把附近一窗口的点按钟形权重
@@ -331,6 +342,8 @@ def _make_detour_path(path: np.ndarray, obstacle, direction: np.ndarray,
     Endpoints stay pinned.
     """
     centre, r_eq = _obstacle_geom(obstacle)
+    if centre_override is not None:   # time-aware: 鼓在障碍"抵达时刻预测所在"的位置(非 t=0 当前位置)
+        centre = np.asarray(centre_override, dtype=np.float64).reshape(3)
     dists = np.linalg.norm(path - centre, axis=1)
     i_close = int(np.argmin(dists))
     target = centre + direction * (r_eq + d_safe + detour_cfg.detour_margin)
@@ -347,16 +360,20 @@ def _make_detour_path(path: np.ndarray, obstacle, direction: np.ndarray,
     return new_path
 
 
-def _passing_side(axis: np.ndarray, obs) -> np.ndarray:
+def _passing_side(axis: np.ndarray, obs, t_eval: float = 0.0) -> np.ndarray:
     """确定性选「绕哪边过」:取垂直于 axis 的水平方向 u;若障碍在横穿(速度有 u 分量),
     选从它**背后**过的那侧(-sign(v·u)·u);静止则默认 +u。替代 ±u/±v 盲搜的单侧确定性选择。
+    t_eval>0:用 velocity_at(t_eval)(抵达时刻的速度,CA 模型)选边;t_eval=0 等价于读 obs.vel(逐字节不变)。
     Deterministic passing-side: horizontal perpendicular u to axis; pass BEHIND a crossing
     obstacle (the side it is leaving), else default side. Replaces the ±u/±v multi-start guess."""
     z = np.array([0.0, 0.0, 1.0])
     u = np.cross(axis, z)                         # axis ⟂ 的水平方向
     n = float(np.linalg.norm(u))
     u = (u / n) if n > 1e-6 else np.array([0.0, 1.0, 0.0])
-    vel = np.asarray(getattr(obs, "vel", np.zeros(3)), dtype=float)
+    if hasattr(obs, "velocity_at"):               # SphereObstacle:抵达时刻速度(CA);t=0 时 == obs.vel
+        vel = np.asarray(obs.velocity_at(float(t_eval)), dtype=float).reshape(3)
+    else:
+        vel = np.asarray(getattr(obs, "vel", np.zeros(3)), dtype=float)
     vu = float(np.dot(vel, u))
     if abs(vu) > 1e-3:
         return -np.sign(vu) * u                   # 从横穿者背后过
@@ -371,7 +388,11 @@ def _generate_detour_seeds(astar_path: np.ndarray, obstacles, avoid_cfg, opt: Op
     seeds: List[Tuple[str, np.ndarray]] = [("original", astar_path)]
     if not detour_cfg.enabled or not obstacles:
         return seeds
-    clearances = _min_clearance_per_obstacle(astar_path, obstacles, detour_cfg.K_eval)
+    # time-aware:抵达时刻 = 沿折线累计弧长 / vmax,让"违反者判定 + 选边 + 鼓包"都看动态障碍的预测位置
+    # (见缝就穿)。仅当 time_aware_seed 开 -> speed 非 None;关掉时 speed=None,逐字节不变。
+    _ta_speed = max(float(opt.vmax), 1e-3) if detour_cfg.time_aware_seed else None
+    clearances = _min_clearance_per_obstacle(astar_path, obstacles, detour_cfg.K_eval,
+                                             speed=_ta_speed)
     # 挑出「违反者」：折线离它太近（间隙 < d_safe + 触发余量）的障碍
     violators = []
     for i, obs in enumerate(obstacles):
@@ -387,15 +408,34 @@ def _generate_detour_seeds(astar_path: np.ndarray, obstacles, avoid_cfg, opt: Op
     if detour_cfg.use_topology:
         # 确定性单种子:对每个违反者按 passing-side 把折线鼓到正确一侧(homotopy 类几何选定,
         # 不跑 ±u/±v 盲搜)。返回 [original, topology] 两个种子,early-exit 会先试 topology。
+        # time-aware(_ta_speed 非 None 且障碍会动):按"抵达时刻"看障碍预测位置选边、鼓在它将到达的位置。
+        ta_vertex = None
+        if _ta_speed is not None:
+            _vseg = np.linalg.norm(np.diff(astar_path, axis=0), axis=1)
+            ta_vertex = np.concatenate([[0.0], np.cumsum(_vseg)]) / _ta_speed  # (M,) 到各顶点的时刻
         new_path = astar_path
         for violation, i, obs, d_safe, i_path in violators[: detour_cfg.topology_max_obstacles]:
-            centre, _r = _obstacle_geom(obs)
-            path_pt = new_path[min(i_path, len(new_path) - 1)]
-            axis = centre - path_pt
+            if ta_vertex is not None and _is_moving(obs):
+                # space-time 最近接近:无人机到各顶点时,障碍预测位置离哪个顶点最近?在那一侧、那时刻选边
+                ds = np.array([obs.signed_dist(new_path[j], float(ta_vertex[j]))
+                               for j in range(len(new_path))])
+                j_close = int(np.argmin(ds))
+                t_eval = float(ta_vertex[j_close])
+                centre = np.asarray(obs.predict(t_eval), dtype=np.float64).reshape(3)
+                # axis = 局部路径切向(行进方向)→ passing-side 选"横向"绕行,而非沿路向后退
+                # (用「路点→障碍」当 axis 在障碍正侧方时会退化成沿路方向)
+                jm, jp = max(j_close - 1, 0), min(j_close + 1, len(new_path) - 1)
+                axis = new_path[jp] - new_path[jm]
+            else:
+                j_close = min(i_path, len(new_path) - 1)
+                t_eval = 0.0
+                centre, _r = _obstacle_geom(obs)
+                axis = centre - new_path[j_close]
             if float(np.linalg.norm(axis)) < 1e-6:
                 axis = astar_path[-1] - astar_path[0]
-            d = _passing_side(axis, obs)
-            new_path = _make_detour_path(new_path, obs, d, d_safe, detour_cfg)
+            d = _passing_side(axis, obs, t_eval)
+            new_path = _make_detour_path(new_path, obs, d, d_safe, detour_cfg,
+                                         centre_override=(centre if t_eval > 0.0 else None))
         seeds.append(("topology", new_path))
         return seeds
     # 只给前 top_k 个最严重的障碍生成绕行
