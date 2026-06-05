@@ -16,3 +16,7 @@ python/test/data/obsmat_*.txt
 # editor + local logs
 .vscode/
 *.log
+
+# gif intermediate data
+python/media/_gif_*.csv
+python/media/_tunnel_W*.csv
