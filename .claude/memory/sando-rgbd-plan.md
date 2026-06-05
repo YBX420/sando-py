@@ -310,3 +310,9 @@ mammoth 上有同名计划 [[sando-rgbd-plan-v2]] + 更全的旧背景 memory。
 - **场景B 隧道软墙+硬人**:硬人净空恒 ~0.82(ALM 本就顶,与走廊无关);走廊 ON 更居中不蹭软墙(max|y| 0.72→0.24,墙净空 0.585→1.056)。
 - **注意**:`bench_tunnel` 用 A+B(af_*)离线求解器,**测不到 plan_minco 的走廊**——审计「在 bench_tunnel 验」不准,故新写 bench_corridor 直打 plan_minco。
 - **下一步**:走廊在生产**默认开会破 golden**(需重生成 golden_cases)→ 要么作「agile 模式」配置开、要么重生成 golden。动态移动缝还需「管心套在抵达时刻种子上」+ 两侧比较(=SLIM-2)。本机直编:`g++ -std=c++17 -O2 -I cpp/include -I cpp/third_party/eigen -I cpp/third_party cpp/test/bench_corridor.cpp -o cpp/build/bench_corridor.exe`。
+- **后续 C++ commits**:`e6a7b6a` 走廊默认开(50/0.6)+ ctest 19/19;`cf20da7` `bench_crowd` 闭环人群(走廊 ON 把卡壳 5→0、更快);`c601449` bench_corridor 实验。**用户决定不再卡 golden,C++ 为主线**(改默认有意偏离 Python-golden;gated 测试不受影响因从 case 造 opt)。
+
+### ★ 安全半场 step1:recovery bench ✅ 2026-06-05(`cpp/test/bench_recovery.cpp`,commit c624827)
+- 很堵走廊(硬墙车道 |y|<=1.3 + 5/3 个迎面人,plan_minco 真失败→必须等)。**baseline 冻住 → 被走进来撞穿身体 min_human=−0.290(HIT)**;**recovery-v1 主动让位(最大化净空的移动,可退到走廊外开阔区)→ +2.97(5人)/+3.70(3人),≥d_safe 且都到达**。前瞻监视器(余量<d_safe+0.5 早让)在此 = reactive。→ **安全半场机制成立**:不冻住、主动退让保净空、人过了再走 = hold-or-thread 的「安全等」那半。
+- **诚实边界**:kinematic bench + 几何让位(5 候选方向),**还没接进生产 planner**;退得保守(退到开阔区,净空很大)。
+- **下一步(生产化)= audit Q5**:`reach_avoid.hpp`(复用证书 margin `-max(g)` 当 reach-avoid 监视器,plan_minco.hpp:834)+ `recovery.hpp`(yield/brake 注入 deque)+ HOLDING/YIELDING 枚举,接进 `planner.hpp` replan 的失败/breach 处({false,true} 冻住 → 改主动让位)。test_planner golden 大概率不受影响(nominal 不走失败路)。
