@@ -90,7 +90,7 @@ world.scene.add(VisualCuboid(prim_path="/World/floor", name="floor",
     scale=np.array([abs(_gx) + 20.0, 16.0, 0.02]), color=np.array([0.25, 0.25, 0.28])))
 
 import omni.usd
-from pxr import UsdLux, Sdf
+from pxr import UsdLux, Sdf, UsdShade, Gf
 _stage = omni.usd.get_context().get_stage()
 UsdLux.DomeLight.Define(_stage, Sdf.Path("/World/DomeLight")).CreateIntensityAttr(1000.0)
 UsdLux.DistantLight.Define(_stage, Sdf.Path("/World/SunLight")).CreateIntensityAttr(3000.0)
@@ -128,6 +128,27 @@ for i, o in enumerate(OBS):
     col = np.array([1.0, 0.25, 0.25]) if IS_HUMAN[i] else np.array([0.55, 0.55, 0.6])
     obs_prims.append(world.scene.add(VisualCuboid(prim_path=f"/World/obs_{i}", name=f"obs_{i}",
         position=p0.copy(), scale=sz.copy(), color=col)))
+
+# 动态障碍「膨胀光环」: 全局 heat-A* 实际把每个障碍当成 (盒子 + 2*dyn_base_inflation_m) 大来绕,
+# 半透明橙盒画出这个有效膨胀尺寸 -> 一眼看出「为什么绕而不穿」。try/except 兜底, 渲染失败不崩。
+infl_prims = []
+try:
+    _infl_m = float(par.dyn_base_inflation_m)
+    _imat = UsdShade.Material.Define(_stage, "/World/Looks/inflMat")
+    _ish = UsdShade.Shader.Define(_stage, "/World/Looks/inflMat/Shader")
+    _ish.CreateIdAttr("UsdPreviewSurface")
+    _ish.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 0.5, 0.0))
+    _ish.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(0.14)
+    _imat.CreateSurfaceOutput().ConnectToSource(_ish.ConnectableAPI(), "surface")
+    for i, o in enumerate(OBS):
+        szf = np.array(o["size"], float) + 2.0 * _infl_m              # inflated FULL size
+        pr = world.scene.add(VisualCuboid(prim_path=f"/World/infl_{i}", name=f"infl_{i}",
+            position=DTS[i].eval(0.0).copy(), scale=szf, color=np.array([1.0, 0.5, 0.0])))
+        UsdShade.MaterialBindingAPI(_stage.GetPrimAtPath(f"/World/infl_{i}")).Bind(_imat)
+        infl_prims.append(pr)
+    print(f"[isaac] inflation halos drawn ({len(infl_prims)}, dyn_base_inflation_m={_infl_m:.2f}, translucent orange)", flush=True)
+except Exception as _e:
+    print(f"[isaac][warn] inflation halo render failed, skipped: {_e}", flush=True); infl_prims = []
 
 # 面包屑轨迹
 N_TRAIL = 500
@@ -224,7 +245,10 @@ while simulation_app.is_running() and t < T_MAX and not reached:
 
     drone.set_world_pose(position=p_d)
     for i in range(len(OBS)):                       # 障碍按 t 运动(可视化跟着动)
-        obs_prims[i].set_world_pose(position=DTS[i].eval(t))
+        _cp = DTS[i].eval(t)
+        obs_prims[i].set_world_pose(position=_cp)
+        if i < len(infl_prims):                      # 膨胀光环跟着障碍动
+            infl_prims[i].set_world_pose(position=_cp)
     c = clearance_all(p_d, t)
     min_clear = min(min_clear, c)
     if c < 0.0:
