@@ -26,7 +26,10 @@ hum_by_t = {}
 for r in _csv("_gif_hum.csv"):
     hum_by_t.setdefault(round(float(r["t"]), 3), []).append((float(r["x"]), float(r["y"]), float(r["r"])))
 NH = max(len(v) for v in hum_by_t.values())
-DRONE_Z = 1.5   # 飞行高度(可视化)
+DRONE_Z = 1.5   # 规划是 2D 单一高度 -> 无人机与障碍【同一平面】,避免「身高立柱」错觉
+# 每个行人的真实半径(障碍尺寸)+ d_safe 安全半径(画成淡环,看清无人机始终在安全区外)
+t0 = round(float(path[0]["t"]), 3)
+R_HUM = [h[2] for h in hum_by_t[t0]]
 
 # ---- Isaac (SimulationApp 必须最先) ----
 from isaacsim import SimulationApp
@@ -60,9 +63,16 @@ drone = world.scene.add(VisualCuboid(prim_path="/World/drone", name="drone",
 # 目标
 world.scene.add(VisualCuboid(prim_path="/World/goal", name="goal",
     position=np.array([GOALX, 0, DRONE_Z]), scale=np.array([0.3, 0.3, 0.3]), color=np.array([0.1, 0.9, 0.2])))
-# 16 行人(人形盒,站立,红色)
+# 16 行人:真实障碍尺寸(直径 2r)的小盒,与无人机【同一平面 z=DRONE_Z】(忠实 2D 规划)
 humans = [world.scene.add(VisualCuboid(prim_path=f"/World/hum_{i}", name=f"hum_{i}",
-    position=np.array([0, 0, 0.9]), scale=np.array([0.55, 0.55, 1.7]), color=np.array([0.9, 0.2, 0.2])))
+    position=np.array([0, 0, DRONE_Z]),
+    scale=np.array([2 * R_HUM[i], 2 * R_HUM[i], 2 * R_HUM[i]]), color=np.array([0.9, 0.2, 0.2])))
+    for i in range(NH)]
+# d_safe 安全环:半径 r+d_safe 的淡色盒(无人机始终在它【外面】= 安全可见)
+halos = [world.scene.add(VisualCuboid(prim_path=f"/World/halo_{i}", name=f"halo_{i}",
+    position=np.array([0, 0, DRONE_Z]),
+    scale=np.array([2 * (R_HUM[i] + D_SAFE), 2 * (R_HUM[i] + D_SAFE), 0.02]),
+    color=np.array([1.0, 0.7, 0.7])))
     for i in range(NH)]
 # 面包屑
 N_TRAIL = 400
@@ -83,9 +93,11 @@ while simulation_app.is_running():
     for i, h in enumerate(humans):
         if i < len(hs):
             hx, hy, r = hs[i]
-            h.set_world_pose(position=np.array([hx, hy, 0.9]))
+            h.set_world_pose(position=np.array([hx, hy, DRONE_Z]))
+            halos[i].set_world_pose(position=np.array([hx, hy, DRONE_Z - 0.25]))  # 安全环平铺在下方一点
         else:
             h.set_world_pose(position=np.array([0, 0, -5]))
+            halos[i].set_world_pose(position=np.array([0, 0, -5]))
     trail[ti % N_TRAIL].set_world_pose(position=dpos.copy())
     world.step(render=True)
     ti += 1
