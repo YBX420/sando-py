@@ -14,6 +14,7 @@
 #include <memory>
 #include <cmath>
 #include "sando_cpp/plan_minco.hpp"
+#include "sando_cpp/types.hpp"
 using namespace sando;
 
 static std::map<std::string, AvoidParams> make_cfg() {
@@ -55,6 +56,9 @@ static Metrics run(const Eigen::MatrixXd& ap, const std::vector<const Obstacle*>
 }
 
 int main() {
+  { Parameters _p; printf("Parameters DEFAULT now: minco_w_corridor=%.1f minco_sfc_radius=%.2f "
+                          "(>0 => corridor ON by default; per-run rows below override it)\n\n",
+                          _p.minco_w_corridor, _p.minco_sfc_radius); }
   Eigen::Vector3d start(0, 0, 1.5), goal(8, 0, 1.5);
   Eigen::MatrixXd ap = straight_path(start, goal, 9);
 
