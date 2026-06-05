@@ -478,7 +478,10 @@ class SANDO {
       opos.push_back(p);
       obbox.push_back(t.bbox);
       int tid = t.id;
-      oclass.push_back((200 <= tid && tid < 300) ? "wall" : "human");
+      // class source (placeholder): id>=200 -> wall (soft), else human (hard). Was [200,300)
+      // which silently misclassified the 100th+ wall (id>=300) as a HARD human -> the local solve
+      // could not thread past those phantom-hard boxes -> stall. id>=200 supports >100 walls.
+      oclass.push_back((tid >= 200) ? "wall" : "human");
       ovel.push_back(t.velocity(current_time));
       oaccel.push_back(t.accel(current_time));
       selected.push_back(t);
