@@ -53,6 +53,8 @@
 #include "sando_cpp/avoid_config.hpp"
 #include "sando_cpp/plan_minco.hpp"
 #include "sando_cpp/minjerk_traj.hpp"
+#include "sando_cpp/reach_avoid.hpp"
+#include "sando_cpp/recovery.hpp"
 
 #include <Eigen/Dense>
 #include <vector>
@@ -763,8 +765,15 @@ class SANDO {
                                    global_path);
     if (!ok) return {false, false};
 
-    if (!plan_local_trajectory_minco(global_path, last_replanning_computation_time))
+    if (!plan_local_trajectory_minco(global_path, last_replanning_computation_time)) {
+      // SAFE half: no feasible forward plan -> actively YIELD (recovery_yield) instead of freezing
+      // the stale deque. Only fires on failure, so nominal/golden behaviour is unchanged. Wrapped
+      // so a recovery error can never crash the planner (worst case = the old freeze behaviour).
+      try {
+        if (par.recovery_enabled && recovery_yield() && append_to_plan()) return {false, true};
+      } catch (const std::exception&) {}
       return {false, true};
+    }
 
     if (!append_to_plan()) return {false, true};
 
@@ -1042,6 +1051,60 @@ class SANDO {
     successful_factor = 1.0;
     cvx_decomp_time = 0.0;
     last_minco_traj = mj_ptr;
+    return true;
+  }
+
+  // recovery_yield — SAFE half: when no feasible forward plan exists, actively YIELD (move to keep
+  // max clearance, recovery.hpp) instead of freezing the stale deque. Commits a short brake/yield
+  // maneuver from the splice point A into goal_setpoints. Returns true if a maneuver was committed.
+  bool recovery_yield() {
+    RobotState local_A = get_A();
+    double A_time_local = get_A_time();
+    std::vector<Eigen::Vector3d> opos = obst_pos, obbox = obst_bbox, ovel = obst_vel, oaccel = obst_accel;
+    std::vector<std::string> oclass = obst_class;
+    if (opos.empty()) return false;                       // nothing to yield from
+    std::vector<std::shared_ptr<Obstacle>> owned;
+    std::vector<const Obstacle*> obstacles;
+    std::map<std::string, AvoidParams> avoid_cfg;
+    obstacles_from_snapshot(opos, obbox, oclass, ovel, oaccel, owned, obstacles, avoid_cfg);
+
+    const double horizon = 0.6, step = 0.6;
+    Eigen::Vector3d path_dir = get_G().pos - local_A.pos;
+    Eigen::Vector3d target = yield_target(local_A.pos, path_dir, obstacles, 0.0, horizon, step);
+    double dc = par.dc;
+    std::vector<RobotState> setpoints;
+    double d = (target - local_A.pos).norm();
+    if (d < 1e-3) {                                        // staying is safest -> brake to rest + HOLD at A
+      int n = std::max(2, static_cast<int>(std::ceil(horizon / dc)));
+      for (int i = 0; i < n; ++i) {
+        RobotState s; s.t = A_time_local + (i + 1) * dc; s.pos = local_A.pos;
+        s.vel.setZero(); s.accel.setZero(); s.jerk.setZero(); setpoints.push_back(s);
+      }
+      goal_setpoints = setpoints; last_minco_traj.reset(); cps.clear(); pwp_to_share.clear_q();
+      successful_factor = 1.0; cvx_decomp_time = 0.0; return true;
+    }
+    double yv = std::max(0.5, std::min(par.v_max, 1.5));   // yield slowly
+    double Tseg = std::max(dc * 2.0, d / yv / 2.0);
+    Eigen::MatrixXd wp(3, 3);
+    wp.row(0) = local_A.pos.transpose();
+    wp.row(1) = (0.5 * (local_A.pos + target)).transpose();
+    wp.row(2) = target.transpose();
+    Eigen::VectorXd T(2); T(0) = Tseg; T(1) = Tseg;
+    MinjerkTraj mj(wp, T, local_A.vel, local_A.accel, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    double t_end = mj.t_end;
+    int n_samples = std::max(2, static_cast<int>(std::ceil(t_end / dc)));
+    for (int i = 0; i < n_samples; ++i) {
+      double t_local = std::min((i + 1) * dc, t_end - 1e-6);
+      RobotState s; s.t = A_time_local + t_local;
+      s.pos = mj.eval_deriv(t_local, 0); s.vel = mj.eval_deriv(t_local, 1);
+      s.accel = mj.eval_deriv(t_local, 2); s.jerk = mj.eval_deriv(t_local, 3);
+      setpoints.push_back(s);
+    }
+    goal_setpoints = setpoints;
+    pwp_to_share = minjerk_to_pwp(mj, A_time_local);
+    cps = mj.control_points();
+    successful_factor = 1.0; cvx_decomp_time = 0.0;
+    last_minco_traj = std::make_shared<MinjerkTraj>(mj);
     return true;
   }
 

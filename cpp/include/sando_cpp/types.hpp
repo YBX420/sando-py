@@ -625,6 +625,10 @@ struct Parameters {
   // Soft penalty (cannot cause infeasibility); hard humans stay ALM-enforced regardless.
   double minco_sfc_radius = 0.6;       // m: tube radius (0=off)
   double minco_w_corridor = 50.0;      // corridor penalty weight (0=off)
+  // SAFE half: on a FAILED forward replan, actively yield (recovery.hpp) instead of freezing the
+  // stale plan. Default ON (cpp-port main line); only fires when plan_minco finds no valid plan,
+  // so nominal/golden behaviour is unchanged.
+  bool recovery_enabled = true;
 
   // Dynamic obstacles
   double traj_lifetime = 7.0;
