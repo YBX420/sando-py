@@ -620,9 +620,11 @@ struct Parameters {
   double minco_human_slow_far = 9.0;   // m: at/above -> full v_max
   // Safe Flight Corridor (SFC): tube of radius minco_sfc_radius around the global-guide seed
   // waypoints; minco_w_corridor penalises leaving it. Stops the soft local optimiser drifting
-  // off the guide into a clutter pocket. Both 0 => OFF (golden byte-identical).
-  double minco_sfc_radius = 0.0;       // m: tube radius (0=off)
-  double minco_w_corridor = 0.0;       // corridor penalty weight (0=off)
+  // off the guide into a clutter pocket (the root cause of "detour relaxes to straight" sticking).
+  // DEFAULT ON (cpp-port main line; validated by bench_corridor: soft-wall clearance -0.122 -> +0.779).
+  // Soft penalty (cannot cause infeasibility); hard humans stay ALM-enforced regardless.
+  double minco_sfc_radius = 0.6;       // m: tube radius (0=off)
+  double minco_w_corridor = 50.0;      // corridor penalty weight (0=off)
 
   // Dynamic obstacles
   double traj_lifetime = 7.0;
