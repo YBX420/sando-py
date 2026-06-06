@@ -57,7 +57,7 @@ SANDO_API void params_set_double(void* ph, const char* name, double v) {
   D(minco_time_budget_ms); D(minco_w_time); D(minco_w_vel); D(minco_w_accel);
   D(minco_human_slow_vmax); D(minco_human_slow_near); D(minco_human_slow_far);
   D(minco_sfc_radius); D(minco_w_corridor);
-  D(replan_dt); D(dynamic_speed_thresh);
+  D(replan_dt); D(dynamic_speed_thresh); D(pred_horizon_s);
   D(w_max_yawing); D(yaw_spinning_dyaw); D(default_goal_z); D(hover_avoidance_d_trigger);
   D(hover_avoidance_h); D(hover_avoidance_min_repulsion_norm);
   I(visual_level); I(hgp_timeout_duration_ms); I(max_num_expansion); I(los_cells); I(heat_p);

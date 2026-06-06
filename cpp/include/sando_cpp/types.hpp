@@ -617,6 +617,11 @@ struct Parameters {
   double dynamic_speed_thresh = 0.0;
   // per-class avoidance override: "" -> per-class; "soft"/"hard" force all (production field, not a backdoor).
   std::string avoid_override = "";
+  // motion-aware GLOBAL guide: >0 -> predict each obstacle forward over this horizon (s) and feed the
+  // samples to the dynamic-heat tube so heat-A* threads gaps that are OPEN AT ARRIVAL, not gaps open NOW
+  // (which a moving box closes by the time the drone gets there -> local stop-and-wait). 0 -> off (single
+  // snapshot, golden-identical). Soft cost only (no hard future-occupancy) so it cannot over-block to a stall.
+  double pred_horizon_s = 0.0;
 
   // Anytime-feasible / gatekeeper (computation-invariant safety). Default OFF -> baseline +
   // every golden byte-identical; the deterministic certificate-first stack activates only when set.

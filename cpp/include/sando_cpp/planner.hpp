@@ -430,7 +430,7 @@ class SANDO {
     std::vector<Eigen::Vector3d> pcl_unk = has_unk_cloud ? pclptr_unk
                                                          : std::vector<Eigen::Vector3d>();
     hgp_manager.update_map(wdx, wdy, wdz, map_center, pcl_map, pcl_unk, opos, obbox,
-                           traj_max_time);
+                           traj_max_time, pred_samples, pred_times);
     map_size_initialized = true;
     map_seen = true;
     if (!pcl_map.empty()) kdtree_map_initialized = true;
@@ -452,7 +452,8 @@ class SANDO {
     std::vector<Eigen::Vector3d> pcl_map = has_map_cloud ? pclptr_map
                                                          : std::vector<Eigen::Vector3d>();
     hgp_manager.update_map(wdx, wdy, wdz, map_center, pcl_map,
-                           std::vector<Eigen::Vector3d>(), opos, obbox, traj_max_time);
+                           std::vector<Eigen::Vector3d>(), opos, obbox, traj_max_time,
+                           pred_samples, pred_times);
     map_size_initialized = true;
     map_seen = true;
     if (!pcl_map.empty()) kdtree_map_initialized = true;
@@ -494,6 +495,9 @@ class SANDO {
     obst_accel = oaccel;
 
     double Th = worst_traj_time * (factors_.empty() ? 1.0 : factors_.back());
+    // motion-aware guide: force a prediction horizon even when worst_traj_time==0 (rviz/analytic path)
+    // so the dynamic-heat tube gets forward samples -> heat-A* avoids where boxes WILL be.
+    if (par.pred_horizon_s > 0.0) Th = std::max(Th, par.pred_horizon_s);
     if (Th <= 0.0 || selected.empty()) return Th;
 
     double dt = 0.5;
@@ -985,9 +989,16 @@ class SANDO {
     double v_eff = par.v_max;
     if (par.minco_human_slow_vmax > 0.0 && !opos.empty()) {
       double dmin = std::numeric_limits<double>::infinity();
-      for (size_t i = 0; i < opos.size(); ++i)
-        if (oclass[i] != "wall")  // hard human class
+      for (size_t i = 0; i < opos.size(); ++i) {
+        // slow near any MOVER: a human (oclass!=wall) OR a fast "dynamic" box (oclass is still "wall",
+        // so detect it by speed like obstacles_from_snapshot does). Approaching a moving cluster at
+        // full v_max then slamming to 0 is the jagged stop-go; ramping v_max down -> a gentle approach.
+        bool is_human = (oclass[i] != "wall");
+        bool is_dyn = (par.dynamic_speed_thresh > 0.0 && i < ovel.size() &&
+                       ovel[i].norm() >= par.dynamic_speed_thresh);
+        if (is_human || is_dyn)
           dmin = std::min(dmin, (opos[i] - local_A.pos).norm());
+      }
       if (std::isfinite(dmin)) {
         double frac = std::min(1.0, std::max(0.0,
             (dmin - par.minco_human_slow_near) /
