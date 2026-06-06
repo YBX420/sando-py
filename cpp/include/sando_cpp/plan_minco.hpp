@@ -37,6 +37,7 @@
 #include "sando_cpp/minjerk_traj.hpp"
 #include "sando_cpp/obstacles.hpp"
 #include "sando_cpp/avoid_config.hpp"        // AvoidParams + resolve_mode
+#include "sando_cpp/st_graph.hpp"            // space-time front-end (ST-graph speed planner, default OFF)
 
 // Vendored header-only L-BFGS-B (cpp/third_party/LBFGSpp). Path is relative to the
 // third_party include root so the standard "-I cpp/third_party" compile line resolves it
@@ -104,6 +105,20 @@ struct PlanOptParams {
   // (seed/guide waypoints) are wired in alm_solve where q0 is known.
   double sfc_radius  = 0.0;
   double w_corridor  = 0.0;
+  // Safe-Interval SPACE-TIME corridor (default OFF -> golden-safe). corridor_cuboids is carved per-solve
+  // in optimise_one_minco and pointed here for the cost; the scalars feed StcParams.
+  bool   use_spacetime_corridor = false;
+  double w_time_window = 0.0;        // explicit-T window hinge (escape hatch, off)
+  double stc_d_safe_dyn = 0.5;
+  double stc_time_dt    = 0.1;
+  double stc_Th         = 1.5;
+  double stc_drone_radius = 0.0;
+  const std::vector<SpaceTimeCuboid>* corridor_cuboids = nullptr;
+  // Space-time FRONT-END (ST-graph speed planner): time the moving gaps via the seed T0. Default OFF.
+  bool   use_st_graph = false;
+  int    st_NS = 12;          // stations along the guide (NT >> NS so vmax is representable)
+  int    st_NT = 48;          // time levels
+  double st_w_wait = 1.0;     // slow/wait bias
 
   // Project to the CostGradOptParams the inner objective reads.
   CostGradOptParams cost_grad() const {
@@ -117,6 +132,7 @@ struct PlanOptParams {
     o.v_max_human = v_max_human; o.est_pos_err = est_pos_err;
     o.est_vel_err = est_vel_err;
     o.corridor_radius = sfc_radius; o.w_corridor = w_corridor;  // centres set by caller (alm_solve)
+    o.corridor_cuboids = corridor_cuboids; o.w_time_window = w_time_window;  // space-time corridor (off=null)
     return o;
   }
   // Project to the HardAlmOptParams the ALM constraint helpers read.
@@ -480,6 +496,24 @@ inline MincoSeed minco_seed(const Eigen::MatrixXd& seed_path, const PlanOptParam
   return S;
 }
 
+// Same as minco_seed but the segment TIMES T0 come from an ST-graph profile (timing the moving gaps).
+// q0 / start / goal are IDENTICAL to minco_seed -> only WHEN the drone is where changes (the whole point).
+inline MincoSeed minco_seed_timed(const Eigen::MatrixXd& seed_path, const PlanOptParams& opt,
+                                  const StProfile& prof) {
+  MincoSeed S;
+  const int N = (int)seed_path.rows();
+  long Mr = std::lround(double(N) / 2.0);
+  int M = (int)std::min<long>(std::max<long>(Mr, 2), opt.M_cap);
+  Eigen::MatrixXd wp = resample_polyline(seed_path, M + 1);
+  wp.row(0) = seed_path.row(0);
+  wp.row(M) = seed_path.row(N - 1);
+  S.start = wp.row(0).transpose();
+  S.goal = wp.row(M).transpose();
+  S.q0 = (M > 1) ? Eigen::MatrixXd(wp.middleRows(1, M - 1)) : Eigen::MatrixXd(0, 3);
+  S.T0 = profile_to_T0(prof, wp, M, opt.dt_min);   // ONLY difference: timing from the ST-graph
+  return S;
+}
+
 // ---------------------------------------------------------------------------
 // _safety_surrogate: deterministic+speed-reach -> replace moving hard spheres by a
 // static surrogate at centre0. Returns a parallel list (sharing static obstacles,
@@ -762,6 +796,7 @@ struct MincoCandidate {
   bool anytime_feasible = true;
   bool truncated = false;
   std::string seed_name;
+  std::vector<SpaceTimeCuboid> corridor;   // space-time corridor used (for viz; empty when off)
 };
 
 inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
@@ -781,8 +816,44 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
   std::vector<const Obstacle*> soft_obs, hard_obs;
   partition_obstacles(obs_eff, avoid_cfg, opt.avoid_override, soft_obs, hard_obs);
 
+  // Space-time FRONT-END (ST-graph speed planner): time the moving gaps -> rewrite the seed segment TIMES
+  // T0 (and T_target=T0.sum(), the dominant w_time anchor) so the drone SLOWS to pass the gap when it opens
+  // instead of arriving when it's shut and braking to 0. q0 (lateral route) is UNCHANGED. Default OFF.
+  StProfile st_prof;
+  if (opt.use_st_graph && M > 1 && !hard_obs.empty()) {
+    StGraphParams gp;
+    gp.d_safe_dyn = opt.stc_d_safe_dyn; gp.vmax = opt.vmax; gp.dt_min = opt.dt_min;
+    gp.Th = std::max(opt.stc_Th, S.T0.sum() * 2.0 + 1.0);   // nominal traversal + room to wait out a gap
+    gp.NS = opt.st_NS; gp.NT = opt.st_NT; gp.w_wait = opt.st_w_wait;
+    auto stns = sample_stations(seed_path, gp.NS);
+    auto blk  = build_blocked(stns, hard_obs, gp);
+    st_prof   = solve_st_graph(stns, blk, gp);
+    if (st_prof.feasible) S = minco_seed_timed(seed_path, opt, st_prof);   // SAME q0, NEW timing
+  }
+
+  // Safe-Interval SPACE-TIME corridor: carve a static-free cuboid per seed waypoint + a collision-free
+  // time window from the ANALYTIC predicted movers. Passed to the solve as a CONVEX conditioner so the
+  // hard-ALM converges instead of stalling (removes the dense-crowd stop-and-go). The movers stay HARD
+  // -> hard_clearance below remains the safety certificate (corridor is not a rejection gate). OFF=null.
+  std::vector<SpaceTimeCuboid> corridor;
+  PlanOptParams lopt = opt;
+  if (opt.use_spacetime_corridor && M > 1) {
+    std::vector<double> tau0(M - 1, 0.0);
+    double cacc = 0.0;
+    for (int i = 0; i < M - 1; ++i) { cacc += S.T0(i); tau0[i] = cacc; }
+    StcParams sp;
+    sp.r_init = (opt.sfc_radius > 0.0) ? opt.sfc_radius : 0.8;
+    sp.r_cap  = 2.0 * sp.r_init;
+    sp.drone_radius = opt.stc_drone_radius;
+    sp.d_safe_dyn = opt.stc_d_safe_dyn;
+    sp.time_dt = opt.stc_time_dt;
+    sp.Th = std::max(opt.stc_Th, S.T0.sum());
+    corridor = build_corridor(S.q0, tau0, soft_obs, hard_obs, sp);
+    lopt.corridor_cuboids = &corridor;
+  }
+
   AlmSolveResult sol = alm_solve(S.start, S.goal, S.q0, S.T0, soft_obs, hard_obs,
-                                 avoid_cfg, opt, v0, a0, deadline_s);
+                                 avoid_cfg, lopt, v0, a0, deadline_s);
   const MinjerkTraj& tr = sol.tr;
   Eigen::VectorXd Tf(M); for (int i = 0; i < M; ++i) Tf(i) = sol.x(nq + i);
 
@@ -842,6 +913,7 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
   }
   C.anytime_feasible = sol.anytime_feasible;
   C.truncated = sol.truncated;
+  C.corridor = std::move(corridor);
   return C;
 }
 
@@ -901,6 +973,7 @@ struct PlanInfo {
   double certificate_margin = 0.0;
   bool anytime_feasible = true;
   bool truncated = false;
+  std::vector<SpaceTimeCuboid> corridor;   // space-time corridor of the chosen candidate (for viz)
 };
 
 inline std::pair<MinjerkTraj, PlanInfo> plan_minco(
@@ -950,6 +1023,7 @@ inline std::pair<MinjerkTraj, PlanInfo> plan_minco(
   info.feasibility = feas;
   info.seed_used = best.seed_name;
   info.n_seeds_tried = (int)candidates.size();
+  info.corridor = best.corridor;   // for viz (empty when space-time corridor off)
   info.init_cost = best.init_cost;
   info.final_cost = best.final_cost;
   info.iter = best.iter;
