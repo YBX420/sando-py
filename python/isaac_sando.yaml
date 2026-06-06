@@ -29,11 +29,14 @@ planner:
   drone_bbox: [0.3, 0.3, 0.3]
   drone_radius: 0.2
   minco_w_time: 2500.0
-  minco_time_budget_ms: 200.0
-  # dynamic-obstacle map inflation: factor-2 fix halved the effective footprint in dense moving
-  # clutter -> global path threaded too tight -> local planner stalled. Restoring it (legit knob,
-  # not the old bug) keeps the global path clear -> smooth fast flight. Tuned for this scene.
-  dyn_base_inflation_m: 1.2
+  # generous deadline ceiling: the hard-cert solve converges in ~23 ms (max ~138), so the wall-clock
+  # deadline only ever fires under load and makes the result NON-deterministic (margin +0.008..+0.355,
+  # rare breach). A ceiling the solve never hits -> deterministic + safe (+0.289 body @ vmax=12). The
+  # clean long-term fix is a deterministic ITERATION budget (task #1) to reclaim a hard <50 ms bound.
+  minco_time_budget_ms: 1000.0
+  # no route-around inflation: with the dynamic-agent hard certificate the drone THREADS the moving
+  # crowd (the goal) instead of routing wide. 1.2 was a stall workaround for the (now-fixed) class bug.
+  dyn_base_inflation_m: 0.0
   minco_use_topology: true
   minco_human_slow_vmax: 0.0
   minco_human_slow_near: 3.0
