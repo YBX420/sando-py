@@ -8,7 +8,7 @@ exactly what obstacle_tracker_kernels.hpp::connected_components reproduces.
 import os, sys, ast
 import numpy as np
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 SRC = os.path.join(ROOT, "sando_py", "nodes", "obstacle_tracker.py")
 
 # --- extract the named defs verbatim from the source and exec them ---

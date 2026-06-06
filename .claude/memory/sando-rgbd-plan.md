@@ -217,3 +217,111 @@ mammoth 上有同名计划 [[sando-rgbd-plan-v2]] + 更全的旧背景 memory。
   - **性能**:dim=10 finite-diff LBFGS,lean 5s/default 15s/iter ~30。研究够,上机需手算梯度或 jit。
 - **下一步**:接 ROS nodes / 接 controller / obstacle_tracker 加 class,或先做 local_opt 二代(multi-start / Adam)解 LBFGS 局部最优。
 - **全套阶段3(15 文件 188 项)+ 全局段(11 文件 91 项)= 26 文件 279 项全绿**。
+
+## ★ Milestone 重定义:「混乱中 hold-or-thread」(2026-06-05 用户拍板,顶替之前的零散收尾)
+用户把第一关锁成一个能力,**比「穿行」更根本**:在绝对混乱的动态人群里,每拍重规划都要同时做到——
+- **(安全)** 对人净空 ≥ d_safe、**零穿透**;尤其**等待时人逼近也要主动避让**(「等待」≠ 冻在原地被人撞)。绝不假报 valid。
+- **(活性,不傻等)** 一旦出现通往目标的可行路(缝一开),**立刻提交穿过去**;没缝就输出**被证明安全的等待/让位**机动,而不是撞或卡死。
+- 用户洞察:这关做到了,**大膨胀导航 + 平面穿缝都是它的特例**。
+
+### 验证型 gap 分析(workflow wpx9c98qz,41 agent,2026-06-05;只读代码,非 docs)
+**总判定:生产里 OPEN。** 零件大多在、且不少**已接线**(anytime 截断 + 拓扑种子已进 `planner.py` 且 isaac_sando.yaml 开着——之前我说「没接」是错的)。但三个已验证的洞打败 milestone:
+1. **「等待」没有主动行为(最大洞)**:`replan` 失败就 `return False`(planner.py:1073-1079),无人机飞完旧 commit 再**冻住**(get_next_goal:1702-1707 重复最后点)。没有刹停/让位。`check_hover_avoidance`(planner.py:1873-1965)是启发式 1/d² 斥力、**默认关、只在 GOAL_REACHED/HOVER_AVOIDING 触发,TRAVELING 规划失败时根本不启动**。→ 人径直走向冻住的无人机,无机制阻止。
+2. **诚实闸在赶 deadline 时放行未认证轨迹**:最终提交只看 `trajectory_valid`(事后 K=200 密采、tol=0.05),**不看 `anytime_feasible`(ALM 证书)**(local_opt.py:594、cpp plan_minco.hpp:942-947)。`_exp_anytime_margin.py` 显示早期迭代 −0.13m 已穿人而冻结证书读 +1.2。
+3. **生产场景零个人、余量全 0**:isaac_sando.yaml 的 60+ 障碍**全是 class:wall(软)**,头牌「人群」demo 从没走硬约束路径;`q_conformal/epsilon_track/v_max_human/a_max_human` 默认 0、YAML 没设——确定性永不撞 + 真行人 Q≈0.926m 全在离线测试。class 源还是写死 id 区间(planner.py:734)。
+
+**两条标准:安全=partial、活性=partial。** 活性好的一面:每拍重规划+anytime+拓扑确实接通、`RT.react` 证明横穿人能躲;缺的:「缝一开就穿」对硬约束人从没验过,拓扑种子是**几何一次性(t=0 选边)**、真正按抵达时刻选边的 `time_aware_seed` 只在 `_anytime_solver.py` 离线、planner 从没 import。
+
+### 6 步搭建顺序(去风险序;优先接线已有零件,不重写)
+1. **证书门**:有 budget 时提交须 `anytime_feasible`,否则保留旧安全轨迹(local_opt.py:594、cpp:942-947)。【安全·绝不假 valid】
+2. **主动 hold/刹停-让位**(← 当前在做):`replan` 失败不再冻住,而是被证明安全地退让。【安全·最大洞】
+3. 默认打开安全余量(确定性速度可达 + epsilon_track),从 Parameters/YAML 接进 OptParams(planner.py:1303-1308)。【安全】
+4. **建头牌验收测试** `stage6_hold_or_thread_chaos.py`:对 class:human 闭环,同考「先等再穿」+「被逼近时让位零穿透」。【两条都证】
+5. 把 `time_aware_seed` 接进生产(按抵达时刻选边)。【活性·见缝就穿】
+6. class 源改 fail-safe(可疑一律当人)+ 可选 z-band 去掉飞越作弊。【安全/穿缝诚实】
+
+**最大风险**:没有主动认证的 hold —— 混乱人群里冻住的无人机会被人撞,正是 milestone 禁止的失败。步骤 1-2 落地并在步骤 4 的硬约束闭环上验过之前,安全声明是空心的。
+- 完整结果:`tasks/wpx9c98qz.output`(194KB)。工作流脚本可 resume:`workflows/scripts/hold-or-thread-gap-analysis-*.js`。
+
+### 架构定版:ABS 式双模式 + 常开监视器(2026-06-05 用户拍板)
+借鉴 **Agile But Safe (ABS, arXiv 2401.17583)** 的「双策略 + 常开 reach-avoid 开关」,但做成**确定性、可证明**版:
+- **Agile 模式** = 正常 MINCO per-class 朝目标(高速见缝穿越)= 活性。
+- **Recovery 模式** = 认证刹停/让位(主动把净空余量拉回来)= 安全兜底。
+- **监视器/开关** = 我们已有的**确定性连续时间证书 + worst-case 可达集余量**当 reach-avoid value(每拍常开;余量<阈值→recovery,恢复且有可行前进路→agile;进/出双阈值防抖)。这就是研究方向里的 **gatekeeper**,ABS 给了它一个被审稿人认可的实例。符号:ABS「RA 值高=危险」↔ 我们「余量≥0=安全」。
+- **全部 model-based,不用 RL**(2026-06-05 用户澄清「为什么一定要用 rl」):ABS 用 RL 只因它是学习型腿足控制;我们只借**架构**(双行为 + 切换用的安全 value),架构本身与方法无关(= 经典 simplex / safety-filter / gatekeeper)。RL 会砸可解释性、而「快」已由 anytime+C++<50ms 解决,故不用。**agile/monitor/recovery 三者全 model-based。**
+- **之前的工作全部复用,没有白做**:agile=已建的 MINCO/ALM/anytime/topology(快+可解释),monitor=已有确定性证书+可达集+conformal Q,全局=heat-A*。唯一不做的 RL 本就没建。
+- **学习 RA value = 不一定学,观望**(用户原话「ra value 不一定要学,我可以观望」):monitor 先用确定性证书;学习版 RA value 仅作可选未来加速器,安全永远压在证书上、不依赖网络。
+- **实现顺序:先做 agile**(用户拍板 2026-06-05),再做监视器 + recovery(= 原 Step 2)。
+- 卖点 framing:ABS 架构的确定性 + 形式化保证版(certificate-as-switch),与 per-class 硬约束证书协同。
+
+### SOTA 全景 + 定位(2026-06-05,3 个 deep-research 工作流,~312 agent 对抗核查)
+结论:整套想法可以全 model-based、确定性、无 RL,每块都有成熟可引的 SOTA 落点;新颖点窄,须严对标。
+- **① Agile/穿缝**:backbone MINCO=GCOPTER(T-RO'22, arXiv 2103.00190),6.8–11.8ms <50ms 级。**注意 EGO-Planner-v2(Sci.Robotics'22)也用 MINCO → MINCO 本身不是新颖点**。穿瞬时缝的关键机制 = **T-MPC/T-MPC++(de Groot et al., T-RO'24, 2401.06021):在 (x,y,t) 空时里按 homotopy 类选边 = 正是你的「抵达时刻选缝」,但用 B-spline+并行 MPC、无 per-class、无 MINCO 连续时间证书 → 头号对标/差异化对象**。其余:EGO-Planner(2008.08835,静态<0.5m/s,自承)、MADER(2010.11061,分离面当决策变量选边,MINVO 最紧包)、RAPTOR/TopoTraj(1912.12644,空间 UVD 多拓扑种子)、FASTER(1903.03558,两轨迹 backup)、Fast-Planner(kinodynamic+B-spline)。
+- **② 监视器不必学**:HJ reach-avoid value(Bansal/Tomlin, 1709.07523)是解析、有形式保证,但维度诅咒(≤5–6 态)→ 离线网格表;学习版(DeepReach 2011.02082 / ABS 的 RA-net)只是逃维度诅咒的**可扩展性工具**,certificate 仍是解析 HJ,网络只是 PDE 逼近器。**学了丢的正是:形式保证→只剩概率、必有网络误差、经验上更保守、要额外离线验证层**。CBF-QP(Ames 1903.11199)解析便宜、最小侵入;C3BF(2303.15871)用相对速度锥躲动态障碍、Crazyflie 100Hz;Composite-CBF 1000 障碍构造 0.485ms(证明「解析也实时」)。→ **你的确定性 per-class 证书(凸包支撑半空间+worst-case 可达集+conformal 分位)是合法的解析 reach-avoid value,与 HJ/CBF/gatekeeper 同 niche,无需学 → 「RA value 不学」是更强的位置(形式保证+可解释)**。CBF 注意:QP 可行性会随状态丢失(要调 γ);C3BF 假设匀速障碍。
+- **③ 双模式架构**:统一理论 = **Hsu/Hu/Fisac「The Safety Filter: A Unified View」(Annual Rev.'24, 2309.05837)**:(fallback policy + safety monitor + intervention) 三元组,Theorem 1:初态在 fallback 下被判安全 ⇒ 任意 task policy 下永远安全;HJ/CBF/shielding/gatekeeper 全是其特例。最近的确定性实例 = **gatekeeper(Agrawal & Panagou, T-RO'24, 2211.14361)**:committed traj = 跟 nominal 到切换时刻、之后接 backup;选「有效候选里切换时刻最大」的提交;**没有有效候选就保留上一条已认证轨迹(天然防抖)**;有限时域验证 + 到达受控不变 backup 集 ⇒ 无限时域安全。Simplex(三件套,2503.10559)、shielding(Alshiekh AAAI'18, 1708.08611,pre/post-shield)、predictive safety filter(Wabersich&Zeilinger 1812.05506,MPC backup)。ABS(2401.17583)= 学习对照(agile/recovery/RA-value/感知 四模块全学,只有底层 PD 是 model-based)。**防抖三法**:① dwell-time/迟滞(Simplex)② CBF/QP 连续混合避免边界 bang-bang(HJ)③ commit 整条+保留上一条(gatekeeper)。→ 我们的 monitor 用进/出双阈值(迟滞)+ gatekeeper 的 commit-retain。
+- **新颖点(medium 置信)**:无单一工作同时具备 per-class 硬软 + MINCO 连续时间 ALM 证书 + 抵达时刻空时拓扑种子 + 证书当 switch。**必做对标:T-MPC(空时拓扑)、gatekeeper(切换架构)、MADER(动态选边)**。
+- **诚实风险**:你的复合证书在**密集人群**里的可行性/保守度**未经外部验证**——CBF/C3BF 在密集人群有「不可行 / 过保守」的已知病(DPCBF 2510.01402、VO-CBF 2503.00606 在批它),需基准验证。conformal 余量对分布漂移的鲁棒性也是 open。
+- 完整结果:`tasks/wx9igho77.output`(agile)、`wpv4urt3k.output`(monitor)、`wj3x33bbe.output`(architecture)。
+
+### Agile 第一刀:抵达时刻拓扑种子 ✅ 实现+测试 2026-06-05
+- 改动(全 model-based、无学习,`minco_time_aware_seed` 默认 False → 逐字节不变):`local_opt.py` 的 `_generate_detour_seeds` 拓扑分支 + `_min_clearance_per_obstacle`(+speed)+ `_passing_side`(+t_eval,用 velocity_at)+ `_make_detour_path`(+centre_override);`DetourConfig` 加 `time_aware_seed`;`types.py` 加 `minco_time_aware_seed`;`planner.py` 两处 DetourConfig 接 `use_taware`。抵达时刻 = 沿种子折线累计弧长 / vmax;违反者判定 + 选边 + 鼓包全按"无人机到那儿时障碍预测位置"。选边 axis 改用**局部路径切向**(避免"路点→障碍"在正侧方退化成沿路方向)。
+- 测试 `test/stage_agile_time_aware_seed.py` **8/8**(开阔=种子层机制,密集=端到端价值)。
+- **★ 诚实发现(重要)**:开阔单/双人横穿,**现有 spacetime ALM 从直线种子就能解到 valid**(优化器先试 original 即早退,topology 种子根本没被用上)——种子**不改变开阔场景结局**。种子的端到端价值只在**密集移动 trap**:4 人横排向 +y 漂移(y=0 缝关闭),几何种子 clr=0.765(擦在 d_safe 下方、仅因 0.05 容差判 valid),**时间感知种子 clr=0.879(真正 ≥ d_safe)**。→ 「见缝就穿」的真正考验是密集 trap = 头牌 Step-4 闭环测试要做的;agile 种子是必要的更好 warm-start,但不是开阔场景的 load-bearing 件。
+- 回归:stage3_minco_perclass 38/38、realtime 10/10、grad 17/17 全绿(默认关逐字节一致)。stage5_planner_minco 的 INT.* 在本 Windows 上**基线就失败**(git stash 验证,非我引入;plan_local_trajectory 返 False,平台相关,Linux/colcon 上才是 28/28)。
+
+### Agile 动态闭环 ✅ 验证 2026-06-05(用户「让他能够在动态中闭环」)
+- 新测试 `test/stage_agile_dynamic_crowd.py` **9/9**:滚动重规划(每拍从当前 pos+vel warm-start、喂人速度预测、commit dt、人按真速度走、子步对所有人密采)闭环穿 3 个移动人群——slalom(3 人交错)/ sweep(4 人横排向 +y 漂移)/ dense(5 人交错)——**全部 start→goal 到达、零穿透**(闭环 min_clr 1.8–2.5,远超 d_safe=0.8);开环 plan-once 全 breach(0.38 / −0.09 / 0.10,判据非空)。重规划中位 57ms / p95 111ms / max 139ms(~17Hz,Python;C++ 再快一个量级)。
+- **诚实 nuance**:① 闭环净空很大(1.8–2.5)= 无人机留宽裕量穿行,**不是贴着 d_safe 的紧穿缝**(当前人群不够紧、且无走廊墙,有限人群总能从外侧绕);② 时间感知 vs 几何种子闭环几乎相同(每拍重规划 + spacetime ALM 主导反应性,种子价值被淹没——印证开阔场景结论);③ 无墙 → 从不"真正被堵" → 不触发 hold/freeze。
+- 结论:**「动态中闭环」达成**;尚缺 (a) 走廊 + 密堵到必须紧穿/必须等的 trap 场景,(b) 没缝时的安全 hold/yield(= 安全半场 monitor+recovery)。这两个连起来才是头牌 Step-4 验收。
+
+### 很堵的走廊 baseline ✅ 2026-06-05(用户「建造一个很堵的走廊」)
+- 新诊断 `test/stage_agile_corridor_trap.py`:窄车道(宽 2.6m,**硬墙夹住**——去掉侧向逃逸,走廊版的"去掉 z-cheat")+ 5 人迎面密集行进(d_safe=0.8)。生产式 harness:只 commit `trajectory_valid` 的计划,否则 hold;无有效计划则原地 hover(= 今天的 freeze)。人照走。
+- **基线(诚实、damning)**:① open-once 第一拍就无可行解 → START 悬停 → 人走过来撞(min_human **−0.29**,HIT-WHILE-FROZEN);② 闭环(几何/时间感知**一样**)→ **冻住 ~30 拍(占一半)**,冻住期间人走进来 → **撞人 −0.29m**;勉强 REACHED 仅因人群最终走光。墙没被穿(硬墙顶住,min_wall +1.3),无人机贴 y≈0 **不躲**。
+- **这就是 recovery 要修的洞**:堵死时今天 = 「冻住悬停 → 被走进来撞」;安全半场要换成「主动让位/刹停,堵死也保持净空」,监视器(证书余量当 reach-avoid)判何时切 agile↔recovery。这是 [[research-direction-speed-safety]] 里 gatekeeper / ABS 双模式的落地点。
+
+### Agile-review 结论(workflow wky6zw44s,37 agent,2026-06-05)— 印证用户「别叠组件、要结构性优化」
+- **我加的时间感知种子 = 窄而小**:只在密集 trap 起效、~0.06m;开阔/人群里 replanning+ALM 从直线种子就解了。**不是 agile 杠杆,别吹**(review honesty_note 原话)。大部分发现 = 「defer,藏在默认关的开关后」→ 旗标增生坐实。
+- **真正的 agile 杠杆是结构性的**:优化器**不 commit 到选定的缝**——SFC 走廊默认关(w_corridor=0)+ 软墙弱三次罚(d≥d_safe 梯度=0)→ 种子鼓的绕行被 L-BFGS 拉回直线「口袋」;加 early-exit-on-first-feasible 从不比较左右缝(T-MPC/MADER 才比)。→ 开阔过度保守(1.8-2.5)、走廊贴中线不躲。**「认准一条缝守住 + 比较缝」比任何种子细节高一个量级,且是去冗余不是加料。**
+- **2 个真小 bug(便宜、同处,fix-now)**:① `ta_vertex` 在 pre-bulge 直线路算一次、bulge 后(更长)仍复用 → 多人时第 2+ 绕行用错抵达时刻(local_opt.py:414-438,循环内重算即可);② 抵达时刻用纯 vmax 无视 v0/加速爬升(≈0.06m,改 `_ta_speed=0.5(‖v0‖+vmax)`)。
+- **1 个证书结构性疣(do-with-safety,HIGH)**:`tau_trust=0.75s` 是硬/软**悬崖**——vmax=3 下仅 ~4/30 控制点硬 ALM,其余 ~26 被翻成弱软罚(g=−1e9 关掉)→ 远端轨迹欠约束。改「超窗口用膨胀 R 而非关掉」;与安全半场一起做(共用机制)。
+- **2 条 reviewer 主张被验证组推翻**(不采纳):j_close==0 时不算 tangent(实际无条件算);fallback axis 在 _passing_side 之后(实际在之前 L435 覆盖)。determinism 担心也被推翻(无 RNG)。
+- **结构脊柱(定论)**:一个证书 = reach-avoid value,三用(agile 优化奔目标 s.t.证书≥0 / monitor 每拍算它 / recovery 最大化它)。种子 4 套→合 1;余量→已统一为撑大 R;bspline/Gurobi→死路隔离或删;旗标→收成几个模式。安全半场以「复用证书」落,不加新组件。完整结果 `tasks/wky6zw44s.output`。
+
+### 瘦身 SLIM(2026-06-05,用户拍板「先瘦身 纯减法」)
+- **SLIM-1 ✅**:删掉本会话加的独立旗标 `Parameters.minco_time_aware_seed`(types.py),`planner.py` 改 `time_aware_seed=use_topo` —— **拓扑种子默认即抵达时刻感知**(静态退化、core 单测不开 topology 不受影响)。少 1 flag/概念。验证:agile 8/8 + 9/9、stage3_minco_perclass 38/38、realtime 10/10 全绿,核心无残留引用。`DetourConfig.time_aware_seed` 内部字段保留(单测/消融用)。
+- **诚实重估(blast radius 摸底后)**:真正的「臃肿」**不是死文件**(solver_gurobi.py / bspline plan() 已是隔离的独立件,且是 paper 的对照基线 + 被 stage5/smoke 测试依赖)——**而是多套重叠的种子机制 + flag sprawl**。所以:
+  - **SLIM-2(下一刀,= 结构主菜 + agile 杠杆同一件事)**:把 ±u/±v 盲搜 multistart + 拓扑 + 时间感知合成**一个抵达时刻 homotopy 种子器**,并**生成左右两侧、比较取优**(替 early-exit),让优化器认准一条缝。中高回归风险(动默认 detour 路径 + stage3/5 测试),要逐步 + 回归。
+  - **Gurobi/bspline:建议「保留为带标签的基线/oracle」而非删**(删要改 stage5 spy + smoke import,且丢 paper 基线)。删与否待用户定。
+  - **flag→模式**:多为 paper 消融旋钮,应保留可达;只加一层「profile」便利层,不急。
+
+### ★ 转 C++ 为核心,Python 冻结 legacy(2026-06-05 用户拍板)
+- 用户:「核心改动放 cpp,Python 最终成 legacy,纯 control 在 python 没意义」「python 可做可视化/测试,不作算法」。契合「Python 不上机」+ 不做 RL。
+- C++ 在本机 `cpp/`:`include/sando_cpp/*.hpp`(22 核心头,忠实端口)+ `capi/sando_capi.cpp`(DLL 桥)+ `ros2/`(Linux/colcon)+ vendored Eigen/LBFGSpp。**Glob 默认基准是 python/,看 cpp 要传 `path=…\cpp`。**
+- **本机能编译能验证**:Strawberry 自带 cmake/g++/ninja(`C:\Strawberry\c\bin`)。`cmake -S cpp -B cpp/build -G "MinGW Makefiles"` → `cmake --build` → `ctest` = **19/19 golden 全过(4.2s)**,对 `cpp/golden/*.txt`(源自 Python = golden oracle)。
+
+### C++ 架构审计(workflow wufpiuez4,2026-06-05)
+- 三层:全局 heat-A*(**只空间,无时间轴**)→ 局部 MINCO+ALM(plan_minco.hpp / local_opt*/minco_cost_grad)→ 编排 SANDO(planner.hpp:replan 5 段)。失败返回 `{false,true}` = 试了没成、**无 recovery、冻住旧 deque**。
+- **卡住根因(排序,file:line)**:#1 软墙罚 d≥d_safe 梯度=0(`local_opt_terms.hpp:198`)→ 绕行只剩平滑力被拉回直线;#2 守住绕行的走廊默认关(`w_corridor/sfc_radius=0`;管心接线已就位 `plan_minco.hpp:625`);#3 有预算 early-exit 第一个可行(`plan_minco.hpp:935`)不比较缝;#4 全局无时间轴 → 局部独扛动态。**#1+#2 连体=病根。**
+- **C++ 已很瘦**:MINCO-only(Gurobi/SFC/bspline 基线 NOT ported)。~7700 行,~250-300 死;三块:`anytime_feasible.hpp`(~220 行 A+B 写全但生产没 include,**该提拔非删**)、Gurobi/bspline parity 残留参数、k_value 3 策略中 2 条 legacy + safety flag sprawl(收成 SafetyConfig)。核心 MINCO/hard-ALM/avoid_config/几何/C-ABI 干净。
+- **agile/safe 分法**:今天揉一起、safe-recovery 不存在。**共享 reach-avoid 值已现成 = 证书 margin `-max(g)`(`plan_minco.hpp:834`,现仅 telemetry)→ 拿它当 gatekeeper,别造第二个**。建议:AGILE=plan_minco+走廊ON+两侧比较;SAFE=新 `reach_avoid.hpp`(~80,复用 alm_constraints 当监视器)+ `recovery.hpp`(~60,hold/decel 注 deque)+ 2 枚举态(HOLDING/YIELDING)接进 replan。净 +150/−250,拆分反更瘦。完整结果 `tasks/wufpiuez4.output`。
+
+### ★ 走廊实验 ✅ 实锤根因+修复(2026-06-05,`cpp/test/bench_corridor.cpp`,直打生产 plan_minco)
+- **场景A 软墙挡直路**:走廊 OFF → min 墙净空 **−0.122(轨迹穿进软墙!)**、max|y|=0.38(绕行散架被拉回直线;valid 还=1,因软墙不卡 valid);走廊 ON(w=50,r=0.6)→ **+0.779**、max|y|=1.30(绕行守住)。→ **#1+#2 实锤,走廊一开就治。**
+- **场景B 隧道软墙+硬人**:硬人净空恒 ~0.82(ALM 本就顶,与走廊无关);走廊 ON 更居中不蹭软墙(max|y| 0.72→0.24,墙净空 0.585→1.056)。
+- **注意**:`bench_tunnel` 用 A+B(af_*)离线求解器,**测不到 plan_minco 的走廊**——审计「在 bench_tunnel 验」不准,故新写 bench_corridor 直打 plan_minco。
+- **下一步**:走廊在生产**默认开会破 golden**(需重生成 golden_cases)→ 要么作「agile 模式」配置开、要么重生成 golden。动态移动缝还需「管心套在抵达时刻种子上」+ 两侧比较(=SLIM-2)。本机直编:`g++ -std=c++17 -O2 -I cpp/include -I cpp/third_party/eigen -I cpp/third_party cpp/test/bench_corridor.cpp -o cpp/build/bench_corridor.exe`。
+- **后续 C++ commits**:`e6a7b6a` 走廊默认开(50/0.6)+ ctest 19/19;`cf20da7` `bench_crowd` 闭环人群(走廊 ON 把卡壳 5→0、更快);`c601449` bench_corridor 实验。**用户决定不再卡 golden,C++ 为主线**(改默认有意偏离 Python-golden;gated 测试不受影响因从 case 造 opt)。
+
+### ★ 安全半场 step1:recovery bench ✅ 2026-06-05(`cpp/test/bench_recovery.cpp`,commit c624827)
+- 很堵走廊(硬墙车道 |y|<=1.3 + 5/3 个迎面人,plan_minco 真失败→必须等)。**baseline 冻住 → 被走进来撞穿身体 min_human=−0.290(HIT)**;**recovery-v1 主动让位(最大化净空的移动,可退到走廊外开阔区)→ +2.97(5人)/+3.70(3人),≥d_safe 且都到达**。前瞻监视器(余量<d_safe+0.5 早让)在此 = reactive。→ **安全半场机制成立**:不冻住、主动退让保净空、人过了再走 = hold-or-thread 的「安全等」那半。
+- **诚实边界**:kinematic bench + 几何让位(5 候选方向),**还没接进生产 planner**;退得保守(退到开阔区,净空很大)。
+- **下一步(生产化)= audit Q5**:`reach_avoid.hpp`(复用证书 margin `-max(g)` 当 reach-avoid 监视器,plan_minco.hpp:834)+ `recovery.hpp`(yield/brake 注入 deque)+ HOLDING/YIELDING 枚举,接进 `planner.hpp` replan 的失败/breach 处({false,true} 冻住 → 改主动让位)。test_planner golden 大概率不受影响(nominal 不走失败路)。
+
+### ★ 安全半场 生产接线 + 端到端验证 + bug 修复(2026-06-05,commits 42d7a3f / 5933b39)
+- **建好的**:`reach_avoid.hpp`(监视器,复用 Obstacle::signed_dist 当 reach-avoid 余量)+ `recovery.hpp`(`yield_target` 最大化净空的让位)+ `planner.hpp::recovery_yield()` 接进 replan 失败处 + `types.hpp recovery_enabled`(默认 true)+ capi/bridge 加 `recovery_enabled` toggle。走廊默认 50/0.6。ctest 19/19 全程绿。
+- **★ 端到端验证暴露的两件事(`python/_isaac_recovery_test.py`,经生产 DLL A/B)**:
+  1. **真系统里 freeze-gets-hit 罕见**:墙是软的 → 无人机直接**飞出走廊躲硬人**(max|y|=4.12 ≫ lane 1.3)→ 不会冻在走廊被撞。bench 的「冻住被撞」是**硬墙 artifact**。
+  2. **我第一版 recovery 是回归**:挂在「plan 失败」上 = 过度触发(失败≠危险),用让位替掉还安全的前进计划 → 让位死循环。A/B:ON **280 fails / 到不了** vs OFF 到达。
+- **修复(5933b39)**:`recovery_yield` 自带**人体危险门**——只在「硬人 clearance < d_safe+0.5(0.6s horizon)」才让位,否则 return false 照常 hold(像旧行为)。修后 A/B **ON ≡ OFF(都到达、min_human +2.863、4 fails)= 回归消除**。recovery 现在是**有门控的安全网**(有逃生口时 no-op)。
+- **教训**:bench 隔离验证 ≠ 生产验证;端到端一验就抓出过度触发 + 软墙逃生口两个真相。**recovery 触发条件该是监视器(committed 计划余量),不是规划失败**——现用「当前人体 clearance 门」是其简化版,够修回归;完整版 = 每拍监视 committed 计划。
+- **未做**:还没构造「真无逃生口(开阔四面围人)」场景证明 recovery 正向有用(软墙系统里很难造)。SLIM-2(agile 抵达时刻种子+两侧比较移 C++)仍待做。

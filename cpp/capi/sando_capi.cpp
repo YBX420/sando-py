@@ -54,14 +54,17 @@ SANDO_API void params_set_double(void* ph, const char* name, double v) {
   D(dynamic_factor_initial_mean); D(factor_initial); D(factor_final); D(factor_constant_step_size);
   D(obst_max_vel); D(obst_position_error); D(max_gurobi_comp_time_sec); D(jerk_smooth_weight);
   D(traj_lifetime); D(alpha_k_value_filtering); D(k_value_factor); D(alpha_filter_dyaw); D(w_max);
-  D(minco_time_budget_ms); D(minco_w_time);
+  D(minco_time_budget_ms); D(minco_w_time); D(minco_w_vel); D(minco_w_accel);
   D(minco_human_slow_vmax); D(minco_human_slow_near); D(minco_human_slow_far);
   D(minco_sfc_radius); D(minco_w_corridor);
+  D(replan_dt); D(dynamic_speed_thresh); D(pred_horizon_s);
+  D(stc_d_safe_dyn); D(stc_time_dt); D(stc_Th); D(stc_w_time); D(st_w_wait);
   D(w_max_yawing); D(yaw_spinning_dyaw); D(default_goal_z); D(hover_avoidance_d_trigger);
   D(hover_avoidance_h); D(hover_avoidance_min_repulsion_norm);
   I(visual_level); I(hgp_timeout_duration_ms); I(max_num_expansion); I(los_cells); I(heat_p);
   I(heat_q); I(heat_num_samples); I(static_heat_p); I(num_P); I(num_N);
   I(num_replanning_before_adapt); I(default_k_value); I(yaw_spinning_threshold);
+  I(st_NS); I(st_NT);
   else std::printf("[sando_capi][warn] params_set_double: unknown field '%s', skipped\n", name);
 #undef D
 #undef I
@@ -80,7 +83,8 @@ SANDO_API void params_set_bool(void* ph, const char* name, int v) {
   B(static_heat_enabled); B(static_heat_boundary_only); B(static_heat_apply_on_unknown);
   B(static_heat_exclude_dynamic); B(use_soft_cost_obstacles); B(use_dynamic_factor);
   B(inflate_unknown_boundary); B(using_variable_elimination); B(skip_initial_yawing);
-  B(minco_use_topology);
+  B(minco_use_topology); B(minco_retime_overshoot); B(recovery_enabled); B(inflate_walls_by_body);
+  B(use_spacetime_corridor); B(use_st_graph);
   B(force_goal_z); B(debug_verbose); B(ignore_other_trajs); B(hover_avoidance_enabled);
   B(hover_avoidance_2d);
   else std::printf("[sando_capi][warn] params_set_bool: unknown field '%s', skipped\n", name);
@@ -93,7 +97,7 @@ SANDO_API void params_set_string(void* ph, const char* name, const char* v) {
 #define S(field) else if (k == #field) p.field = val
   if (k == "sim_env") p.sim_env = val;
   S(vehicle_type); S(flight_mode); S(global_planner); S(local_solver);
-  S(environment_assumption); S(dynamic_constraint_type);
+  S(environment_assumption); S(dynamic_constraint_type); S(avoid_override);
   else std::printf("[sando_capi][warn] params_set_string: unknown field '%s', skipped\n", name);
 #undef S
 }
@@ -191,6 +195,22 @@ SANDO_API int sando_get_global_path(void* h, double* out, int max_pts) {
   if (n > max_pts) n = max_pts;
   for (int i = 0; i < n; ++i) {
     out[3 * i] = gp[i][0]; out[3 * i + 1] = gp[i][1]; out[3 * i + 2] = gp[i][2];
+  }
+  return n;
+}
+
+// fills out[9*N] with the space-time corridor: per cuboid [lo(3), hi(3), t_l_abs, t_u_abs, seg].
+// time windows are ABSOLUTIZED (last_A_time_ + t) for the viz clock. returns N (clamped to max_n).
+SANDO_API int sando_get_corridor(void* h, double* out, int max_n) {
+  const auto& cb = static_cast<SANDO*>(h)->get_corridor();
+  double At = static_cast<SANDO*>(h)->get_corridor_A_time();
+  int n = static_cast<int>(cb.size());
+  if (n > max_n) n = max_n;
+  for (int i = 0; i < n; ++i) {
+    double* o = out + 9 * i;
+    o[0] = cb[i].lo[0]; o[1] = cb[i].lo[1]; o[2] = cb[i].lo[2];
+    o[3] = cb[i].hi[0]; o[4] = cb[i].hi[1]; o[5] = cb[i].hi[2];
+    o[6] = At + cb[i].t_l; o[7] = At + cb[i].t_u; o[8] = (double)cb[i].seg;
   }
   return n;
 }

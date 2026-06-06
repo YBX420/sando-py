@@ -25,7 +25,7 @@ Run: python cpp/golden/gen_minco_cost_grad_golden.py
 import os, sys
 import numpy as np
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 sys.path.insert(0, ROOT)
 
 from sando_py.local.minco import MinjerkTraj
@@ -141,6 +141,11 @@ def make_case(name, start, goal, q, T, v0, a0, vf, af, obstacles, opt,
     lines.append(f"V_MAX_HUMAN {repr(float(opt.v_max_human))}")
     lines.append(f"EST_POS_ERR {repr(float(opt.est_pos_err))}")
     lines.append(f"EST_VEL_ERR {repr(float(opt.est_vel_err))}")
+    # SFC corridor — only dumped when active so existing cases stay byte-identical
+    if opt.w_corridor > 0.0 and opt.corridor_radius > 0.0 and opt.corridor_centers is not None:
+        lines.append(f"W_CORRIDOR {repr(float(opt.w_corridor))}")
+        lines.append(f"CORRIDOR_RADIUS {repr(float(opt.corridor_radius))}")
+        lines.append(f"CORRIDOR_CENTERS {fmt(opt.corridor_centers)}")   # (M-1,3) flat
     # per-class cfg (dump every class referenced by ANY obstacle so the lookup matches)
     classes = sorted(set(o.class_name for o in obstacles))
     lines.append(f"NCLASS {len(classes)}")
@@ -402,6 +407,16 @@ for ridx in range(16):
     rho = float(rng.uniform(2.0, 35.0))
     make_case(f"fuzz{ridx}_M{M}", *st, obs, opt, lam_scale=lam_scale,
               rho=rho, freeze=freeze)
+
+# SFC soft flight-corridor active (placed AFTER the fuzz loop so it does not perturb the fuzz
+# RNG stream -> all prior cases stay byte-identical). No obstacles -> the corridor term is isolated
+# (smooth + vel/accel/time + corridor). Tube centres shifted off the waypoints so some q_i leave
+# the radius -> non-trivial pull-back cost+grad. Exercises the (previously Python-dormant) term.
+st = rand_traj(4)
+_centers = st[2] - np.array([0.0, 1.1, 0.0])   # (M-1,3) shifted so several wpts leave the tube
+make_case("sfc_corridor", *st, [],
+          mk_opt(w_corridor=80.0, corridor_radius=0.4, corridor_centers=_centers),
+          lam_scale=0.0, rho=0.0, freeze=False)
 
 
 out = os.path.join(os.path.dirname(__file__), "minco_cost_grad_cases.txt")

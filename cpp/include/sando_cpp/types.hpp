@@ -485,6 +485,12 @@ struct Parameters {
   double z_min = 0.5;
   double z_max = 6.0;
   double drone_radius = 0.2;
+  // Body-aware (configuration-space) avoidance: inflate soft walls by drone_radius so the local
+  // solve avoids with the quad's BODY, not as a point. This is robot-radius C-space inflation
+  // (textbook), NOT the route-around dyn_base_inflation_m — it only restores the body the
+  // point-model dropped, so the soft d_safe is then measured body-to-box. Default false so the
+  // golden point-model oracle is unchanged; production turns it on.
+  bool inflate_walls_by_body = false;
   int hgp_timeout_duration_ms = 1000;
   int max_num_expansion = 100000;
   bool use_free_start = true;
@@ -601,11 +607,34 @@ struct Parameters {
   double jerk_smooth_weight = 10.0;
   bool using_variable_elimination = true;
 
+  // ---- moving-obstacle avoidance (2026-06: compute a real margin or honestly degrade) ----
+  // replan cadence (s). >0 -> commit-ahead in find_A_and_Atime is capped to ~(replan_dt - dc) so the
+  // EXECUTED front of the deque is at most ~one replan old and fresh plans actually take effect (else
+  // the drone flies a frozen stale segment and local avoidance is inert). 0 -> old budget-only formula.
+  double replan_dt = 0.0;
+  // a "wall" whose snapshot speed >= this reclassifies to the hard, motion-aware "dynamic" class
+  // (continuous-time ALM certificate via a bounding sphere). 0 -> off (every wall stays soft/static).
+  double dynamic_speed_thresh = 0.0;
+  // per-class avoidance override: "" -> per-class; "soft"/"hard" force all (production field, not a backdoor).
+  std::string avoid_override = "";
+  // motion-aware GLOBAL guide: >0 -> predict each obstacle forward over this horizon (s) and feed the
+  // samples to the dynamic-heat tube so heat-A* threads gaps that are OPEN AT ARRIVAL, not gaps open NOW
+  // (which a moving box closes by the time the drone gets there -> local stop-and-wait). 0 -> off (single
+  // snapshot, golden-identical). Soft cost only (no hard future-occupancy) so it cannot over-block to a stall.
+  double pred_horizon_s = 0.0;
+
   // Anytime-feasible / gatekeeper (computation-invariant safety). Default OFF -> baseline +
   // every golden byte-identical; the deterministic certificate-first stack activates only when set.
   double minco_time_budget_ms = 0.0;   // >0 -> hard per-replan compute deadline for plan_minco
   bool minco_use_topology = false;     // True -> deterministic H-signature passing-side seed
+  // retime-on-overshoot: a pure velocity/acceleration overshoot is collision-SAFE; instead of the
+  // gatekeeper holding (braking to 0 -> large average-speed loss), dilate the committed setpoints so
+  // EXECUTED speed respects v_max (fly the same path a bit slower). Clearance/hard violations still
+  // hold. Default OFF -> every golden byte-identical (retime factor stays 1).
+  bool minco_retime_overshoot = false;
   double minco_w_time = 10.0;          // MINCO time-anchor weight: higher -> faster, lower -> smoother
+  double minco_w_vel = 100.0;          // velocity-hinge weight: higher -> respects v_max harder (fewer rejects)
+  double minco_w_accel = 100.0;        // acceleration-hinge weight: higher -> respects a_max harder
   // speed-aware per-class avoidance: ramp v_max down near a human so the planner swerves instead
   // of braking; full speed when clear. Off when slow_vmax<=0.
   double minco_human_slow_vmax = 0.0;  // routing-feasible v_max next to a human (0=off)
@@ -613,9 +642,30 @@ struct Parameters {
   double minco_human_slow_far = 9.0;   // m: at/above -> full v_max
   // Safe Flight Corridor (SFC): tube of radius minco_sfc_radius around the global-guide seed
   // waypoints; minco_w_corridor penalises leaving it. Stops the soft local optimiser drifting
-  // off the guide into a clutter pocket. Both 0 => OFF (golden byte-identical).
-  double minco_sfc_radius = 0.0;       // m: tube radius (0=off)
-  double minco_w_corridor = 0.0;       // corridor penalty weight (0=off)
+  // off the guide into a clutter pocket (the root cause of "detour relaxes to straight" sticking).
+  // DEFAULT ON (cpp-port main line; validated by bench_corridor: soft-wall clearance -0.122 -> +0.779).
+  // Soft penalty (cannot cause infeasibility); hard humans stay ALM-enforced regardless.
+  double minco_sfc_radius = 0.6;       // m: tube radius (0=off)
+  double minco_w_corridor = 50.0;      // corridor penalty weight (0=off)
+  // Safe-Interval SPACE-TIME corridor: per-waypoint static-free cuboids + collision-free time windows
+  // (from analytic predicted movers; oscillation-exact). Convex stay-in-box conditioner that makes the
+  // hard-ALM converge instead of stalling in dense crowds -> removes stop-and-go. Reuses minco_sfc_radius
+  // (box half-extent) and minco_w_corridor (penalty weight). Default OFF -> golden byte-identical.
+  bool   use_spacetime_corridor = false;
+  double stc_d_safe_dyn = 0.5;         // mover keep-out used for the time window
+  double stc_time_dt    = 0.1;         // window sampling cadence (s)
+  double stc_Th         = 1.5;         // window horizon (s, local time)
+  double stc_w_time     = 0.0;         // explicit-T window hinge (escape hatch, off)
+  // Space-time FRONT-END (ST-graph speed planner): time the moving gaps -> seed T0 so the drone slows to
+  // pass when the gap opens instead of braking to 0. q0 unchanged. Default OFF -> golden byte-identical.
+  bool   use_st_graph = false;
+  int    st_NS = 12;                   // stations along the guide (NT >> NS so vmax is representable)
+  int    st_NT = 48;                   // time levels in [0, Th]
+  double st_w_wait = 1.0;              // slow/wait bias
+  // SAFE half: on a FAILED forward replan, actively yield (recovery.hpp) instead of freezing the
+  // stale plan. Default ON (cpp-port main line); only fires when plan_minco finds no valid plan,
+  // so nominal/golden behaviour is unchanged.
+  bool recovery_enabled = true;
 
   // Dynamic obstacles
   double traj_lifetime = 7.0;

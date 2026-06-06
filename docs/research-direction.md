@@ -81,3 +81,72 @@
 
 **逐级门槛**:RAL/ICRA = 你的栈 + 单域 + 两条截断不变曲线(现在就能);Science Robotics = + 命名原理 + optimizer⊗fallback 耦合定理 + 有说服力的(近)真实人群 demo;Nature = + 跨域(无人机+车/机械臂)**或**深到意外的通用定理。
 **关键**:不管冲哪级,**第一步实验都是 §7 那个**——它既是会议论文核心,又是证明这条原理的第一个实例。
+
+---
+
+## 11. 综合裁决:锁定「A 主攻 + B 前端」(2026-06-04,第 5 个 deep-research:时空穿移动缝 SOTA + novelty gap)
+> 24 篇主源(UPenn GRASP / TU Delft AMR / MIT-ACL / HKUST / JHU)、25 条断言 3 票对抗验证(23 确认 2 枪毙)。**结论:确认并收紧 §0–§10 —— 主攻 A(per-class anytime-feasible 证书),B(timing-aware 时空拓扑)降级为前端配件,C 为最终落地。**
+
+**新增的承重证据(literature 没有,你这两天实测独有 = 最强 motivation 图):**
+- **「算力越多越差」**:budget 给足 → 完全收敛的解反而在密集移动 clutter 卡死(avg 0.7,90% 无效);anytime 截断在中间迭代反而能走。这是 optimize-then-check 架构坏掉的铁证 → 直接论证「要的是可证明可行的中间解,不是收敛解」。
+- **超速→validity gate 拒→gatekeeper 刹停**:卡死的直接根因 = 收敛解不可行被后验拒。**anytime-feasible(每迭代可行)从构造上消灭这个拒绝** → §7 实验的 before/after 对照天然成立(before=卡死,after=穿过)。
+- 实测可行配置:dyn_base_inflation_m=1.2 + minco_w_time=2500 + v_max=12 → **持续巡航 8.48 m/s 穿密集移动场**(安全 clr+1.15);但高 w_time/v_max 时**解算崩(plan_minco 抛 all-seeds-failed)** → 印证「需要可行性恢复 / 可行种子」这条命门。
+
+**三轴 novelty gap(每个 SOTA 只占两格,空交集 = 你):**
+| 方法 | 时空穿移动缝 | 硬安全(证书级) | anytime-feasible <50ms |
+|---|:-:|:-:|:-:|
+| T-MPC++ (2401.06021) | ✓ | ✗ 软 | ~ 截断**选优**,非逐迭代可行 |
+| MIGHTY (MIT-ACL 2511.10822) | ✓ | ✗ 软 EGO 线 | ✗;硬件 6.7 m/s 静态 |
+| SS-QCQP (JHU 2511.19675) | ✗ | ✓ 离散时间前向不变 | ✓ |
+| P-CBF (2606.00297) | ~ horizon | ✓ | ~ |
+| ST-GCS (IROS'25) / SSC (HKUST RA-L'19) | ✓ 硬走廊 | ✓ | ✗ 秒级离线/多机预约 |
+| SPOT (2602.01189, 2026-02) | ✓ 4D | ✗ 软 + 纯静态势场兜底 | ✗ |
+| **你(目标)** | ✓ | ✓ | ✓ |
+
+**A 与 B 互锁(不是两个独立大工程)**:A 的命门是「SS-QCQP 要每拍可行初值 g(x⁰)≤0」;**B(时空拓扑向导)正是喂可行种子 + time 准移动缝的前端**,且直接复用现有 detour/topology 扩到时空即可,别在 B 上猛投 novelty。报告 open-Q#3 原话:**「没有任何文献把 per-class 差异化机制和 anytime-feasible 求解器结合」——这就是最独有的空位**。
+
+**收紧后三篇必读**:SS-QCQP `2511.19675`(anytime-feasible primitive + 修 Maratos 丢不变性)、T-MPC++ `2401.06021`(时空 H-signature 拓扑,有开源 tud-amr/mpc_planner)、SIMP/UTVD `2409.10647`(穿移动缝的时空拓扑等价判据,UPenn Kumar 组 ICRA'25)。补充:P-CBF `2606.00297`(整段 horizon 硬证书,和你 ALM 证书哲学契合)。
+
+**第一步 = §7 实验**(不变):把一次 ALM 内层换成 feasible-direction + deadline 截断,量(i)任意截断时刻人净空 ≥ 阈值、(ii)anytime 版穿过去而 optimize-then-check 卡死(对照基线已有)、(iii)5 行人 <50ms。
+
+### 11.1 第一个结果(2026-06-04,原型已跑通 → 核心主张证实)
+- **探针**:`python/sando_py/local/local_opt.py` 加了门控 `_ALM_OUTER_TRACE`(默认 None,零开销,golden 安全)记录每个外层 ALM 迭代的 (max_g, x)。
+- **BEFORE**(`python/_exp_anytime_margin.py`):密集移动行人下,当前 optimize-then-check 的 ALM **每个迭代都人体不可行**(min_clr<0,在撞人),first-certified-feasible = None → 早截断没有可 commit 的安全轨迹。**额外挖到**:冻结法向证书会报 max_g<0(声称可行)而真实 min_clr<0(在撞)—— 现有 validity gate 的 soundness 漏洞,待复核。
+- **AFTER**(`python/_exp_anytime_feasible.py` → `media/_exp_anytime_feasible.png`):实现了 **feasible-direction 内层原型**(SS-QCQP-lite:方向 u=argmin ½‖u+∇f‖² s.t. ∇gₐ·u ≤ −α gₐ via SLSQP + 回溯到真实可行)。从一个可行起点出发:**feasible-direction 的每一个迭代 min_clr ≥ d_safe(绿线全程在阈值上,边优化边保持)**;而 plain cost-descent(当前内层本质)第 3 迭代就跌破 d_safe(橙线进不安全区)。**= computation-invariant 行人安全这条主张的第一张实证图。**
+- **原型 caveats(诚实)**:① 约束 Jacobian 用有限差分(非 <50ms 级)→ 下一步要用 MINCO banded 结构的解析 ∇g;② 静态行人 + 手工可行起点 → 下一步上动态行人 + 可行性恢复(命门 open-Q#1:每拍可行 warm-start);③ 还没接进生产 `_alm_solve`(门控接入是后续)。
+- **下一步顺序**:(1) 解析 banded ∇g 替掉有限差分 + 量单解 ms;(2) 动态行人 + 用拓扑/上一帧解做可行 warm-start;(3) 门控接进 `_alm_solve`(默认关→golden 安全)+ 闭环测「截断率 vs 行人密度」「截断后净空恒≥阈」两条防御曲线。
+
+### 11.2 A+B 集成原型:卡住问题(机制级)已解(2026-06-05,`python/_exp_solve_stall.py` → `media/_exp_solve_stall.png`)
+动态密集行人场景(3 个横穿走廊的行人)端到端跑通 A+B,**当前求解器撞人/失败处 A+B 安全穿过**:
+- **B(time-aware 拓扑种子)**:每个路点按「它将抵达的时刻」选过障侧、取偏离最小的清空 y(紧贴缝穿)。
+  实测 **time-aware 种子 min-clr=0.766 vs static-snapshot 0.049** —— 量化了时空价值:静态快照选错侧正是当前规划器卡死的根因。
+- **Phase-1 可行性恢复**(`restore_feasible`,梯度下降总违反量)把种子推进可行集(0.984 ≥ d_safe)—— 堵 A 的命门 open-Q#1(每拍可行 warm-start)。
+- **A(feasible-direction)+ 走廊引导**:紧贴缝穿过,**每个迭代 min 人体净空恒 = 0.800 ≥ d_safe**(任意截断都安全);对照当前 `_optimise_one_minco` 撞人(min_clr=−0.14, valid=False)。
+- **意义**:这是「绕行=局部穿不动」这个症状的**机制级解** —— B 给对的 homotopy 可行种子破 pocket + time 移动缝,A 保证截断安全。证明了路线成立。
+- **离生产「完全解决」还差(诚实)**:① 单次开环解、3 行人(非 120 障碍闭环);② 有限差分 Jacobian(非 <50ms);③ 没接进 receding-horizon 闭环。→ 生产化 = §11.1 的 (1)-(3)。
+
+### 11.3 闭环 + 密集 + 防御曲线(2026-06-05,`python/_anytime_solver.py` + `python/_exp_production.py` → `media/_exp_production.png`)
+把 §11.2 推进到 **receding-horizon 闭环 + 6 个横穿移动行人 + 防御曲线**,端到端证明 A+B 解卡住:
+- **解析 banded 梯度**(替掉有限差分):`_alm_constraints` 给逐约束解析 g + 外法向 a,`dg/dq=-aᵀ·dP/dq`,dP/dq 对固定 T 一次性算 → 每迭代不再有限差分 clearance(从 87ms/迭代降到 ~30ms/迭代)。
+- **可行性恢复**(Phase-1,堵 A 命门)+ **time-aware 拓扑种子**(B)+ **fast feasible-direction**(A,带 deadline 截断)。
+- **闭环结果**:A+B **reached=True 到达 x=14.0,全程 min 人体净空 +0.885 ≥ d_safe**;**每拍截断不变性 95%**(本拍每个迭代净空都 ≥ d_safe → 任意截断都安全);对照**当前求解器(静态快照 + optimize-then-check)卡死在 x=0.4**(复现卡住症状)。
+- **soundness 修正**:可行性检查必须用【采样连续时间净空】或 degree-elevated 时空证书 —— **解析控制点 g 对移动行人不 sound**(凸包性质只对静态成立;控制点间时刻人移动了)。这正坐实了 §11.1 发现的「冻结证书 soundness 漏洞」,且 A 的连续时间证书是它的解。
+- **唯一剩下的缺口 = <50ms**:Python+scipy ~383ms/replan(scipy SLSQP 方向子问题 + Python 开销主导)。**解析 banded 结构已就位(这是 <50ms 的前提)**,但 Python 到不了 —— <50ms 是 **C++ 端口任务**(把内层方向 QP 换成 banded 解,替掉 scipy SLSQP)。即:机制 + 闭环 + 防御曲线全部做出,<50ms 待 C++。
+
+### 11.4 C++ 端口:<50ms 达成 → 四个缺口全关闭(2026-06-05,`cpp/include/sando_cpp/anytime_feasible.hpp` + `cpp/test/bench_anytime.cpp`)
+把 §11.3 的 A+B 闭环移植进 C++ 引擎(复用 `alm_constraints` 解析 g/法向、`minco_cost_grad`、`MinjerkTraj`、`hard_clearance`),**方向子问题用 Gauss-Seidel 投影替掉 scipy SLSQP**(微秒级,无 QP 库),编译 -O2 独立 benchmark。同一密集场景(6 个横穿移动行人)闭环 receding-horizon:
+- **<50ms 达成**:per-replan **ms mean=5.6,p90=11.0,max=13.7 → 全部 < 50ms deadline**(Python 383ms → C++ ~6ms,~60x;最坏 13.7ms 仍有 3.6x 余量)。
+- **到达 + 全程安全**:reached=true,**flight min 人体净空 +0.916 ≥ d_safe**(加 0.12 规划裕度吸收拍间行人漂移)。
+- **截断不变性 96%**:每拍解的每个迭代净空 ≥ d_safe(任意 deadline 截断都人体安全)。
+- **结论:四个缺口(① <50ms ② 闭环 ③ 密集端到端 ④ 防御曲线)全部在 C++ 关闭。** computation-invariant 行人安全 + <50ms 硬 deadline + 时空穿密集移动人群,端到端可证明运作。
+- **离全生产还差(诚实,但已非「能不能」)**:Gauss-Seidel 投影是近似 QP(非精确 SS-QCQP 步,但实测够);未接进 receding-horizon 生产 planner 的 commit/golden 路径(bench 是独立可执行);场景是 6 行人合成(非真感知)。这些是工程集成,不是原理风险。
+
+### 11.5 tunnel(lane)约束内穿人群(2026-06-05,`cpp/test/bench_tunnel.cpp`)
+回答「能否在 tunnel 限制内穿梭人群、有无证明」:给 feasible-direction 叠加 tunnel(y-band)约束
+(控制点 |y|<=W,凸包→曲线在 lane 内,spatial sound),扫宽度:
+- **安全(可证):** 每迭代同时保持人体 g<=0 + tunnel |y|<=W -> 任意截断,提交轨迹都人体安全且在 lane 内。
+  实测所有宽度均 in-lane/safe(连窄 tunnel 也不撞、不出 lane;无缝时 gatekeeper 刹停held)。
+- **到达(场景相关):** W=1.6 够宽 -> 在 lane 内穿过整个移动人群到达(THREADED,min_clr 0.831, max|y| 0.874, <50ms);
+  W<=1.2 太窄 -> lane 内无时机缝 -> 正确刹停held(仍安全),而非冲出/撞。
+- 结论:**「tunnel 内安全」是构造性证明 + 已验;「tunnel 内能穿到」当且仅当 lane 容得下时机缝(W=1.6 已证可)。**
+- **⚠️ z 自由的诚实说明(2026-06-05,`cpp/test/viz_tunnel_gif.cpp` 16 人密集 gif/Isaac 回放):** tunnel **只约束 y**(|y|<=W),**z 不约束**。所以在 y-lane 挤不过去的最密处,求解器会**抬高 z 飞越**最近的人(实测 z 升到 ~3.2,人在 z=2.0),3D 净空 0.927 仍安全 —— 这是**合法的 3D 无人机避障**,但**不是纯平面内穿行**(竖直方向某种意义上是「绕」)。上面 bench_tunnel 的 in-lane 净空同理可能部分来自 z。**若要逼真正的「平面内从人缝穿过」,需再给 tunnel 叠加 z-band(顶/底)约束**,届时到达性需重验(可能更多 held)。当前 Isaac 回放 (`python/isaac_anytime_replay.py`) 按真实 z 渲染,会看到无人机在最挤处真的飞高越过人群。

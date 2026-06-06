@@ -43,6 +43,7 @@
 #include "sando_cpp/local_opt_hardalm.hpp"  // brings avoid_config.hpp's full AvoidParams
 #include "sando_cpp/minjerk_traj.hpp"
 #include "sando_cpp/obstacles.hpp"
+#include "sando_cpp/spacetime_corridor.hpp"  // Safe-Interval space-time corridor (default OFF)
 
 #include <Eigen/Dense>
 #include <vector>
@@ -89,6 +90,12 @@ struct CostGradOptParams {
   const Eigen::MatrixXd* corridor_centers = nullptr;
   double corridor_radius = 0.0;
   double w_corridor = 0.0;
+  // Safe-Interval SPACE-TIME corridor: per-waypoint cuboids with a time window. When set, the corridor
+  // term penalises q_i leaving cuboid_i WHILE its window is active (convex stay-in-box, replaces the
+  // sphere-tube above). Null -> sphere-tube path (golden byte-identical). w_time_window: optional
+  // explicit-T window hinge (escape hatch, default 0 = off).
+  const std::vector<SpaceTimeCuboid>* corridor_cuboids = nullptr;
+  double w_time_window = 0.0;
 
   // Build the HardAlmOptParams used by alm_term (every field the inner ALM reads).
   HardAlmOptParams hard_alm() const {
@@ -262,7 +269,30 @@ inline CostGradResult minco_cost_grad(
   // --- soft flight-corridor (SFC): penalise interior waypoints leaving the guide tube ----
   // cost = w · Σ_i max(0, ||q_i - centre_i|| - R)^2 ; acts directly on q (no MINCO back-prop).
   // OFF by default (centres null / w<=0 / R<=0) -> golden byte-identical.
-  if (opt.w_corridor > 0.0 && opt.corridor_radius > 0.0 && opt.corridor_centers &&
+  if (opt.corridor_cuboids && opt.w_corridor > 0.0 &&
+      (int)opt.corridor_cuboids->size() == M - 1) {
+    // Safe-Interval SPACE-TIME corridor: keep q_i inside cuboid_i while its time window is active.
+    // gate(t_i) is read-only on T (stop-gradient) -> T stays free (time-optimal); gradient only via q.
+    const double w = opt.w_corridor;
+    double t_i = 0.0;
+    for (int i = 0; i < M - 1; ++i) {
+      t_i += T(i);                                          // cumulative LOCAL time at waypoint i
+      const SpaceTimeCuboid& cb = (*opt.corridor_cuboids)[i];
+      if (!cb.valid) continue;                              // honest-degrade box -> hard-ALM alone
+      const double gate = window_gate(t_i, cb.t_l, cb.t_u);
+      if (gate <= 0.0) continue;
+      const Eigen::Vector3d p = q.row(i).transpose();
+      const Eigen::Vector3d over = (cb.lo - p).cwiseMax(0.0) + (p - cb.hi).cwiseMax(0.0);  // exterior
+      const double n2 = over.squaredNorm();
+      if (n2 > 0.0) {
+        f += gate * w * n2;
+        for (int a = 0; a < 3; ++a) {
+          const double s = (p(a) > cb.hi(a)) ? 1.0 : ((p(a) < cb.lo(a)) ? -1.0 : 0.0);
+          gq(i, a) += 2.0 * gate * w * over(a) * s;         // gradient ONLY through q
+        }
+      }
+    }
+  } else if (opt.w_corridor > 0.0 && opt.corridor_radius > 0.0 && opt.corridor_centers &&
       opt.corridor_centers->rows() == M - 1 && opt.corridor_centers->cols() == 3) {
     const Eigen::MatrixXd& Cc = *opt.corridor_centers;
     const double R = opt.corridor_radius;

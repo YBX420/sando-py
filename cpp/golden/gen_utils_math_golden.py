@@ -1,7 +1,7 @@
 """Golden generator for utils.py numeric helpers C++ port."""
 import os, sys
 import numpy as np
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 sys.path.insert(0, ROOT)
 from sando_py import utils as U
 

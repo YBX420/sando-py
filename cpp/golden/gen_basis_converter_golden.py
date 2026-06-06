@@ -1,6 +1,6 @@
 import os, sys
 import numpy as np
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 sys.path.insert(0, ROOT)
 from sando_py.types import BasisConverter
 def fmt(a): return " ".join(repr(float(x)) for x in np.asarray(a,float).reshape(-1))

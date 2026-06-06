@@ -135,11 +135,14 @@ class ObstacleTracker : public rclcpp::Node {
       Eigen::VectorXd qx = polyfit(t, xx, 5), qy = polyfit(t, yy, 5), qz = polyfit(t, zz, 5);
 
       double t0 = ros_now();
+      // samples only reach t=(num_steps-1)*dt (= samp.t.back()), one dt short of horizon_;
+      // declare the window to the actual last sample so the poly is never extrapolated past fit data.
+      double t_end_rel = samp.t.back();
       dynus_interfaces::msg::DynTraj m;
       m.header.stamp = now(); m.header.frame_id = frame_id_;
       m.id = s.id;
       m.bbox = {s.bbox[0], s.bbox[1], s.bbox[2]};
-      m.pwp.times = {t0, t0 + horizon_};
+      m.pwp.times = {t0, t0 + t_end_rel};
       auto cp = [](const Eigen::VectorXd& b) {
         dynus_interfaces::msg::CoeffPoly3 c; c.a = b[0]; c.b = b[1]; c.c = b[2]; c.d = b[3]; return c;
       };
@@ -151,7 +154,7 @@ class ObstacleTracker : public rclcpp::Node {
       m.poly_coeffs_x.assign(qx.data(), qx.data() + qx.size());
       m.poly_coeffs_y.assign(qy.data(), qy.data() + qy.size());
       m.poly_coeffs_z.assign(qz.data(), qz.data() + qz.size());
-      m.poly_start_time = t0; m.poly_end_time = t0 + horizon_;
+      m.poly_start_time = t0; m.poly_end_time = t0 + t_end_rel;   // window trimmed to fit-data end, no extrapolation
       m.pos.x = s.x[0]; m.pos.y = s.x[1]; m.pos.z = s.x[2];
       m.is_agent = false;
       pub_traj_->publish(m);
