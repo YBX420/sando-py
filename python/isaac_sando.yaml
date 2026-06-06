@@ -38,7 +38,7 @@ planner:
   # crowd (the goal) instead of routing wide. 1.2 was a stall workaround for the (now-fixed) class bug.
   dyn_base_inflation_m: 0.0
   minco_use_topology: true
-  minco_human_slow_vmax: 0.0
+  minco_human_slow_vmax: 0.0       # (Step5 motion-aware guide restores agility; gentle-slow available if needed)
   minco_human_slow_near: 3.0
   minco_human_slow_far: 9.0
   goal_radius: 0.8
@@ -55,6 +55,8 @@ planner:
   minco_w_corridor: 100.0
   inflate_walls_by_body: true     # plan with the quad BODY, not as a point (C-space, not route-around)
   dynamic_speed_thresh: 0.5       # a "wall" moving >=0.5 m/s -> hard, motion-aware "dynamic" certificate
+  pred_horizon_s: 0.5             # motion-aware global guide: 0.5 s lookahead = sweet spot (vmax 9 & 12 both safe;
+                                  # 1.0 over-predicts and shuffles the resonance, 2.0 over-blocks -> holds)
 scene:
   start: [0.0, 0.0, 3.0]
   goal: [60.0, 0.0, 3.0]

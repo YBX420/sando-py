@@ -150,12 +150,20 @@ class HGPManager {
                   const std::vector<Eigen::Vector3d>& /*cloud_unk*/,
                   const std::vector<Eigen::Vector3d>& obst_pos,
                   const std::vector<Eigen::Vector3d>& obst_bbox,
-                  double traj_max_time) {
+                  double traj_max_time,
+                  const std::vector<std::vector<Eigen::Vector3d>>& pred_samples = {},
+                  const std::vector<double>& pred_times = {}) {
     double r = res;
     // max(2, int(round(w/res))). Python round() = round-half-to-even.
     long cells_x = std::max<long>(2, helpers::py_round_to_long(wdx / r));
     long cells_y = std::max<long>(2, helpers::py_round_to_long(wdy / r));
     long cells_z = std::max<long>(2, helpers::py_round_to_long(wdz / r));
+    // motion-aware guide: hand the forward-predicted obstacle samples to the dynamic-heat tube so
+    // heat-A* biases away from where movers WILL be. Empty -> single-snapshot (golden-identical).
+    map_util.dyn_pred_samples = pred_samples;
+    map_util.has_dyn_pred_samples = !pred_samples.empty();
+    map_util.dyn_pred_times = pred_times;
+    map_util.has_dyn_pred_times = !pred_times.empty();
     map_util.read_map(cells_x, cells_y, cells_z, center_map, cloud_occ, par.z_min,
                       par.z_max, par.inflation_hgp, obst_pos, obst_bbox,
                       traj_max_time);

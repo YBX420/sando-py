@@ -27,13 +27,14 @@ def signed_box(p, c, sz):
     return float(np.linalg.norm(out)) if np.any(out > 0) else float(np.max(np.maximum(lo - p, p - hi)))
 
 
-def run(vmax=12.0, wcor=None, body=True, avoid="", dyn=0.5, t_max=20.0):
+def run(vmax=12.0, wcor=None, body=True, avoid="", dyn=0.5, pred_h=None, t_max=20.0):
     os.environ["DYNINFL"] = "0"                              # pure agile, no route-around inflation
     par, START, GOAL, OBS, LOOP = B.build()
     par.v_max = float(vmax)
     par.inflate_walls_by_body = bool(body)
     par.dynamic_speed_thresh = float(dyn)                    # >0 -> fast movers become hard "dynamic" class
     par.avoid_override = str(avoid)                          # "" per-class; "hard"/"soft" force
+    if pred_h is not None: par.pred_horizon_s = float(pred_h)  # motion-aware guide lookahead (None=yaml)
     if wcor is not None: par.minco_w_corridor = float(wcor)
     DR = float(par.drone_radius)
     DTS = [B.make_dt(i, o) for i, o in enumerate(OBS)]
