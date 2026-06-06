@@ -117,29 +117,35 @@ inline BatchDistGrad signed_dist_and_grad_batch(const Obstacle* obs,
     }
     return r;
   }
-  // AABB (static): vectorised over k samples, same math as the scalar path.
+  // AABB: vectorised over k samples, same math as the scalar path. #11: motion-aware (lo+vel*t /
+  // hi+vel*t) + dddt = -dd_dp·vel so cost/gradient match obstacles.hpp::signed_dist for a moving box;
+  // vel==0 -> static, dddt 0 -> byte-identical to before (golden-safe).
   auto b = dynamic_cast<const AABBObstacle*>(obs);
   for (int j = 0; j < k; ++j) {
     Eigen::Vector3d p = P.row(j).transpose();
-    Eigen::Vector3d over = (b->lo - p).cwiseMax(0.0) + (p - b->hi).cwiseMax(0.0);
+    Eigen::Vector3d lo_t = b->lo + b->vel * t_abs(j);
+    Eigen::Vector3d hi_t = b->hi + b->vel * t_abs(j);
+    Eigen::Vector3d over = (lo_t - p).cwiseMax(0.0) + (p - hi_t).cwiseMax(0.0);
     if ((over.array() > 0.0).any()) {
       double nrm = over.norm();
       Eigen::Vector3d sign;
       for (int a = 0; a < 3; ++a)
-        sign(a) = (p(a) > b->hi(a) ? 1.0 : 0.0) - (p(a) < b->lo(a) ? 1.0 : 0.0);
+        sign(a) = (p(a) > hi_t(a) ? 1.0 : 0.0) - (p(a) < lo_t(a) ? 1.0 : 0.0);
       r.d(j) = nrm;
-      r.ndp.row(j) = (over.cwiseProduct(sign) / nrm).transpose();
+      Eigen::Vector3d dd_dp = over.cwiseProduct(sign) / nrm;
+      r.ndp.row(j) = dd_dp.transpose();
+      r.dddt(j) = -dd_dp.dot(b->vel);
     } else {
-      Eigen::Vector3d cand = (b->lo - p).cwiseMax(p - b->hi);
+      Eigen::Vector3d cand = (lo_t - p).cwiseMax(p - hi_t);
       int ax = 0;
       cand.maxCoeff(&ax);
       r.d(j) = cand(ax);
-      double loP = b->lo(ax) - p(ax), Phi = p(ax) - b->hi(ax);
+      double loP = lo_t(ax) - p(ax), Phi = p(ax) - hi_t(ax);
       Eigen::Vector3d g = Eigen::Vector3d::Zero();
       g(ax) = (loP >= Phi) ? -1.0 : 1.0;
       r.ndp.row(j) = g.transpose();
+      r.dddt(j) = -g.dot(b->vel);
     }
-    // dddt stays 0
   }
   return r;
 }

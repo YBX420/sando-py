@@ -458,6 +458,45 @@ inline std::pair<double, double> hard_clearance(const MinjerkTraj& tr,
       double t = (K_eval == 1) ? tr.t_start
                                : tr.t_start + (tr.t_end - tr.t_start) * double(j) / double(K_eval - 1);
       double d = obs->signed_dist(tr.eval(t), t);
+      // #5: a non-finite distance (NaN/Inf obstacle) must FAIL the gate, not silently pass it
+      // (NaN compares false against every threshold -> would leave max_breach at -inf -> "valid").
+      if (!std::isfinite(d))
+        return {-std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
+      if (d < min_clr) min_clr = d;
+      double br = d_safe - d;
+      if (br > max_breach) max_breach = br;
+    }
+  }
+  return {min_clr, max_breach};
+}
+
+// hard_clearance_trusted: like hard_clearance, but a MOVING hard obstacle is only enforced within
+// [t_start, t_start+tau_trust] — the horizon over which the optimizer has authority (beyond it the
+// ALM sets g=G_NEG, i.e. the constraint is OFF) AND over which the CV/CA prediction is trusted. A
+// STATIC obstacle (vel==accel==0) is enforced over the FULL trajectory (no trust issue, no motion).
+// Why this is the honest gate (#3): rejecting on un-fixable >tau_trust predictions caused frequent
+// false holds (a liveness trap), while the "continuous-time certificate" silently only held to
+// tau_trust anyway. Receding-horizon keeps it safe: the executed commit (~replan_dt) is always
+// < tau_trust, so the flown path stays certified; the un-enforced tail is replanned before it is flown.
+inline std::pair<double, double> hard_clearance_trusted(
+    const MinjerkTraj& tr, const std::vector<const Obstacle*>& hard_obs,
+    const std::map<std::string, AvoidParams>& avoid_cfg, int K_eval, double tau_trust) {
+  const double inf = std::numeric_limits<double>::infinity();
+  if (hard_obs.empty()) return {inf, -inf};
+  double min_clr = inf, max_breach = -inf;
+  for (const Obstacle* obs : hard_obs) {
+    auto it = avoid_cfg.find(obs->class_name);
+    double d_safe = (it != avoid_cfg.end()) ? it->second.d_safe : 0.8;
+    bool moving = false;
+    if (auto s = dynamic_cast<const SphereObstacle*>(obs))
+      moving = (s->vel.norm() > 0.0 || s->accel.norm() > 0.0);
+    double t_hi = moving ? std::min(tr.t_end, tr.t_start + tau_trust) : tr.t_end;
+    for (int j = 0; j < K_eval; ++j) {
+      double t = (K_eval == 1) ? tr.t_start
+                               : tr.t_start + (t_hi - tr.t_start) * double(j) / double(K_eval - 1);
+      double d = obs->signed_dist(tr.eval(t), t);
+      if (!std::isfinite(d))
+        return {-inf, inf};                          // #5: non-finite must fail the gate
       if (d < min_clr) min_clr = d;
       double br = d_safe - d;
       if (br > max_breach) max_breach = br;
@@ -862,7 +901,10 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
   int K_dense = std::max(opt.K, 200);
   std::vector<const Obstacle*> safety_soft, safety_obs;  // hard set under override=None
   partition_obstacles(obs_eff, avoid_cfg, "", safety_soft, safety_obs);
-  auto mc = hard_clearance(tr, safety_obs, avoid_cfg, K_dense);
+  // #3: enforce the gate over the SAME horizon the optimizer constrains (moving obstacles within
+  // tau_trust; static obstacles fully). Removes the false-hold liveness trap and makes the certified
+  // horizon honest. tau_trust comes from opt (now YAML-wired, #2).
+  auto mc = hard_clearance_trusted(tr, safety_obs, avoid_cfg, K_dense, opt.hard_alm().tau_trust);
   double min_clr = mc.first, max_breach = mc.second;
 
   double extra = pred_margin(opt.hard_alm()) + eps_track(opt.hard_alm());

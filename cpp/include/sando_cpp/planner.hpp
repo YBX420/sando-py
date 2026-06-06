@@ -159,16 +159,22 @@ class QuinticPieceWisePol : public PieceWisePol {
 //   times[i] = A_time + mj.cum[i]; per-segment ascending coeffs copied verbatim
 //   (mj.c is (6M,3) ascending). 1:1 with planner.py::_minjerk_to_pwp.
 // ---------------------------------------------------------------------------
-inline QuinticPieceWisePol minjerk_to_pwp(const MinjerkTraj& mj, double A_time) {
+// retime_s>1 time-dilates the shared trajectory so it matches the (retimed) executed setpoints:
+// q(τ')=p(τ'/retime_s) over a τ'-span scaled by retime_s, i.e. coeff_j *= (1/retime_s)^j and the
+// segment durations *= retime_s. retime_s==1 -> byte-identical (golden-safe). #9.
+inline QuinticPieceWisePol minjerk_to_pwp(const MinjerkTraj& mj, double A_time, double retime_s = 1.0) {
   QuinticPieceWisePol pwp;
+  const double inv_s = 1.0 / retime_s;
   pwp.times.resize(mj.M + 1);
-  for (int i = 0; i <= mj.M; ++i) pwp.times[i] = A_time + mj.cum(i);
+  for (int i = 0; i <= mj.M; ++i) pwp.times[i] = A_time + mj.cum(i) * retime_s;
   for (int i = 0; i < mj.M; ++i) {
     Eigen::Matrix<double, 6, 1> cx, cy, cz;
+    double sj = 1.0;                       // (1/retime_s)^j
     for (int j = 0; j < 6; ++j) {
-      cx(j) = mj.c(6 * i + j, 0);
-      cy(j) = mj.c(6 * i + j, 1);
-      cz(j) = mj.c(6 * i + j, 2);
+      cx(j) = mj.c(6 * i + j, 0) * sj;
+      cy(j) = mj.c(6 * i + j, 1) * sj;
+      cz(j) = mj.c(6 * i + j, 2) * sj;
+      sj *= inv_s;
     }
     pwp.qcoeff_x.push_back(cx);
     pwp.qcoeff_y.push_back(cy);
@@ -240,6 +246,7 @@ class SANDO {
   std::vector<std::string> obst_class;
   std::vector<Eigen::Vector3d> obst_vel;
   std::vector<Eigen::Vector3d> obst_accel;
+  double obst_snapshot_time_ = 0.0;   // #1: wall-clock at which obst_pos was sampled (eval(current_time))
   double traj_max_time = 0.0;
 
   // hover
@@ -477,6 +484,7 @@ class SANDO {
     for (auto& traj : local_trajs) {
       DynTraj t = traj;
       Eigen::Vector3d p = t.eval(current_time);
+      if (!p.allFinite()) continue;   // #5: NaN/Inf obstacle (e.g. analytic div-by-zero) must not enter
       if (!check_point_within_map(p)) continue;
       double dist = (p - state.pos).norm();
       if (dist > par.horizon) continue;
@@ -497,6 +505,7 @@ class SANDO {
     obst_class = oclass;
     obst_vel = ovel;
     obst_accel = oaccel;
+    obst_snapshot_time_ = current_time;   // #1: remember WHEN this snapshot was taken
 
     double Th = worst_traj_time * (factors_.empty() ? 1.0 : factors_.back());
     // motion-aware guide: force a prediction horizon even when worst_traj_time==0 (rviz/analytic path)
@@ -782,7 +791,15 @@ class SANDO {
     std::vector<Eigen::Vector3d> global_path;
     bool ok = generate_global_path(current_time, last_replanning_computation_time,
                                    global_path);
-    if (!ok) return {false, false};
+    if (!ok) {
+      // #10: the global path can fail because the commit point A drifted out of the world box. Today
+      // that silently stops replanning and keeps flying the stale plan (no avoidance, no yield). Try the
+      // gated recovery yield (no-op unless a human is actually close) instead of freezing.
+      try {
+        if (par.recovery_enabled && recovery_yield() && append_to_plan()) return {false, true};
+      } catch (const std::exception&) {}
+      return {false, false};
+    }
 
     if (!plan_local_trajectory_minco(global_path, last_replanning_computation_time)) {
       // SAFE half: no feasible forward plan -> actively YIELD (recovery_yield) instead of freezing
@@ -973,6 +990,21 @@ class SANDO {
                                  oaccel = obst_accel;
     std::vector<std::string> oclass = obst_class;
 
+    // #1: the snapshot was sampled at obst_snapshot_time_, but the committed trajectory's local t=0
+    // is at wall-clock A_time_local (= snapshot_time + commit_ahead*dc). predict(t)=centre0+vel*t then
+    // places the human at snapshot_time+t while the drone is actually at A_time_local+t -> the whole
+    // commit window under-predicts the human by vel*delta (~0.2 m for a 1.4 m/s human, 0.15 s window),
+    // a systematic OPTIMISTIC error. Advance each obstacle's CA state to A_time so predict(t) is honest.
+    double dt_pred = std::max(0.0, A_time_local - obst_snapshot_time_);
+    if (dt_pred > 0.0) {
+      for (size_t k = 0; k < opos.size(); ++k) {
+        Eigen::Vector3d v = (k < ovel.size()) ? ovel[k] : Eigen::Vector3d::Zero();
+        Eigen::Vector3d a = (k < oaccel.size()) ? oaccel[k] : Eigen::Vector3d::Zero();
+        opos[k] += v * dt_pred + 0.5 * a * (dt_pred * dt_pred);   // centre advanced to A_time
+        if (k < ovel.size()) ovel[k] = v + a * dt_pred;           // velocity advanced to A_time
+      }
+    }
+
     std::vector<std::shared_ptr<Obstacle>> owned;
     std::vector<const Obstacle*> obstacles;
     std::map<std::string, AvoidParams> avoid_cfg;
@@ -1038,6 +1070,18 @@ class SANDO {
     opt.use_st_graph = par.use_st_graph;   // space-time front-end (ST-graph speed planner, off=default)
     opt.st_NS = par.st_NS; opt.st_NT = par.st_NT; opt.st_w_wait = par.st_w_wait;
     opt.avoid_override = par.avoid_override;  // "" -> per-class; "soft"/"hard" force all
+    // #2: wire the prediction-uncertainty / worst-case-reach margins (dead until now). Defaults keep
+    // current behaviour; YAML can now enable the deterministic reach set so safety stops betting on a
+    // fully-trusted short-horizon prediction. tau_trust feeds BOTH the ALM window and the gate (#3).
+    opt.q_conformal  = par.minco_q_conformal;
+    opt.epsilon_track = par.minco_epsilon_track;
+    opt.safety_mode  = par.minco_safety_mode;
+    opt.reach_model  = par.minco_reach_model;
+    opt.v_max_human  = par.minco_v_max_human;
+    opt.a_max_human  = par.minco_a_max_human;
+    opt.est_pos_err  = par.minco_est_pos_err;
+    opt.est_vel_err  = par.minco_est_vel_err;
+    opt.tau_trust    = par.minco_tau_trust;
     // gatekeeper / anytime: hard compute deadline + deterministic topology seed (mirrors
     // planner.py). Both default OFF -> behaviour unchanged. plan_minco returns only certified-
     // feasible trajectories within the budget; an uncertified solve fails the valid gate below
@@ -1079,8 +1123,28 @@ class SANDO {
          info.failure_reason == "acceleration_violation")) {
       double sv = (par.v_max > 1e-6) ? info.feasibility.max_v / par.v_max : 1.0;
       double sa = (par.a_max > 1e-6) ? std::sqrt(std::max(0.0, info.feasibility.max_a / par.a_max)) : 1.0;
-      retime_s = std::max(1.0, std::max(sv, sa));
-      valid = true;
+      double rs = std::max(1.0, std::max(sv, sa));
+      // #4: retiming slows EXECUTION (drone lags) while the world moves on wall-clock. The hard
+      // certificate was verified TIME-MATCHED (drone@eval(t) vs human@predict(t)); retimed, the drone
+      // is at eval(t) but the human is at predict(t*rs). Re-verify THAT pairing for moving hard
+      // obstacles; only accept the retime if it still clears. Static obstacles (predict(t*rs)=predict(t))
+      // pass unchanged, so a static-only overshoot retimes exactly as before.
+      bool retime_safe = true;
+      const MinjerkTraj& rt = *mj_ptr;
+      int Kc = std::max(opt.K, 200);
+      for (const Obstacle* o : obstacles) {
+        auto it = avoid_cfg.find(o->class_name);
+        if (it == avoid_cfg.end() || it->second.mode != "hard") continue;   // soft walls don't gate valid
+        double dsafe = it->second.d_safe;
+        for (int j = 0; j < Kc; ++j) {
+          double tl = rt.t_start + (rt.t_end - rt.t_start) * double(j) / double(std::max(Kc - 1, 1));
+          double dd = o->signed_dist(rt.eval(tl), tl * rs);     // drone@eval(t) vs obstacle@predict(t*rs)
+          if (!std::isfinite(dd) || dd < dsafe - opt.clearance_tol) { retime_safe = false; break; }
+        }
+        if (!retime_safe) break;
+      }
+      if (retime_safe) { retime_s = rs; valid = true; }
+      // else: leave valid=false -> fail -> recovery (never commit an unverified retimed moving cert)
     }
     if (!mj_ptr || !valid) {
       replanning_failure_count += 1;
@@ -1099,7 +1163,10 @@ class SANDO {
     for (int i = 0; i < n_samples; ++i) {
       double t_local = std::min((i + 1) * dc * inv_s, t_end - 1e-6);
       RobotState s;
-      s.t = A_time_local + t_local;
+      // #9: timestamp by WALL-clock spacing dc (how the deque is popped), NOT trajectory-time t_local.
+      // At retime_s==1 t_local==(i+1)*dc so this is identical (golden-safe); at retime_s>1 it stops the
+      // setpoint stamps from being spaced dc*inv_s (which mis-times any consumer that trusts s.t).
+      s.t = A_time_local + (i + 1) * dc;
       s.pos = mj.eval_deriv(t_local, 0);
       s.vel = mj.eval_deriv(t_local, 1) * inv_s;
       s.accel = mj.eval_deriv(t_local, 2) * (inv_s * inv_s);
@@ -1108,7 +1175,7 @@ class SANDO {
     }
 
     goal_setpoints = setpoints;
-    pwp_to_share = minjerk_to_pwp(mj, A_time_local);
+    pwp_to_share = minjerk_to_pwp(mj, A_time_local, retime_s);   // #9: retimed share matches execution
     cps = mj.control_points();
     successful_factor = 1.0;
     cvx_decomp_time = 0.0;
@@ -1154,7 +1221,30 @@ class SANDO {
     double dc = par.dc;
     std::vector<RobotState> setpoints;
     double d = (target - local_A.pos).norm();
-    if (d < 1e-3) {                                        // staying is safest -> brake to rest + HOLD at A
+    bool brake = (d < 1e-3);                               // staying is the chosen target
+    double yv = std::max(0.5, std::min(par.v_max, 1.5));   // yield slowly
+    double Tseg = std::max(dc * 2.0, d / yv / 2.0);
+    std::shared_ptr<MinjerkTraj> ymj;
+    if (!brake) {
+      Eigen::MatrixXd wp(3, 3);
+      wp.row(0) = local_A.pos.transpose();
+      wp.row(1) = (0.5 * (local_A.pos + target)).transpose();
+      wp.row(2) = target.transpose();
+      Eigen::VectorXd T(2); T(0) = Tseg; T(1) = Tseg;
+      ymj = std::make_shared<MinjerkTraj>(wp, T, local_A.vel, local_A.accel,
+                                          Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+      // #8: the committed maneuver is a CURVE bent by v0/a0 overshoot; yield_target only scored straight
+      // segments. Re-verify the ACTUAL curve's clearance (drone@eval(t) vs humans@predict(t)); if it is
+      // worse than simply holding, brake instead of committing an unverified, possibly-worse maneuver.
+      double stay_clr = reach_avoid_clearance(local_A.pos, humans, 0.0, horizon);
+      double yield_clr = 1e18;
+      for (int s = 0; s <= 12; ++s) {
+        double tl = ymj->t_end * s / 12.0;
+        yield_clr = std::min(yield_clr, reach_avoid_clearance(ymj->eval(tl), humans, tl, 0.0));
+      }
+      if (yield_clr < stay_clr) brake = true;
+    }
+    if (brake) {                                          // brake to rest + HOLD at A (never worsen)
       int n = std::max(2, static_cast<int>(std::ceil(horizon / dc)));
       for (int i = 0; i < n; ++i) {
         RobotState s; s.t = A_time_local + (i + 1) * dc; s.pos = local_A.pos;
@@ -1163,14 +1253,7 @@ class SANDO {
       goal_setpoints = setpoints; last_minco_traj.reset(); cps.clear(); pwp_to_share.clear_q();
       successful_factor = 1.0; cvx_decomp_time = 0.0; return true;
     }
-    double yv = std::max(0.5, std::min(par.v_max, 1.5));   // yield slowly
-    double Tseg = std::max(dc * 2.0, d / yv / 2.0);
-    Eigen::MatrixXd wp(3, 3);
-    wp.row(0) = local_A.pos.transpose();
-    wp.row(1) = (0.5 * (local_A.pos + target)).transpose();
-    wp.row(2) = target.transpose();
-    Eigen::VectorXd T(2); T(0) = Tseg; T(1) = Tseg;
-    MinjerkTraj mj(wp, T, local_A.vel, local_A.accel, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    MinjerkTraj& mj = *ymj;
     double t_end = mj.t_end;
     int n_samples = std::max(2, static_cast<int>(std::ceil(t_end / dc)));
     for (int i = 0; i < n_samples; ++i) {

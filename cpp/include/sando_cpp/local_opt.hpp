@@ -28,22 +28,27 @@ inline DistGrad signed_dist_and_grad(const Obstacle* obs, const Eigen::Vector3d&
     return {d, n, dd_dt};
   }
   auto b = dynamic_cast<const AABBObstacle*>(obs);
-  Eigen::Vector3d over = (b->lo - p).cwiseMax(0.0) + (p - b->hi).cwiseMax(0.0);
+  // #11: motion-aware box (lo+vel*t / hi+vel*t) so the cost/gradient MATCH obstacles.hpp::signed_dist
+  // (which already drifts the box at vel*t). dd_dt = -dd_dp·vel (translating the box by v == translating
+  // p by -v). vel==0 -> lo_t=lo, dd_dt=0 -> byte-identical to the original static path (golden-safe).
+  Eigen::Vector3d lo_t = b->lo + b->vel * t;
+  Eigen::Vector3d hi_t = b->hi + b->vel * t;
+  Eigen::Vector3d over = (lo_t - p).cwiseMax(0.0) + (p - hi_t).cwiseMax(0.0);
   if ((over.array() > 0.0).any()) {
     double nrm = over.norm();
     Eigen::Vector3d sign;
     for (int k = 0; k < 3; ++k)
-      sign(k) = (p(k) > b->hi(k) ? 1.0 : 0.0) - (p(k) < b->lo(k) ? 1.0 : 0.0);
+      sign(k) = (p(k) > hi_t(k) ? 1.0 : 0.0) - (p(k) < lo_t(k) ? 1.0 : 0.0);
     Eigen::Vector3d dd_dp = over.cwiseProduct(sign) / nrm;
-    return {nrm, dd_dp, 0.0};
+    return {nrm, dd_dp, -dd_dp.dot(b->vel)};
   }
   // inside: L-inf penetration subgradient
-  Eigen::Vector3d cand = (b->lo - p).cwiseMax(p - b->hi);
+  Eigen::Vector3d cand = (lo_t - p).cwiseMax(p - hi_t);
   int ax = 0;
   cand.maxCoeff(&ax);  // first index of max (matches np.argmax tie-break)
   Eigen::Vector3d grad = Eigen::Vector3d::Zero();
-  grad(ax) = ((b->lo(ax) - p(ax)) >= (p(ax) - b->hi(ax))) ? -1.0 : 1.0;
-  return {cand(ax), grad, 0.0};
+  grad(ax) = ((lo_t(ax) - p(ax)) >= (p(ax) - hi_t(ax))) ? -1.0 : 1.0;
+  return {cand(ax), grad, -grad.dot(b->vel)};
 }
 
 // _seg_vander: power-basis rows for derivative orders 0..3 at local times taus (k,).

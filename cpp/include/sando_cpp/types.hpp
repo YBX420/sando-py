@@ -382,6 +382,13 @@ class DynTraj {
       expr_vy_ = traj_vy.empty() ? AnalyticExpr() : AnalyticExpr(traj_vy);
       expr_vz_ = traj_vz.empty() ? AnalyticExpr() : AnalyticExpr(traj_vz);
       have_v_ = !traj_vx.empty() && !traj_vy.empty() && !traj_vz.empty();
+      // #7: AnalyticExpr is LAZY — constructing it from a malformed source ("(", "1+") does NOT throw;
+      // only evaluation does. Trial-evaluate here so a bad expression is rejected at compile time
+      // (analytic_compiled stays false -> eval() returns 0) instead of throwing later across the C ABI.
+      volatile double probe = expr_x_(0.0) + expr_y_(0.0) + expr_z_(0.0)
+                            + expr_x_(1.0) + expr_y_(1.0) + expr_z_(1.0);
+      if (have_v_) probe += expr_vx_(0.0) + expr_vy_(0.0) + expr_vz_(0.0);
+      (void)probe;
       analytic_compiled = true;
       return true;
     } catch (const std::exception&) {
@@ -666,6 +673,22 @@ struct Parameters {
   // stale plan. Default ON (cpp-port main line); only fires when plan_minco finds no valid plan,
   // so nominal/golden behaviour is unchanged.
   bool recovery_enabled = true;
+
+  // #2: prediction-uncertainty / worst-case-reachability margins for the HARD certificate. Until now
+  // these lived only in the optimizer headers and were NEVER set from production -> the deterministic
+  // worst-case reach set was dead and safety leaned on a fully-trusted short-horizon prediction. They
+  // are now wired into PlanOptParams (plan_local_trajectory_minco). DEFAULTS preserve current behaviour
+  // (golden byte-identical); set them in YAML to turn the reach set ON:
+  //   minco_safety_mode="deterministic", minco_v_max_human + minco_est_pos_err (or accel model).
+  double minco_q_conformal  = 0.0;     // conformal statistical margin Q_alpha (spheres)
+  double minco_epsilon_track = 0.0;    // plan->flown execution-gap tube radius (every hard obstacle)
+  std::string minco_safety_mode = "conformal";   // "conformal" | "deterministic"
+  std::string minco_reach_model = "accel";        // "accel" | "speed"
+  double minco_v_max_human  = 0.0;     // deterministic 'speed' model: worst-case human speed
+  double minco_a_max_human  = 0.0;     // deterministic 'accel' model: worst-case human accel
+  double minco_est_pos_err  = 0.0;     // position estimate error (added to R)
+  double minco_est_vel_err  = 0.0;     // velocity estimate error ('accel' model)
+  double minco_tau_trust    = 0.75;    // hard-ALM + gate trust horizon (s); beyond it, replan covers
 
   // Dynamic obstacles
   double traj_lifetime = 7.0;
