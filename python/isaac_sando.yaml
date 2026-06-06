@@ -50,6 +50,8 @@ planner:
   debug_verbose: false
   minco_sfc_radius: 0.8
   minco_w_corridor: 100.0
+  inflate_walls_by_body: true     # plan with the quad BODY, not as a point (C-space, not route-around)
+  dynamic_speed_thresh: 0.5       # a "wall" moving >=0.5 m/s -> hard, motion-aware "dynamic" certificate
 scene:
   start: [0.0, 0.0, 3.0]
   goal: [60.0, 0.0, 3.0]

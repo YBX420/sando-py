@@ -42,23 +42,30 @@ class SphereObstacle : public Obstacle {
 
 class AABBObstacle : public Obstacle {
  public:
-  Eigen::Vector3d lo, hi;
+  Eigen::Vector3d lo, hi, vel;   // vel: constant-velocity drift over the local horizon (0 = static wall)
 
   AABBObstacle(const Eigen::Vector3d& lo_, const Eigen::Vector3d& hi_,
-               const std::string& cls = "wall")
-      : lo(lo_), hi(hi_) {
+               const std::string& cls = "wall",
+               const Eigen::Vector3d& v = Eigen::Vector3d::Zero())
+      : lo(lo_), hi(hi_), vel(v) {
     class_name = cls;
     if ((hi.array() < lo.array()).any())
       throw std::invalid_argument("AABB hi must be >= lo elementwise");
   }
 
-  double signed_dist(const Eigen::Vector3d& p, double /*t*/ = 0.0) const override {
+  // Motion-aware: the box drifts at constant velocity so the local solve avoids where the box WILL
+  // be at trajectory-time t (same convention as SphereObstacle::predict). vel=0 -> static wall
+  // (identical to the original point-in-box, golden-unchanged). Without this, a moving "wall" is
+  // avoided at its STALE snapshot position and drifts into the path between replans (graze).
+  double signed_dist(const Eigen::Vector3d& p, double t = 0.0) const override {
+    Eigen::Vector3d lo_t = lo + vel * t;
+    Eigen::Vector3d hi_t = hi + vel * t;
     // outside[axis] = how far p is beyond the box on each axis (0 if inside)
     Eigen::Vector3d outside =
-        (lo - p).cwiseMax(0.0) + (p - hi).cwiseMax(0.0);
+        (lo_t - p).cwiseMax(0.0) + (p - hi_t).cwiseMax(0.0);
     if ((outside.array() > 0.0).any()) return outside.norm();
     // inside: L-inf penetration depth (<= 0)
-    Eigen::Vector3d pen = (lo - p).cwiseMax(p - hi);
+    Eigen::Vector3d pen = (lo_t - p).cwiseMax(p - hi_t);
     return pen.maxCoeff();
   }
 };
