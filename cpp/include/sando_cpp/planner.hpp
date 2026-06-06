@@ -270,6 +270,8 @@ class SANDO {
 
   // last minco traj (debug)
   std::shared_ptr<MinjerkTraj> last_minco_traj;
+  std::vector<SpaceTimeCuboid> last_corridor_;   // last committed space-time corridor (for viz)
+  double last_A_time_ = 0.0;                      // A-time of that corridor (to absolutize its windows)
 
   // -------------------------------------------------------------------------
   explicit SANDO(const Parameters& par_) : par(par_) {
@@ -334,6 +336,8 @@ class SANDO {
   }
   std::vector<DynTraj> get_trajs() const { return trajs; }
   std::vector<Eigen::Vector3d> get_global_path() const { return global_path_; }
+  const std::vector<SpaceTimeCuboid>& get_corridor() const { return last_corridor_; }
+  double get_corridor_A_time() const { return last_A_time_; }
   const QuinticPieceWisePol& get_pwp() const { return pwp_to_share; }
 
   // ------------------------------------------------------------------
@@ -1023,7 +1027,16 @@ class SANDO {
     // certificate can deviate freely to safety (verified: at vmax=12 corridor 100 -> graze, 0 -> +0.29).
     // Keyed on the scene MODE, not per-tick mover presence -> stable (an oscillating box dipping below
     // the speed threshold at a turning point must not re-engage the corridor mid-flight).
-    if (par.dynamic_speed_thresh > 0.0) opt.w_corridor = 0.0;
+    // Space-time corridor REUSES w_corridor as its stay-in-box penalty weight -> do NOT zero it when on.
+    if (par.dynamic_speed_thresh > 0.0 && !par.use_spacetime_corridor) opt.w_corridor = 0.0;
+    opt.use_spacetime_corridor = par.use_spacetime_corridor;   // Safe-Interval space-time corridor (off=default)
+    opt.w_time_window  = par.stc_w_time;
+    opt.stc_d_safe_dyn = par.stc_d_safe_dyn;
+    opt.stc_time_dt    = par.stc_time_dt;
+    opt.stc_Th         = par.stc_Th;
+    opt.stc_drone_radius = par.drone_radius;
+    opt.use_st_graph = par.use_st_graph;   // space-time front-end (ST-graph speed planner, off=default)
+    opt.st_NS = par.st_NS; opt.st_NT = par.st_NT; opt.st_w_wait = par.st_w_wait;
     opt.avoid_override = par.avoid_override;  // "" -> per-class; "soft"/"hard" force all
     // gatekeeper / anytime: hard compute deadline + deterministic topology seed (mirrors
     // planner.py). Both default OFF -> behaviour unchanged. plan_minco returns only certified-
@@ -1100,6 +1113,8 @@ class SANDO {
     successful_factor = 1.0;
     cvx_decomp_time = 0.0;
     last_minco_traj = mj_ptr;
+    last_corridor_ = info.corridor;          // stash for viz (empty when space-time corridor off)
+    last_A_time_ = A_time_local;
     return true;
   }
 

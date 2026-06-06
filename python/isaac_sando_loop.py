@@ -73,6 +73,9 @@ for k, v in PLN.items():
     else:
         print(f"[isaac][warn] Parameters 无字段 '{k}', 跳过", flush=True)
 par.replan_dt = float(LOOP.get("replan_dt", 0.1))   # cap commit-ahead to the replan cadence (commit-lock fix)
+par.use_spacetime_corridor = os.environ.get("STC", "1") == "1"   # Safe-Interval corridor (draw it in Isaac)
+par.use_st_graph = os.environ.get("STG", "0") == "1"             # ST-graph timing front-end
+if os.environ.get("STDSD"): par.stc_d_safe_dyn = float(os.environ["STDSD"])
 
 START = np.array(SCENE["start"], dtype=float)
 GOAL = np.array(SCENE["goal"], dtype=float)
@@ -150,6 +153,29 @@ try:
     print(f"[isaac] inflation halos drawn ({len(infl_prims)}, dyn_base_inflation_m={_infl_m:.2f}, translucent orange)", flush=True)
 except Exception as _e:
     print(f"[isaac][warn] inflation halo render failed, skipped: {_e}", flush=True); infl_prims = []
+
+# Safe-Interval SPACE-TIME corridor: translucent GREEN cuboids carved (static-free + mover-free window)
+# through the moving crowd — the "where it CAN be, and when" made visible. Pool of fixed prims, repositioned
+# /resized each tick from sando.get_corridor(); unused slots parked off-screen. try/except -> never crashes.
+N_CORR = 16
+corr_prims = []
+try:
+    _cmat = UsdShade.Material.Define(_stage, "/World/Looks/corrMat")
+    _csh = UsdShade.Shader.Define(_stage, "/World/Looks/corrMat/Shader")
+    _csh.CreateIdAttr("UsdPreviewSurface")
+    _csh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 1.0, 0.2))
+    _csh.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(0.13)
+    _cmat.CreateSurfaceOutput().ConnectToSource(_csh.ConnectableAPI(), "surface")
+    for i in range(N_CORR):
+        pr = world.scene.add(VisualCuboid(prim_path=f"/World/corr_{i}", name=f"corr_{i}",
+            position=np.array([0.0, 0.0, -100.0]), scale=np.array([0.1, 0.1, 0.1]),
+            color=np.array([0.0, 1.0, 0.2])))
+        UsdShade.MaterialBindingAPI(_stage.GetPrimAtPath(f"/World/corr_{i}")).Bind(_cmat)
+        corr_prims.append(pr)
+    print(f"[isaac] corridor cuboid pool ({N_CORR}, translucent green; use_spacetime_corridor="
+          f"{bool(par.use_spacetime_corridor)})", flush=True)
+except Exception as _e:
+    print(f"[isaac][warn] corridor render init failed, skipped: {_e}", flush=True); corr_prims = []
 
 # 面包屑轨迹
 N_TRAIL = 500
@@ -250,6 +276,18 @@ while simulation_app.is_running() and t < T_MAX and not reached:
         obs_prims[i].set_world_pose(position=_cp)
         if i < len(infl_prims):                      # 膨胀光环跟着障碍动
             infl_prims[i].set_world_pose(position=_cp)
+    if corr_prims:                                   # space-time corridor cuboids (green) — recarved each replan
+        try:
+            cor = sando.get_corridor()
+            for i, pr in enumerate(corr_prims):
+                if i < len(cor):
+                    lo = np.array(cor[i]["lo"], float); hi = np.array(cor[i]["hi"], float)
+                    pr.set_world_pose(position=0.5 * (lo + hi))
+                    pr.set_local_scale(np.maximum(hi - lo, 0.02))
+                else:
+                    pr.set_world_pose(position=np.array([0.0, 0.0, -100.0]))
+        except Exception:
+            pass
     c = clearance_all(p_d, t)
     min_clear = min(min_clear, c)
     if c < 0.0:

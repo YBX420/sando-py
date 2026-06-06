@@ -647,6 +647,21 @@ struct Parameters {
   // Soft penalty (cannot cause infeasibility); hard humans stay ALM-enforced regardless.
   double minco_sfc_radius = 0.6;       // m: tube radius (0=off)
   double minco_w_corridor = 50.0;      // corridor penalty weight (0=off)
+  // Safe-Interval SPACE-TIME corridor: per-waypoint static-free cuboids + collision-free time windows
+  // (from analytic predicted movers; oscillation-exact). Convex stay-in-box conditioner that makes the
+  // hard-ALM converge instead of stalling in dense crowds -> removes stop-and-go. Reuses minco_sfc_radius
+  // (box half-extent) and minco_w_corridor (penalty weight). Default OFF -> golden byte-identical.
+  bool   use_spacetime_corridor = false;
+  double stc_d_safe_dyn = 0.5;         // mover keep-out used for the time window
+  double stc_time_dt    = 0.1;         // window sampling cadence (s)
+  double stc_Th         = 1.5;         // window horizon (s, local time)
+  double stc_w_time     = 0.0;         // explicit-T window hinge (escape hatch, off)
+  // Space-time FRONT-END (ST-graph speed planner): time the moving gaps -> seed T0 so the drone slows to
+  // pass when the gap opens instead of braking to 0. q0 unchanged. Default OFF -> golden byte-identical.
+  bool   use_st_graph = false;
+  int    st_NS = 12;                   // stations along the guide (NT >> NS so vmax is representable)
+  int    st_NT = 48;                   // time levels in [0, Th]
+  double st_w_wait = 1.0;              // slow/wait bias
   // SAFE half: on a FAILED forward replan, actively yield (recovery.hpp) instead of freezing the
   // stale plan. Default ON (cpp-port main line); only fires when plan_minco finds no valid plan,
   // so nominal/golden behaviour is unchanged.

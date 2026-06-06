@@ -71,6 +71,7 @@ _sando_replan = _sig("sando_replan", C.c_int, C.c_void_p, C.c_double, C.c_double
 _sando_get_next_goal = _sig("sando_get_next_goal", C.c_int, C.c_void_p, _dbl)
 _sando_get_drone_status = _sig("sando_get_drone_status", C.c_int, C.c_void_p)
 _sando_get_global_path = _sig("sando_get_global_path", C.c_int, C.c_void_p, _dbl, C.c_int)
+_sando_get_corridor = _sig("sando_get_corridor", C.c_int, C.c_void_p, _dbl, C.c_int)
 
 
 def _p(arr):
@@ -136,7 +137,9 @@ _DEFAULTS = {
     "minco_human_slow_vmax": 0.0, "minco_human_slow_near": 3.0, "minco_human_slow_far": 9.0,
     "minco_sfc_radius": 0.0, "minco_w_corridor": 0.0, "recovery_enabled": True,
     "inflate_walls_by_body": False, "replan_dt": 0.0, "dynamic_speed_thresh": 0.0,
-    "pred_horizon_s": 0.0,
+    "pred_horizon_s": 0.0, "use_spacetime_corridor": False, "stc_d_safe_dyn": 0.5,
+    "stc_time_dt": 0.1, "stc_Th": 1.5, "stc_w_time": 0.0,
+    "use_st_graph": False, "st_NS": 24, "st_NT": 16, "st_w_wait": 1.0,
     "traj_lifetime": 7.0, "alpha_k_value_filtering": 0.9, "k_value_factor": 5.0,
     "alpha_filter_dyaw": 0.8, "w_max": 1.0, "w_max_yawing": 0.5, "yaw_spinning_dyaw": 1.0,
     "default_goal_z": 2.0, "hover_avoidance_d_trigger": 4.0, "hover_avoidance_h": 3.0,
@@ -257,6 +260,7 @@ class SANDO:
     def __init__(self, par: Parameters):
         self._h = _sando_create(par._handle)
         self._gp_buf = (C.c_double * (3 * 4096))()  # global-path scratch
+        self._corr_buf = (C.c_double * (9 * 64))()  # space-time corridor scratch (9 doubles/cuboid)
 
     def update_state(self, data: RobotState):
         _, pp = _p(data.pos)
@@ -300,6 +304,15 @@ class SANDO:
     def get_global_path(self):
         n = _sando_get_global_path(self._h, C.cast(self._gp_buf, _dbl), 4096)
         return [np.array([self._gp_buf[3 * i], self._gp_buf[3 * i + 1], self._gp_buf[3 * i + 2]])
+                for i in range(n)]
+
+    def get_corridor(self):
+        """Last committed space-time corridor: list of {lo,hi,t_l,t_u,seg} (empty when off)."""
+        n = _sando_get_corridor(self._h, C.cast(self._corr_buf, _dbl), 64)
+        b = self._corr_buf
+        return [{"lo": (b[9 * i], b[9 * i + 1], b[9 * i + 2]),
+                 "hi": (b[9 * i + 3], b[9 * i + 4], b[9 * i + 5]),
+                 "t_l": b[9 * i + 6], "t_u": b[9 * i + 7], "seg": int(b[9 * i + 8])}
                 for i in range(n)]
 
     def __del__(self):
