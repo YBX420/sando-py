@@ -58,6 +58,8 @@ SANDO_API void params_set_double(void* ph, const char* name, double v) {
   D(minco_human_slow_vmax); D(minco_human_slow_near); D(minco_human_slow_far);
   D(minco_sfc_radius); D(minco_w_corridor);
   D(replan_dt); D(dynamic_speed_thresh); D(pred_horizon_s);
+  D(minco_q_conformal); D(minco_epsilon_track); D(minco_v_max_human); D(minco_a_max_human);
+  D(minco_est_pos_err); D(minco_est_vel_err); D(minco_tau_trust);   // #2: worst-case reach margins
   D(stc_d_safe_dyn); D(stc_time_dt); D(stc_Th); D(stc_w_time); D(st_w_wait);
   D(w_max_yawing); D(yaw_spinning_dyaw); D(default_goal_z); D(hover_avoidance_d_trigger);
   D(hover_avoidance_h); D(hover_avoidance_min_repulsion_norm);
@@ -98,6 +100,7 @@ SANDO_API void params_set_string(void* ph, const char* name, const char* v) {
   if (k == "sim_env") p.sim_env = val;
   S(vehicle_type); S(flight_mode); S(global_planner); S(local_solver);
   S(environment_assumption); S(dynamic_constraint_type); S(avoid_override);
+  S(minco_safety_mode); S(minco_reach_model);   // #2: deterministic worst-case reach toggles
   else std::printf("[sando_capi][warn] params_set_string: unknown field '%s', skipped\n", name);
 #undef S
 }
@@ -113,104 +116,127 @@ SANDO_API void params_set_vec3(void* ph, const char* name, double x, double y, d
 // ===========================================================================
 // DynTraj — analytic obstacle handle (id + bbox + 6 expression strings).
 // ===========================================================================
+// #7: every extern "C" body that calls into C++ logic is wrapped — a std::exception unwinding across
+// the ABI boundary into ctypes/CPython is undefined behaviour (host crash). Catch -> safe default.
 SANDO_API void* traj_create(int id, double bx, double by, double bz,
                             const char* tx, const char* ty, const char* tz,
                             const char* vx, const char* vy, const char* vz) {
-  DynTraj* d = new DynTraj();
-  d->id = id;
-  d->mode = "Analytic";
-  d->bbox = Eigen::Vector3d(bx, by, bz);
-  d->traj_x = tx; d->traj_y = ty; d->traj_z = tz;
-  d->traj_vx = vx ? vx : ""; d->traj_vy = vy ? vy : ""; d->traj_vz = vz ? vz : "";
-  d->compile_analytic();
-  return d;
+  try {
+    DynTraj* d = new DynTraj();
+    d->id = id;
+    d->mode = "Analytic";
+    d->bbox = Eigen::Vector3d(bx, by, bz);
+    d->traj_x = tx; d->traj_y = ty; d->traj_z = tz;
+    d->traj_vx = vx ? vx : ""; d->traj_vy = vy ? vy : ""; d->traj_vz = vz ? vz : "";
+    d->compile_analytic();   // bad expr -> analytic_compiled=false -> eval() returns 0 (never throws)
+    return d;
+  } catch (...) { return nullptr; }
 }
 SANDO_API void traj_destroy(void* h) { delete static_cast<DynTraj*>(h); }
 SANDO_API void traj_eval(void* h, double t, double* out3) {
-  Eigen::Vector3d p = static_cast<DynTraj*>(h)->eval(t);
-  out3[0] = p[0]; out3[1] = p[1]; out3[2] = p[2];
+  try {
+    Eigen::Vector3d p = static_cast<DynTraj*>(h)->eval(t);
+    out3[0] = p[0]; out3[1] = p[1]; out3[2] = p[2];
+  } catch (...) { out3[0] = out3[1] = out3[2] = 0.0; }
 }
 
 // ===========================================================================
 // SANDO lifecycle + the Isaac-loop API surface.
 // ===========================================================================
 SANDO_API void* sando_create(void* params_h) {
-  return new SANDO(*static_cast<Parameters*>(params_h));
+  try { return new SANDO(*static_cast<Parameters*>(params_h)); }
+  catch (...) { return nullptr; }
 }
 SANDO_API void sando_destroy(void* h) { delete static_cast<SANDO*>(h); }
 
 SANDO_API void sando_update_state(void* h, const double* pos3, const double* vel3,
                                   const double* acc3, double yaw) {
-  RobotState st;
-  st.pos = Eigen::Vector3d(pos3[0], pos3[1], pos3[2]);
-  if (vel3) st.vel = Eigen::Vector3d(vel3[0], vel3[1], vel3[2]);
-  if (acc3) st.accel = Eigen::Vector3d(acc3[0], acc3[1], acc3[2]);
-  st.yaw = yaw;
-  static_cast<SANDO*>(h)->update_state(st);
+  try {
+    RobotState st;
+    st.pos = Eigen::Vector3d(pos3[0], pos3[1], pos3[2]);
+    if (vel3) st.vel = Eigen::Vector3d(vel3[0], vel3[1], vel3[2]);
+    if (acc3) st.accel = Eigen::Vector3d(acc3[0], acc3[1], acc3[2]);
+    st.yaw = yaw;
+    static_cast<SANDO*>(h)->update_state(st);
+  } catch (...) {}
 }
 
 SANDO_API void sando_update_occupancy(void* h, const double* pts, int n) {
-  std::vector<Eigen::Vector3d> cloud;
-  cloud.reserve(n);
-  for (int i = 0; i < n; ++i) cloud.emplace_back(pts[3 * i], pts[3 * i + 1], pts[3 * i + 2]);
-  static_cast<SANDO*>(h)->update_occupancy_map_ptr(cloud);
+  try {
+    std::vector<Eigen::Vector3d> cloud;
+    cloud.reserve(n);
+    for (int i = 0; i < n; ++i) cloud.emplace_back(pts[3 * i], pts[3 * i + 1], pts[3 * i + 2]);
+    static_cast<SANDO*>(h)->update_occupancy_map_ptr(cloud);
+  } catch (...) {}
 }
 
 SANDO_API void sando_set_terminal_goal(void* h, const double* pos3) {
-  RobotState G;
-  G.pos = Eigen::Vector3d(pos3[0], pos3[1], pos3[2]);
-  static_cast<SANDO*>(h)->set_terminal_goal(G);
+  try {
+    RobotState G;
+    G.pos = Eigen::Vector3d(pos3[0], pos3[1], pos3[2]);
+    static_cast<SANDO*>(h)->set_terminal_goal(G);
+  } catch (...) {}
 }
 
 SANDO_API void sando_add_traj(void* h, void* traj_h, double t) {
-  static_cast<SANDO*>(h)->add_traj(*static_cast<DynTraj*>(traj_h), t);
+  try { static_cast<SANDO*>(h)->add_traj(*static_cast<DynTraj*>(traj_h), t); }
+  catch (...) {}
 }
 
 // replan returns std::pair<bool,bool> (success, attempted); encode as bit0=success, bit1=attempted.
 SANDO_API int sando_replan(void* h, double last_rt, double t) {
-  auto r = static_cast<SANDO*>(h)->replan(last_rt, t);
-  return (r.first ? 1 : 0) | (r.second ? 2 : 0);
+  try {
+    auto r = static_cast<SANDO*>(h)->replan(last_rt, t);
+    return (r.first ? 1 : 0) | (r.second ? 2 : 0);
+  } catch (...) { return 0; }
 }
 
 // out9 = [pos(3), vel(3), accel(3)]; returns 1 if a goal is available
 SANDO_API int sando_get_next_goal(void* h, double* out9) {
-  auto ng = static_cast<SANDO*>(h)->get_next_goal();
-  if (!ng.ok) return 0;
-  for (int i = 0; i < 3; ++i) {
-    out9[i] = ng.goal.pos[i];
-    out9[3 + i] = ng.goal.vel[i];
-    out9[6 + i] = ng.goal.accel[i];
-  }
-  return 1;
+  try {
+    auto ng = static_cast<SANDO*>(h)->get_next_goal();
+    if (!ng.ok) return 0;
+    for (int i = 0; i < 3; ++i) {
+      out9[i] = ng.goal.pos[i];
+      out9[3 + i] = ng.goal.vel[i];
+      out9[6 + i] = ng.goal.accel[i];
+    }
+    return 1;
+  } catch (...) { return 0; }
 }
 
 SANDO_API int sando_get_drone_status(void* h) {
-  return static_cast<SANDO*>(h)->get_drone_status();
+  try { return static_cast<SANDO*>(h)->get_drone_status(); }
+  catch (...) { return 0; }
 }
 
 // fills out[3*N] with the global path points; returns N (clamped to max_pts).
 SANDO_API int sando_get_global_path(void* h, double* out, int max_pts) {
-  auto gp = static_cast<SANDO*>(h)->get_global_path();
-  int n = static_cast<int>(gp.size());
-  if (n > max_pts) n = max_pts;
-  for (int i = 0; i < n; ++i) {
-    out[3 * i] = gp[i][0]; out[3 * i + 1] = gp[i][1]; out[3 * i + 2] = gp[i][2];
-  }
-  return n;
+  try {
+    auto gp = static_cast<SANDO*>(h)->get_global_path();
+    int n = static_cast<int>(gp.size());
+    if (n > max_pts) n = max_pts;
+    for (int i = 0; i < n; ++i) {
+      out[3 * i] = gp[i][0]; out[3 * i + 1] = gp[i][1]; out[3 * i + 2] = gp[i][2];
+    }
+    return n;
+  } catch (...) { return 0; }
 }
 
 // fills out[9*N] with the space-time corridor: per cuboid [lo(3), hi(3), t_l_abs, t_u_abs, seg].
 // time windows are ABSOLUTIZED (last_A_time_ + t) for the viz clock. returns N (clamped to max_n).
 SANDO_API int sando_get_corridor(void* h, double* out, int max_n) {
-  const auto& cb = static_cast<SANDO*>(h)->get_corridor();
-  double At = static_cast<SANDO*>(h)->get_corridor_A_time();
-  int n = static_cast<int>(cb.size());
-  if (n > max_n) n = max_n;
-  for (int i = 0; i < n; ++i) {
-    double* o = out + 9 * i;
-    o[0] = cb[i].lo[0]; o[1] = cb[i].lo[1]; o[2] = cb[i].lo[2];
-    o[3] = cb[i].hi[0]; o[4] = cb[i].hi[1]; o[5] = cb[i].hi[2];
-    o[6] = At + cb[i].t_l; o[7] = At + cb[i].t_u; o[8] = (double)cb[i].seg;
-  }
-  return n;
+  try {
+    const auto& cb = static_cast<SANDO*>(h)->get_corridor();
+    double At = static_cast<SANDO*>(h)->get_corridor_A_time();
+    int n = static_cast<int>(cb.size());
+    if (n > max_n) n = max_n;
+    for (int i = 0; i < n; ++i) {
+      double* o = out + 9 * i;
+      o[0] = cb[i].lo[0]; o[1] = cb[i].lo[1]; o[2] = cb[i].lo[2];
+      o[3] = cb[i].hi[0]; o[4] = cb[i].hi[1]; o[5] = cb[i].hi[2];
+      o[6] = At + cb[i].t_l; o[7] = At + cb[i].t_u; o[8] = (double)cb[i].seg;
+    }
+    return n;
+  } catch (...) { return 0; }
 }

@@ -136,7 +136,10 @@ inline Eigen::VectorXd af_restore(const Eigen::Vector3d& start, const Eigen::Vec
   return q;
 }
 
-struct AFResult { Eigen::VectorXd q; std::vector<double> hist; double ms = 0; bool truncated = false; int iters = 0; };
+// #6: `feasible` is an EXPLICIT success flag. Without it a caller cannot tell a converged feasible
+// seed from one returned on a no-progress break (R.q may still violate clearance). Any production
+// use MUST gate on R.feasible — the anytime path is otherwise silent-success.
+struct AFResult { Eigen::VectorXd q; std::vector<double> hist; double ms = 0; bool truncated = false; int iters = 0; bool feasible = false; };
 
 // A: fast feasible-direction from feasible q0. deadline_ms<=0 => no deadline.
 inline AFResult af_feasible_direction(const Eigen::Vector3d& start, const Eigen::Vector3d& goal,
@@ -211,6 +214,8 @@ inline AFResult af_feasible_direction(const Eigen::Vector3d& start, const Eigen:
     if (!moved) break;
   }
   R.q = q;
+  // #6: stamp the honest feasibility of the returned seed (never assume the break left us feasible).
+  R.feasible = af_min_clr(af_make_tr(start, goal, q, T), hum) >= d_safe - 1e-9;
   R.ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
   return R;
 }
