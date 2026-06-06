@@ -88,7 +88,7 @@ _DEFAULTS = {
     # strings
     "sim_env": "gazebo", "vehicle_type": "uav", "flight_mode": "terminal_goal",
     "global_planner": "astar_heat", "local_solver": "minco",
-    "environment_assumption": "dynamic", "dynamic_constraint_type": "Linf",
+    "environment_assumption": "dynamic", "dynamic_constraint_type": "Linf", "avoid_override": "",
     # bools
     "use_global_pc": True, "provide_goal_in_global_frame": False,
     "state_already_in_global_frame": False, "use_hardware": False,
@@ -135,6 +135,7 @@ _DEFAULTS = {
     "minco_w_vel": 100.0, "minco_w_accel": 100.0,
     "minco_human_slow_vmax": 0.0, "minco_human_slow_near": 3.0, "minco_human_slow_far": 9.0,
     "minco_sfc_radius": 0.0, "minco_w_corridor": 0.0, "recovery_enabled": True,
+    "inflate_walls_by_body": False, "replan_dt": 0.0, "dynamic_speed_thresh": 0.0,
     "traj_lifetime": 7.0, "alpha_k_value_filtering": 0.9, "k_value_factor": 5.0,
     "alpha_filter_dyaw": 0.8, "w_max": 1.0, "w_max_yawing": 0.5, "yaw_spinning_dyaw": 1.0,
     "default_goal_z": 2.0, "hover_avoidance_d_trigger": 4.0, "hover_avoidance_h": 3.0,

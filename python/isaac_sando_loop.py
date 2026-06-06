@@ -72,6 +72,7 @@ for k, v in PLN.items():
         setattr(par, k, v)
     else:
         print(f"[isaac][warn] Parameters 无字段 '{k}', 跳过", flush=True)
+par.replan_dt = float(LOOP.get("replan_dt", 0.1))   # cap commit-ahead to the replan cadence (commit-lock fix)
 
 START = np.array(SCENE["start"], dtype=float)
 GOAL = np.array(SCENE["goal"], dtype=float)

@@ -34,6 +34,7 @@ def build():
         setattr(par, "minco_retime_overshoot", os.environ["RETIME"] == "1")
     if os.environ.get("FREEGOAL"):
         setattr(par, "use_free_goal", os.environ["FREEGOAL"] == "1")
+    par.replan_dt = float(LOOP.get("replan_dt", 0.0))   # let the planner cap commit-ahead to its cadence
     START = np.array(SCENE["start"], float); GOAL = np.array(SCENE["goal"], float)
     if bool(getattr(par, "force_goal_z", False)):
         GOAL[2] = float(par.default_goal_z)

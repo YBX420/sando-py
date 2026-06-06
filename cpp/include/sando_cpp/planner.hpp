@@ -603,7 +603,15 @@ class SANDO {
         // the measured/variable compute time. If a replan still overruns, the drone runs out of
         // committed plan and HOLDS (safe) rather than over-committing a stale plan into where a
         // human has moved. Breaks the compute->commit->safety coupling. Mirrors planner.py.
-        int commit_ahead = std::max(1, (int)std::ceil(par.minco_time_budget_ms / 1000.0 / par.dc));
+        // The BUDGET bounds SOLVE time; it must NOT also bound how much STALE plan we fly. If the
+        // commit-ahead exceeds the replan cadence, the executed front of the deque is frozen >1 replan
+        // deep, so fresh plans (and all local avoidance) never reach the wheels in time -> the executed
+        // path is inert to corridor/inflation/certificate. Cap commit to ~(replan_dt - dc) so each cycle
+        // we fly at most ~one replan old. replan_dt<=0 -> old budget-only behaviour (golden-identical).
+        double commit_s = par.minco_time_budget_ms / 1000.0;
+        if (par.replan_dt > 0.0)
+          commit_s = std::min(commit_s, std::max(par.dc, par.replan_dt - par.dc));
+        int commit_ahead = std::max(1, (int)std::ceil(commit_s / par.dc));
         k_value = std::max(plan_size - 1 - commit_ahead, 0);
       } else if (!use_adapt_k_value) {
         k_value = std::max(plan_size - par.default_k_value, 0);
@@ -881,9 +889,28 @@ class SANDO {
       Eigen::Vector3d sz = obbox[k];
       std::string cls = (k < oclass.size()) ? oclass[k] : std::string("human");
       if (cls == "wall") {
-        auto o = std::make_shared<AABBObstacle>(c - 0.5 * sz, c + 0.5 * sz, "wall");
-        owned.push_back(o);
-        out.push_back(o.get());
+        Eigen::Vector3d wvel = (k < ovel.size()) ? ovel[k] : Eigen::Vector3d::Zero();
+        if (par.dynamic_speed_thresh > 0.0 && wvel.norm() >= par.dynamic_speed_thresh) {
+          // DYNAMIC-AGENT: a fast mover that can hit you is not static structure. Bound the box by a
+          // sphere and route it through the EXISTING motion-aware HARD ALM sphere path (continuous-time
+          // certificate: predict(t)+dgdt+trust-mask). 0.5*maxCoeff is the inscribed-ish radius (0.4 for a
+          // 0.8 box; norm=0.69 would over-block a tunnel); the "dynamic" d_safe=0.5 supplies the margin.
+          Eigen::Vector3d acc = (k < oaccel.size()) ? oaccel[k] : Eigen::Vector3d::Zero();
+          // inscribed-ish sphere (0.5*maxCoeff=0.4 for a 0.8 box) + body. Circumscribed (0.5*norm=0.69)
+          // over-blocks the crowd -> infeasible -> holds; the "dynamic" d_safe=0.5 supplies the margin.
+          double rad = 0.5 * sz.maxCoeff() + (par.inflate_walls_by_body ? par.drone_radius : 0.0);
+          auto o = std::make_shared<SphereObstacle>(c, rad, wvel, "dynamic", acc);
+          owned.push_back(o);
+          out.push_back(o.get());
+        } else {
+          // static structure -> SOFT EGO field. body-aware: inflate by drone_radius (C-space) so d_safe
+          // is body-to-box; motion-aware AABB keeps a slow wall predicted forward over the horizon.
+          Eigen::Vector3d r = Eigen::Vector3d::Constant(
+              par.inflate_walls_by_body ? par.drone_radius : 0.0);
+          auto o = std::make_shared<AABBObstacle>(c - 0.5 * sz - r, c + 0.5 * sz + r, "wall", wvel);
+          owned.push_back(o);
+          out.push_back(o.get());
+        }
       } else {
         Eigen::Vector3d vel = (k < ovel.size()) ? ovel[k] : Eigen::Vector3d::Zero();
         Eigen::Vector3d acc = (k < oaccel.size()) ? oaccel[k] : Eigen::Vector3d::Zero();
@@ -979,6 +1006,14 @@ class SANDO {
     opt.w_accel = par.minco_w_accel; // acceleration-hinge weight: higher -> respects a_max harder
     opt.sfc_radius = par.minco_sfc_radius;   // SFC: tube radius around guide seed (0=off)
     opt.w_corridor = par.minco_w_corridor;   // SFC: corridor penalty weight (0=off)
+    // The corridor pins the local solve to the (motion-BLIND) global guide; that holds a STATIC detour
+    // seed, but it forces the path into gaps the guide picked at one instant that a MOVING obstacle has
+    // since closed. In a DYNAMIC scene (dynamic_speed_thresh>0) relax the corridor so the continuous-time
+    // certificate can deviate freely to safety (verified: at vmax=12 corridor 100 -> graze, 0 -> +0.29).
+    // Keyed on the scene MODE, not per-tick mover presence -> stable (an oscillating box dipping below
+    // the speed threshold at a turning point must not re-engage the corridor mid-flight).
+    if (par.dynamic_speed_thresh > 0.0) opt.w_corridor = 0.0;
+    opt.avoid_override = par.avoid_override;  // "" -> per-class; "soft"/"hard" force all
     // gatekeeper / anytime: hard compute deadline + deterministic topology seed (mirrors
     // planner.py). Both default OFF -> behaviour unchanged. plan_minco returns only certified-
     // feasible trajectories within the budget; an uncertified solve fails the valid gate below
@@ -1077,12 +1112,14 @@ class SANDO {
     // this gate, recovery over-triggers into a yield-loop that REGRESSES the nominal/escapable case
     // (verified by _isaac_recovery_test.py: ON 280 fails / did-not-reach vs OFF reached).
     const double horizon = 0.6, step = 0.6, mon_buffer = 0.5;
-    std::vector<const Obstacle*> humans;
-    for (size_t i = 0; i < obstacles.size(); ++i)
-      if (i >= oclass.size() || oclass[i] != "wall") humans.push_back(obstacles[i]);
+    std::vector<const Obstacle*> humans;       // movers (humans + reclassified "dynamic" boxes); use the
+    for (const Obstacle* o : obstacles)        // ACTUAL obstacle class (oclass still says "wall" for movers)
+      if (o->class_name != "wall") humans.push_back(o);
     if (humans.empty()) return false;
     double d_safe_h = 0.8;
-    { auto it = avoid_cfg.find("human"); if (it != avoid_cfg.end()) d_safe_h = it->second.d_safe; }
+    for (const char* key : {"human", "dynamic"}) {     // movers (humans AND fast "dynamic" boxes) gate the yield
+      auto it = avoid_cfg.find(key); if (it != avoid_cfg.end()) d_safe_h = std::min(d_safe_h, it->second.d_safe);
+    }
     if (reach_avoid_clearance(local_A.pos, humans, 0.0, horizon) >= d_safe_h + mon_buffer)
       return false;                                  // no human danger -> hold (do not yield)
     Eigen::Vector3d path_dir = get_G().pos - local_A.pos;

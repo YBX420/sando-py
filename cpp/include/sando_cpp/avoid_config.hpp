@@ -17,6 +17,10 @@ inline std::map<std::string, AvoidParams> default_config() {
   return {
       {"wall", AvoidParams{"wall", "soft", 0.4, 1.0e1}},
       {"human", AvoidParams{"human", "hard", 0.8, 1.0e4}},
+      // dynamic-agent: a MOVING obstacle (not static structure) -> hard continuous-time certificate,
+      // tighter d_safe than a human so a dense crowd is not inflated to infeasibility. The per-class
+      // axis is static-structure(soft) vs dynamic-agent(hard), keyed on motion (dynamic_speed_thresh).
+      {"dynamic", AvoidParams{"dynamic", "hard", 0.5, 1.0e4}},
   };
 }
 

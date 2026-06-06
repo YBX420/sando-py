@@ -485,6 +485,12 @@ struct Parameters {
   double z_min = 0.5;
   double z_max = 6.0;
   double drone_radius = 0.2;
+  // Body-aware (configuration-space) avoidance: inflate soft walls by drone_radius so the local
+  // solve avoids with the quad's BODY, not as a point. This is robot-radius C-space inflation
+  // (textbook), NOT the route-around dyn_base_inflation_m — it only restores the body the
+  // point-model dropped, so the soft d_safe is then measured body-to-box. Default false so the
+  // golden point-model oracle is unchanged; production turns it on.
+  bool inflate_walls_by_body = false;
   int hgp_timeout_duration_ms = 1000;
   int max_num_expansion = 100000;
   bool use_free_start = true;
@@ -600,6 +606,17 @@ struct Parameters {
   double max_gurobi_comp_time_sec = 1.0;
   double jerk_smooth_weight = 10.0;
   bool using_variable_elimination = true;
+
+  // ---- moving-obstacle avoidance (2026-06: compute a real margin or honestly degrade) ----
+  // replan cadence (s). >0 -> commit-ahead in find_A_and_Atime is capped to ~(replan_dt - dc) so the
+  // EXECUTED front of the deque is at most ~one replan old and fresh plans actually take effect (else
+  // the drone flies a frozen stale segment and local avoidance is inert). 0 -> old budget-only formula.
+  double replan_dt = 0.0;
+  // a "wall" whose snapshot speed >= this reclassifies to the hard, motion-aware "dynamic" class
+  // (continuous-time ALM certificate via a bounding sphere). 0 -> off (every wall stays soft/static).
+  double dynamic_speed_thresh = 0.0;
+  // per-class avoidance override: "" -> per-class; "soft"/"hard" force all (production field, not a backdoor).
+  std::string avoid_override = "";
 
   // Anytime-feasible / gatekeeper (computation-invariant safety). Default OFF -> baseline +
   // every golden byte-identical; the deterministic certificate-first stack activates only when set.
