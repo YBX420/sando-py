@@ -40,7 +40,9 @@ class MinjerkTraj {
   double t_start = 0.0, t_end = 0.0;
   Eigen::VectorXd cum;        // (M+1) cumulative segment-start times
   Eigen::MatrixXd c;          // (6M, 3) coefficients ascending in power per segment
-  Eigen::MatrixXd A_;         // dense M(T), kept for the M1 adjoint solve M^T x = rhs
+  // single LU factorization of M(T) (P M = L U): reused for the forward solve M c = b AND every
+  // adjoint solve M^T x = rhs (was 3 separate partialPivLu() of the same matrix per cost-grad).
+  Eigen::PartialPivLU<Eigen::MatrixXd> lu_;
 
   MinjerkTraj(const Eigen::MatrixXd& wp, const Eigen::VectorXd& durations,
               const Eigen::Vector3d& v0_ = Eigen::Vector3d::Zero(),
@@ -154,8 +156,8 @@ class MinjerkTraj {
     b.row(bN - 2) = vf.transpose();
     b.row(bN - 1) = af.transpose();
 
-    A_ = A;                          // keep M(T) for the adjoint M^T x = rhs
-    c = A.partialPivLu().solve(b);  // dense LU == scipy banded LU solution
+    lu_.compute(A);                 // factor M(T) ONCE; reused by forward + adjoint solves
+    c = lu_.solve(b);               // forward M c = b (byte-identical to A.partialPivLu().solve(b))
   }
 
   // searchsorted(cum, tc, side='right') - 1, clipped to [0, M-1]  (matches minco.py)
@@ -253,9 +255,14 @@ class MinjerkTraj {
     return gdT;
   }
 
-  // solve M(T)^T x = rhs  (rhs (6M,3) -> x (6M,3))
+  // solve M(T)^T x = rhs  (rhs (6M,3) -> x (6M,3)), reusing the single LU of M(T).
+  // P M = L U  =>  M = P^T L U  =>  M^T = U^T L^T P.  Solve: U^T w = rhs; L^T u = w; x = P^T u.
+  // No re-factorization: the O(n^3) LU is done once in solve(); here only O(n^2) triangular back-subs.
   Eigen::MatrixXd solve_adjoint(const Eigen::MatrixXd& rhs) const {
-    return A_.transpose().partialPivLu().solve(rhs);
+    const auto LUt = lu_.matrixLU().transpose();                       // (L,U) stored transposed
+    Eigen::MatrixXd w = LUt.triangularView<Eigen::Lower>().solve(rhs);     // U^T w = rhs
+    Eigen::MatrixXd u = LUt.triangularView<Eigen::UnitUpper>().solve(w);   // L^T u = w (L unit-diag)
+    return lu_.permutationP().transpose() * u;                            // x = P^T u
   }
 
   // (dM/dT_k) c, shape (6M,3) — only rows containing T_k are nonzero.

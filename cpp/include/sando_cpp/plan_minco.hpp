@@ -95,6 +95,7 @@ struct PlanOptParams {
   // conformal / exec-gap / deterministic reach
   double q_conformal    = 0.0;
   double epsilon_track  = 0.0;
+  bool   pass_behind    = false;
   std::string safety_mode = "conformal";
   std::string reach_model = "accel";
   double a_max_human = 0.0;
@@ -127,7 +128,7 @@ struct PlanOptParams {
     o.w_time = w_time; o.vmax = vmax; o.amax = amax; o.kappa = kappa;
     o.avoid_override = avoid_override; o.tau_trust = tau_trust;
     o.spacetime_hard = spacetime_hard; o.q_conformal = q_conformal;
-    o.epsilon_track = epsilon_track; o.safety_mode = safety_mode;
+    o.epsilon_track = epsilon_track; o.pass_behind = pass_behind; o.safety_mode = safety_mode;
     o.reach_model = reach_model; o.a_max_human = a_max_human;
     o.v_max_human = v_max_human; o.est_pos_err = est_pos_err;
     o.est_vel_err = est_vel_err;
@@ -140,7 +141,7 @@ struct PlanOptParams {
     HardAlmOptParams h;
     h.avoid_override = avoid_override; h.tau_trust = tau_trust;
     h.spacetime_hard = spacetime_hard; h.q_conformal = q_conformal;
-    h.epsilon_track = epsilon_track; h.safety_mode = safety_mode;
+    h.epsilon_track = epsilon_track; h.pass_behind = pass_behind; h.safety_mode = safety_mode;
     h.reach_model = reach_model; h.a_max_human = a_max_human;
     h.v_max_human = v_max_human; h.est_pos_err = est_pos_err;
     h.est_vel_err = est_vel_err;
@@ -898,6 +899,13 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
 
   // feasibility (all obstacles), then hard-only override.
   Feasibility feas = check_feasibility(tr, obs_eff, avoid_cfg, opt);
+  // is the drone ALREADY penetrating at t_start? If so it MUST be allowed to plan an ESCAPE: rejecting every
+  // penetrating plan when it starts inside (physics overshot the prior commit into the obstacle) traps it
+  // inside forever (permanent freeze + a mover walks into the stuck drone). Only gate a NEWLY penetrating
+  // plan (started clear, dips inside); when already inside, let the optimizer drive the penetration back out.
+  double start_clr = 1e18;
+  for (const Obstacle* o : obs_eff)
+    start_clr = std::min(start_clr, o->signed_dist(tr.eval(tr.t_start), tr.t_start));
   int K_dense = std::max(opt.K, 200);
   std::vector<const Obstacle*> safety_soft, safety_obs;  // hard set under override=None
   partition_obstacles(obs_eff, avoid_cfg, "", safety_soft, safety_obs);
@@ -913,7 +921,15 @@ inline MincoCandidate optimise_one_minco(const Eigen::MatrixXd& seed_path,
     feas.trajectory_valid = false;
     feas.failure_reason = "clearance_violation";
   } else if (feas.failure_reason == "clearance_violation") {
-    if (feas.max_v > opt.vmax * (1.0 + opt.vel_tol)) feas.failure_reason = "velocity_violation";
+    // BODY-PENETRATION FLOOR (class-agnostic, HIGHEST priority): the drone BODY inside ANY obstacle is
+    // never valid -- even a soft/unlabeled wall -- and is NEVER retimable. min_clearance<0 = center inside
+    // the body-inflated obstacle (planner.hpp:933), i.e. the real body is inside the real wall. This MUST be
+    // checked BEFORE velocity/acceleration: a plan that BOTH grazes a wall AND overshoots v_max (common once
+    // human-slow caps v_max low) would otherwise be tagged "velocity_violation" -> retimed -> committed
+    // (retime only re-verifies HARD obstacles, not soft walls) -> a real wall collision. Body-first closes
+    // that hole. The soft-graze case (0 <= d < d_safe, body still outside) stays permitted by the blank.
+    if (feas.min_clearance < 0.0 && start_clr >= 0.0) feas.failure_reason = "body_collision";
+    else if (feas.max_v > opt.vmax * (1.0 + opt.vel_tol)) feas.failure_reason = "velocity_violation";
     else if (feas.max_a > opt.amax * (1.0 + opt.accel_tol)) feas.failure_reason = "acceleration_violation";
     else feas.failure_reason = "";
     feas.trajectory_valid = feas.failure_reason.empty();

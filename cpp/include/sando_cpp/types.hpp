@@ -682,6 +682,8 @@ struct Parameters {
   //   minco_safety_mode="deterministic", minco_v_max_human + minco_est_pos_err (or accel model).
   double minco_q_conformal  = 0.0;     // conformal statistical margin Q_alpha (spheres)
   double minco_epsilon_track = 0.0;    // plan->flown execution-gap tube radius (every hard obstacle)
+  bool minco_pass_behind = false;      // crossing-human: yield to the side the human is LEAVING (not chased)
+  double minco_wall_margin = 0.0;      // extra soft-wall body inflation (physics-overshoot buffer; walls only)
   std::string minco_safety_mode = "conformal";   // "conformal" | "deterministic"
   std::string minco_reach_model = "accel";        // "accel" | "speed"
   double minco_v_max_human  = 0.0;     // deterministic 'speed' model: worst-case human speed
