@@ -26,6 +26,7 @@ def build():
            "minco_w_corridor": "WCOR", "a_max": "AMAX", "minco_w_time": "WTIME",
            "minco_w_vel": "WVEL", "minco_w_accel": "WACCEL",
            "inflation_hgp": "INFL", "dyn_base_inflation_m": "DYNINFL",
+           "minco_human_slow_vmax": "SLOW", "minco_epsilon_track": "EPS", "minco_wall_margin": "WALLM",
            "y_min": "YMIN", "y_max": "YMAX", "heat_weight": "HEATW"}
     for field, ev in _ov.items():
         if os.environ.get(ev):

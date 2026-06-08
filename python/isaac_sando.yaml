@@ -29,6 +29,20 @@ planner:
   drone_bbox: [0.3, 0.3, 0.3]
   drone_radius: 0.2
   minco_w_time: 2500.0
+  # PROBLEM 1 FIX (2026-06-07): from a stopped state the local solve overshoots v_max/a_max (max_a up to
+  # ~40 vs 16) because the w_time anchor dominates the vel/accel hinges -> the gate rejects it as a
+  # velocity/acceleration_violation -> the drone freezes and can never restart (it re-overshoots every
+  # retry). retime_overshoot dilates the committed setpoints so executed v/a respect the limits (and
+  # re-verifies the moving-hard certificate after dilation -> safe). Fixes ~2/3 of the random-scene holds.
+  minco_retime_overshoot: true
+  # plan->flown tracking-error tube radius: added to every hard-obstacle keep-out AND (new) the soft-wall
+  # inflation, so the PLAN keeps this much extra clearance and the physical drone (finite a_max -> overshoots
+  # the plan) still does not penetrate. Sized to the worst tracking overshoot under momentum.
+  minco_epsilon_track: 0.0
+  # PASS-BEHIND (crossing-human avoidance): yield to the side the human is LEAVING (opposite its lateral
+  # velocity), not the current-position side -> the drone steps out of the lane and the human walks away
+  # from it, instead of slowing/lingering in the lane and getting walked into.
+  minco_pass_behind: false
   # generous deadline ceiling: the hard-cert solve converges in ~23 ms (max ~138), so the wall-clock
   # deadline only ever fires under load and makes the result NON-deterministic (margin +0.008..+0.355,
   # rare breach). A ceiling the solve never hits -> deterministic + safe (+0.289 body @ vmax=12). The
@@ -38,7 +52,7 @@ planner:
   # crowd (the goal) instead of routing wide. 1.2 was a stall workaround for the (now-fixed) class bug.
   dyn_base_inflation_m: 0.0
   minco_use_topology: true
-  minco_human_slow_vmax: 0.0       # (Step5 motion-aware guide restores agility; gentle-slow available if needed)
+  minco_human_slow_vmax: 0.0       # OFF: in the fast sparse RGBD scene, slowing near a crosser = lingering in its lane = walked-into; staying fast threads the gap before the human arrives (fewer collisions + faster)
   minco_human_slow_near: 3.0
   minco_human_slow_far: 9.0
   goal_radius: 0.8
