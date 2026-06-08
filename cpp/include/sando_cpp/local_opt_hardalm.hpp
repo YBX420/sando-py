@@ -45,6 +45,10 @@ struct HardAlmOptParams {
   double q_conformal = 0.0;
   // execution-gap tube radius (every hard obstacle)
   double epsilon_track = 0.0;
+  // PASS-BEHIND: for a crossing human, freeze the supporting-halfspace normal on the side the human is
+  // LEAVING (opposite its horizontal velocity) instead of the current-position side -> the drone yields to
+  // the vacated lane and the human walks AWAY from it, instead of being chased / lingered-into. Default off.
+  bool pass_behind = false;
   // deterministic worst-case reachability
   std::string safety_mode = "conformal";   // "conformal" | "deterministic"
   std::string reach_model = "accel";        // "accel" | "speed"
@@ -150,6 +154,11 @@ inline std::vector<double> seg_normals(const MinjerkTraj& tr,
             c = 0.5 * (b->lo + b->hi);                      // wall centre
           }
           a = centroid[i] - c;                             // per-segment centroid normal
+        }
+        if (opt.pass_behind && sph) {                      // PASS-BEHIND override for a crossing human:
+          Eigen::Vector3d vel = sph->velocity_at(spacetime ? t_pt(i, k) : t_rep(i));
+          Eigen::Vector3d vlat(vel(0), vel(1), 0.0);       // human horizontal velocity
+          if (vlat.norm() > 0.3) a = -vlat;                // keep-out normal = the side the human is LEAVING
         }
         double nrm = a.norm();
         Eigen::Vector3d an = (nrm > 1e-12) ? (a / nrm) : fallback;
