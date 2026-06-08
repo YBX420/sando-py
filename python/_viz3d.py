@@ -95,8 +95,9 @@ def main():
 
     ani = anim.FuncAnimation(fig, upd, frames=len(frames), interval=70, blit=False)
     os.makedirs(os.path.join(ROOT, "media"), exist_ok=True)
-    ani.save(os.path.join(ROOT, "media", "_viz3d.gif"), writer=anim.PillowWriter(fps=14))
-    print("wrote media/_viz3d.gif")
+    out = os.environ.get("OUT", "_viz3d.gif")
+    ani.save(os.path.join(ROOT, "media", out), writer=anim.PillowWriter(fps=14))
+    print(f"wrote media/{out}")
 
 
 if __name__ == "__main__":

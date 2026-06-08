@@ -133,6 +133,7 @@ _DEFAULTS = {
     "obst_position_error": 0.0, "max_gurobi_comp_time_sec": 1.0, "jerk_smooth_weight": 10.0,
     "minco_time_budget_ms": 0.0, "minco_use_topology": False, "minco_w_time": 10.0,
     "minco_retime_overshoot": False,
+    "minco_epsilon_track": 0.0, "minco_pass_behind": False, "minco_wall_margin": 0.0,
     "minco_w_vel": 100.0, "minco_w_accel": 100.0,
     "minco_human_slow_vmax": 0.0, "minco_human_slow_near": 3.0, "minco_human_slow_far": 9.0,
     "minco_sfc_radius": 0.0, "minco_w_corridor": 0.0, "recovery_enabled": True,
