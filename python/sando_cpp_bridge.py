@@ -23,6 +23,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # repo layout: <repo>/python/sando_cpp_bridge.py  +  <repo>/cpp/...
 _REPO = os.path.dirname(_HERE)
 _CANDIDATES = [
+    # Linux .so first, so a committed Windows MinGW .dll is never dlopen'd on Linux
+    os.path.join(_REPO, "cpp", "capi", "sando_capi.so"),
+    os.path.join(_REPO, "cpp", "build", "sando_capi.so"),
+    os.path.join(_HERE, "sando_capi.so"),
+    # Windows MinGW DLL
     os.path.join(_HERE, "sando_capi.dll"),
     os.path.join(_REPO, "cpp", "capi", "sando_capi.dll"),
     os.path.join(_REPO, "cpp", "build", "sando_capi.dll"),

@@ -20,3 +20,6 @@ python/test/data/obsmat_*.txt
 # gif intermediate data
 python/media/_gif_*.csv
 python/media/_tunnel_W*.csv
+cpp/capi/sando_capi.so
+cpp/build/sando_capi.so
+cpp/capi/sando_capi.dll
