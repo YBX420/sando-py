@@ -59,6 +59,7 @@ SANDO_API void params_set_double(void* ph, const char* name, double v) {
   D(minco_sfc_radius); D(minco_w_corridor);
   D(replan_dt); D(dynamic_speed_thresh); D(pred_horizon_s);
   D(minco_q_conformal); D(minco_epsilon_track); D(minco_v_max_human); D(minco_a_max_human);
+  D(minco_wall_margin);
   D(minco_est_pos_err); D(minco_est_vel_err); D(minco_tau_trust);   // #2: worst-case reach margins
   D(stc_d_safe_dyn); D(stc_time_dt); D(stc_Th); D(stc_w_time); D(st_w_wait);
   D(w_max_yawing); D(yaw_spinning_dyaw); D(default_goal_z); D(hover_avoidance_d_trigger);
@@ -86,7 +87,7 @@ SANDO_API void params_set_bool(void* ph, const char* name, int v) {
   B(static_heat_exclude_dynamic); B(use_soft_cost_obstacles); B(use_dynamic_factor);
   B(inflate_unknown_boundary); B(using_variable_elimination); B(skip_initial_yawing);
   B(minco_use_topology); B(minco_retime_overshoot); B(recovery_enabled); B(inflate_walls_by_body);
-  B(use_spacetime_corridor); B(use_st_graph);
+  B(use_spacetime_corridor); B(use_st_graph); B(minco_pass_behind);
   B(force_goal_z); B(debug_verbose); B(ignore_other_trajs); B(hover_avoidance_enabled);
   B(hover_avoidance_2d);
   else std::printf("[sando_capi][warn] params_set_bool: unknown field '%s', skipped\n", name);

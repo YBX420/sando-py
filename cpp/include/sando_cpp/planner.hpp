@@ -65,6 +65,8 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
 
 namespace sando {
 
@@ -778,7 +780,10 @@ class SANDO {
     RobotState local_G_term = get_gterm();
     RobotState last_plan_state = get_last_plan_state();
 
-    if (!need_replan(local_state, local_G_term, last_plan_state)) return {false, false};
+    if (!need_replan(local_state, local_G_term, last_plan_state)) {
+      if (std::getenv("HOLDDBG")) std::fprintf(stderr, "[RP] need_replan=false (skip) Az=%.2f\n", get_A().pos(2));
+      return {false, false};
+    }
 
     // Hover avoidance branch (check_hover_avoidance) NOT ported — only reached
     // when hover_avoidance_enabled; the MINCO golden runs with it disabled.
@@ -792,6 +797,7 @@ class SANDO {
     bool ok = generate_global_path(current_time, last_replanning_computation_time,
                                    global_path);
     if (!ok) {
+      if (std::getenv("HOLDDBG")) std::fprintf(stderr, "[RP] GLOBAL-GEN fail (A out of world box?) Az=%.2f\n", get_A().pos(2));
       // #10: the global path can fail because the commit point A drifted out of the world box. Today
       // that silently stops replanning and keeps flying the stale plan (no avoidance, no yield). Try the
       // gated recovery yield (no-op unless a human is actually close) instead of freezing.
@@ -825,6 +831,7 @@ class SANDO {
 
     AAndAtime aa = find_A_and_Atime(current_time, last_replanning_computation_time);
     if (!aa.ok) {
+      if (std::getenv("HOLDDBG")) std::fprintf(stderr, "[GGP] find_A_and_Atime FAIL\n");
       replanning_failure_count += 1;
       out_global_path.clear();
       return false;
@@ -868,9 +875,24 @@ class SANDO {
     }
     if (par.vehicle_type != "uav") dir_hint(2) = 0.0;
 
+    // PERMANENT-FREEZE FIX (2026-06-07): the local solve climbs to z up to z_max (4.5) to clear walls, but
+    // the global heat-A* inflates the z-ceiling/floor by inflation_hgp -> a start at z>z_max-inflation sits
+    // INSIDE the inflated ceiling -> solve_hgp fails -> generate_global_path fails -> the drone freezes near
+    // the ceiling and can never restart (it is stuck above the global-plannable band). Clamp ONLY the global
+    // guide's start z into the plannable band [z_min+infl, z_max-infl]; the local solve keeps the real A and
+    // simply descends to follow the guide back out of the dead zone. (UAV only; ground path pins z separately.)
+    Eigen::Vector3d a_hgp = local_A.pos;
+    if (par.vehicle_type == "uav") {
+      double zlo = par.z_min + par.inflation_hgp, zhi = par.z_max - par.inflation_hgp;
+      if (zhi > zlo) a_hgp(2) = std::min(std::max(a_hgp(2), zlo), zhi);
+    }
     HGPManager::SolveResult sr =
-        hgp_manager.solve_hgp(local_A.pos, dir_hint, local_G.pos, A_time_local);
+        hgp_manager.solve_hgp(a_hgp, dir_hint, local_G.pos, A_time_local);
     if (!sr.success) {
+      if (std::getenv("HOLDDBG"))
+        std::fprintf(stderr, "[GGP] solve_hgp FAIL: A=(%.1f,%.2f,%.2f) G=(%.1f,%.2f,%.2f)\n",
+                     local_A.pos(0), local_A.pos(1), local_A.pos(2),
+                     local_G.pos(0), local_G.pos(1), local_G.pos(2));
       hgp_failure_count += 1;
       replanning_failure_count += 1;
       out_global_path.clear();
@@ -930,8 +952,12 @@ class SANDO {
         } else {
           // static structure -> SOFT EGO field. body-aware: inflate by drone_radius (C-space) so d_safe
           // is body-to-box; motion-aware AABB keeps a slow wall predicted forward over the horizon.
+          // inflate the soft wall by the BODY radius + the plan->flown tracking margin (epsilon_track), so the
+          // body-gate keeps the PLANNED body clearance >= epsilon_track and the physical drone (which overshoots
+          // the plan under finite a_max) still stays out of the real wall. Walls are soft (no ALM eps), so the
+          // margin must live in the geometry here.
           Eigen::Vector3d r = Eigen::Vector3d::Constant(
-              par.inflate_walls_by_body ? par.drone_radius : 0.0);
+              par.inflate_walls_by_body ? (par.drone_radius + par.minco_wall_margin) : 0.0);
           auto o = std::make_shared<AABBObstacle>(c - 0.5 * sz - r, c + 0.5 * sz + r, "wall", wvel);
           owned.push_back(o);
           out.push_back(o.get());
@@ -965,6 +991,8 @@ class SANDO {
       global_path = np;
     }
     if (global_path.empty() || global_path.size() < 3) {
+      if (std::getenv("HOLDDBG"))
+        std::fprintf(stderr, "[PLF] GLOBAL-GUIDE fail: path size=%zu (<3) -> hold\n", global_path.size());
       replanning_failure_count += 1;
       return false;
     }
@@ -1075,6 +1103,7 @@ class SANDO {
     // fully-trusted short-horizon prediction. tau_trust feeds BOTH the ALM window and the gate (#3).
     opt.q_conformal  = par.minco_q_conformal;
     opt.epsilon_track = par.minco_epsilon_track;
+    opt.pass_behind  = par.minco_pass_behind;
     opt.safety_mode  = par.minco_safety_mode;
     opt.reach_model  = par.minco_reach_model;
     opt.v_max_human  = par.minco_v_max_human;
@@ -1147,6 +1176,10 @@ class SANDO {
       // else: leave valid=false -> fail -> recovery (never commit an unverified retimed moving cert)
     }
     if (!mj_ptr || !valid) {
+      if (std::getenv("HOLDDBG"))
+        std::fprintf(stderr, "[PLF] LOCAL-SOLVE fail: reason=%s min_clr=%.3f max_v=%.2f max_a=%.2f (vmax=%.1f amax=%.1f)\n",
+                     info.failure_reason.c_str(), info.feasibility.min_clearance,
+                     info.feasibility.max_v, info.feasibility.max_a, par.v_max, par.a_max);
       replanning_failure_count += 1;
       return false;
     }

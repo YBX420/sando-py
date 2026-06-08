@@ -78,6 +78,7 @@ struct CostGradOptParams {
   bool   spacetime_hard = true;
   double q_conformal   = 0.0;
   double epsilon_track = 0.0;
+  bool   pass_behind   = false;
   std::string safety_mode = "conformal";
   std::string reach_model = "accel";
   double a_max_human = 0.0;
@@ -105,6 +106,7 @@ struct CostGradOptParams {
     h.spacetime_hard = spacetime_hard;
     h.q_conformal    = q_conformal;
     h.epsilon_track  = epsilon_track;
+    h.pass_behind    = pass_behind;
     h.safety_mode    = safety_mode;
     h.reach_model    = reach_model;
     h.a_max_human    = a_max_human;
