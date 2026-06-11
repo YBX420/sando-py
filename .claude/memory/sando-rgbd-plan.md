@@ -325,3 +325,13 @@ mammoth 上有同名计划 [[sando-rgbd-plan-v2]] + 更全的旧背景 memory。
 - **修复(5933b39)**:`recovery_yield` 自带**人体危险门**——只在「硬人 clearance < d_safe+0.5(0.6s horizon)」才让位,否则 return false 照常 hold(像旧行为)。修后 A/B **ON ≡ OFF(都到达、min_human +2.863、4 fails)= 回归消除**。recovery 现在是**有门控的安全网**(有逃生口时 no-op)。
 - **教训**:bench 隔离验证 ≠ 生产验证;端到端一验就抓出过度触发 + 软墙逃生口两个真相。**recovery 触发条件该是监视器(committed 计划余量),不是规划失败**——现用「当前人体 clearance 门」是其简化版,够修回归;完整版 = 每拍监视 committed 计划。
 - **未做**:还没构造「真无逃生口(开阔四面围人)」场景证明 recovery 正向有用(软墙系统里很难造)。SLIM-2(agile 抵达时刻种子+两侧比较移 C++)仍待做。
+
+## ★★ 论文 PIVOT 定向:认证语义风险安全层(2026-06-11,11-agent 评估,方案 B)
+- **决定**:主论文从「类别异质规划系统」改为「planner 无关的认证语义风险安全层」(per-detected-track、per-episode 的 P(撞人)≤ε_cls+ε_pred,ε=0.1,三感知分支);**MINCO 降为载体,side paper 严格排在 9/15 主论文投稿之后**(10-11 月写,11 月中 arXiv,12 月申请两篇在手)。C(不换)三评委一致最末。
+- **权威文档(以这两份为准,取代旧对话总结)**:`docs/safety-layer-spec.md`(修正版蓝图:诚实定理/ε 数学/代码映射/数据计划/竞争地图)+ `docs/safety-layer-plan.md`(13 周计划+3 gate+砍单+W1 清单)。原始调查档案 `docs/safety-layer-dossier.json`(110KB:ε 双盲推演+对抗复核、~20 篇对手地图、代码盘点 file:line、SDD/Isaac 核查、三评委全文)。
+- **四个关键修正(对旧对话总结)**:① per-(agent,timestep) union 确死(tube 4.6m+需 6.7万~135万条轨迹),唯一活法=per-agent max-over-horizon 时间整形分数+只对 H union(α=ε_pred/H,H≤10,9 格,每格 124~1250 条);② FN/漏检是比 ε 更深的雷(Timans 原文排除 FN)→定理必须三分支(统计 tube/确定性遮挡阴影 r_occ+v_max·t/body 底线+0.4m 延迟膨胀);③ 贡献①改名「类条件×密度 Mondrian」(泛密度偏移被 Lindemann 2602.12616 占,scene-level 崩溃半是伪现象);④ 双 planner demo 砍掉(三线独立提名唯一可砍项)。
+- **硬规矩**:ACI 不进 headline(只给 time-average);证书标定不用 SDD(视角偏移破交换性,SDD 只训预测器,标定在 Isaac 机载渲染/笼录);每 track 单评分窗;latch 在首检帧标定;摘要禁词 whole chain/每时间步/任意人群。
+- **成败手 = 预测器**(不是 conformal 机器):匀速 q95→tube 2.0m 封死走廊,学习型→0.9m 可过。W4 gate:tracker 输出 3s q95≤0.6-0.7m,否则砍 horizon 2s/H≤3。
+- **头号风险 = 被抢**:Sundarsingh 2509.25124(Kantaros/Pappas/Atanasov,静态、joint 非类条件)的动态续作是该组自然下一篇,作者群=审稿人群;窗口按 6-9 月算,9/15 必须准时+当天 arXiv+投稿前重扫 04-06 月 arXiv。
+- **代码现实**:planner 可冻结(零手术=信任窗内最大 tube 半径标量化;真 per-时间步=4 处手术 3-5 天+golden 重基线);实机 D435i 环路无动态障碍通道(bridge 不调 add_traj、DynTraj 无 class 字段、ABI 不传类别,补 ~8-12 人天否则 Isaac 扛定量);总新活 ~35-55 人天 vs ~60-65 工作日。
+- **待办第一步 = W1 Gate 0:Boyle 对弱化叙事签字**,签不下来回退 C。详见 plan 文档 W1 清单。
