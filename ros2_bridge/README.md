@@ -36,11 +36,14 @@ g++ -O2 -shared -fPIC -std=c++17 -o capi/sando_capi.so capi/sando_capi.cpp \
 ```
 (`sando_cpp_bridge.py` auto-loads `cpp/capi/sando_capi.so` on Linux, the Windows `.dll` otherwise.)
 
-## Run (assumes the `sando_ws` ROS2 workspace is built and sourced)
+## Run (assumes the `sando_ws` ROS2 workspace is built; scripts source it themselves)
 ```bash
-source /opt/ros/humble/setup.bash && source ~/code/sando_ws/install/setup.bash
 bash ros2_bridge/sando_live.sh      # live RViz + Gazebo
+bash ros2_bridge/sando_viz.sh       # headless -> /tmp/sando_flight.png
 ```
+The launchers are location-independent: they resolve the repo from their own path and
+default the workspace to `~/code/sando_ws` (override: `SANDO_WS=/path/to/ws bash ...`).
+Full laptop migration guide: `docs/UBUNTU22_PORT.md`.
 
 ## Notes / TODO (M3 — RGBD safety, not yet done)
 - `unknown_grid` is published **empty** → no true partial-observability yet
@@ -48,4 +51,4 @@ bash ros2_bridge/sando_live.sh      # live RViz + Gazebo
 - occupancy is a per-frame snapshot (no temporal accumulation).
 - `skip_initial_yawing=True` is set to go straight to TRAVELING; perception-aware
   yaw-to-look-ahead is part of the safety layer.
-- the `*.sh` launchers assume the `~/code/sando_ws` workspace paths.
+- the `*.sh` launchers default to `~/code/sando_ws`; set `SANDO_WS` to override.

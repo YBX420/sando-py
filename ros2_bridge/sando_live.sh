@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# Live RViz view of the D435i closed loop. Run in YOUR interactive WSL terminal
-# (so WSLg shows the GUI):   bash ~/code/sando_ws/sando_live.sh
+# Live RViz view of the D435i closed loop. Run in an interactive terminal
+# (WSLg or a real Ubuntu desktop shows the GUI):
+#   bash <repo>/ros2_bridge/sando_live.sh
 # Ctrl-C in this terminal stops everything.
+#
+# Paths are derived from this script's location; the sando_ws workspace
+# defaults to ~/code/sando_ws (override: SANDO_WS=/path/to/ws bash sando_live.sh).
 set -m
+BRIDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SANDO_WS="${SANDO_WS:-$HOME/code/sando_ws}"
 source /opt/ros/humble/setup.bash
-source /home/boxuan/code/sando_ws/install/setup.bash
+source "$SANDO_WS/install/setup.bash"
 export DISPLAY=${DISPLAY:-:0}
 export GAZEBO_MODEL_DATABASE_URI=
-export ROS_DOMAIN_ID=20
-export GAZEBO_MODEL_PATH="$GAZEBO_MODEL_PATH:$HOME/code/sando_ws/install/sando/share/sando/models"
-cd /home/boxuan/code/sando_ws
+export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-20}
+export GAZEBO_MODEL_PATH="$GAZEBO_MODEL_PATH:$SANDO_WS/install/sando/share/sando/models"
+cd "$SANDO_WS"
 
 cleanup() { pkill -9 gzserver gzclient rviz2 2>/dev/null; pkill -9 -f fake_sim 2>/dev/null; \
             pkill -9 -f depth_to_occupancy 2>/dev/null; pkill -9 -f sando_py_bridge 2>/dev/null; \
@@ -18,13 +24,13 @@ trap cleanup EXIT INT TERM
 cleanup; sleep 2
 
 echo ">> Gazebo server (headless) + GUI (gzclient)"
-gzserver --verbose /home/boxuan/code/sando_ws/minimal_state.world \
+gzserver --verbose "$BRIDGE_DIR/minimal_state.world" \
   -s libgazebo_ros_init.so -s libgazebo_ros_factory.so > /tmp/gz.log 2>&1 &
 sleep 7
 gzclient > /tmp/gzclient.log 2>&1 &     # 3D view of the drone + boxes (optional; close it freely)
 
 echo ">> spawn drone + TF + fake_sim"
-xacro src/sando/urdf/quadrotor.urdf.xacro namespace:=NX01 > /tmp/quad.urdf 2>/dev/null
+xacro "$SANDO_WS/src/sando/urdf/quadrotor.urdf.xacro" namespace:=NX01 > /tmp/quad.urdf 2>/dev/null
 ros2 run gazebo_ros spawn_entity.py -entity NX01 -file /tmp/quad.urdf -x 0 -y 0 -z 2.0 >/tmp/spawn.log 2>&1
 python3 - <<'PY'
 import yaml
@@ -49,8 +55,8 @@ ros2 run gazebo_ros spawn_entity.py -entity obs1 -file /tmp/box.sdf -x 6 -y -0.6
 ros2 run gazebo_ros spawn_entity.py -entity obs2 -file /tmp/box.sdf -x 10 -y 0.8 -z 1.5 >/dev/null 2>&1
 
 echo ">> mapper + your sando-py bridge"
-python3 depth_to_occupancy.py >/tmp/mapper.log 2>&1 &
-python3 sando_py_bridge.py --ros-args -r __ns:=/NX01 -p v_max:=2.0 -p a_max:=6.0 >/tmp/bridge.log 2>&1 &
+python3 "$BRIDGE_DIR/depth_to_occupancy.py" >/tmp/mapper.log 2>&1 &
+python3 "$BRIDGE_DIR/sando_py_bridge.py" --ros-args -r __ns:=/NX01 -p v_max:=2.0 -p a_max:=6.0 >/tmp/bridge.log 2>&1 &
 sleep 5
 
 echo ">> goal ping-pong (16,0,2) <-> (0,0,2) every 12s"
@@ -62,5 +68,5 @@ echo ">> goal ping-pong (16,0,2) <-> (0,0,2) every 12s"
   done ) &
 
 echo ">> RViz (close it or Ctrl-C here to stop everything)"
-RVIZ=/home/boxuan/code/sando_ws/install/sando/share/sando/rviz/sando.rviz
+RVIZ="$SANDO_WS/install/sando/share/sando/rviz/sando.rviz"
 if [ -f "$RVIZ" ]; then rviz2 -d "$RVIZ"; else rviz2; fi

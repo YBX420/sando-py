@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<!-- Minimal self-contained drone: one box body + a forward D435i-style depth camera
+     using ONLY the stock gazebo_ros camera plugin (apt: ros-humble-gazebo-plugins).
+     No realsense_gazebo_plugin, no meshes, no livox. -->
+<robot name="drone" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="namespace" default="NX01"/>
+  <xacro:property name="ns" value="$(arg namespace)"/>
+
+  <link name="base_link">
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.02"/>
+    </inertial>
+    <visual><geometry><box size="0.3 0.3 0.1"/></geometry></visual>
+    <collision><geometry><box size="0.3 0.3 0.1"/></geometry></collision>
+  </link>
+
+  <!-- camera body (forward +x) -->
+  <link name="camera_link"/>
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/><child link="camera_link"/>
+    <origin xyz="0.12 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- optical frame: z-forward, x-right, y-down -->
+  <link name="camera_optical_frame"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/><child link="camera_optical_frame"/>
+    <origin xyz="0 0 0" rpy="-1.5707963268 0 -1.5707963268"/>
+  </joint>
+
+  <!-- drone is teleported by fake_drone via /set_entity_state; turn gravity off so it holds pose -->
+  <gazebo reference="base_link"><gravity>0</gravity></gazebo>
+
+  <!-- D435i-style depth camera: 76 deg HFOV, 0.3-10 m, ~20 Hz -->
+  <gazebo reference="camera_link">
+    <sensor name="d435" type="depth">
+      <always_on>1</always_on>
+      <update_rate>20</update_rate>
+      <visualize>false</visualize>
+      <camera name="d435">
+        <horizontal_fov>1.326</horizontal_fov>
+        <image><width>320</width><height>240</height><format>R8G8B8</format></image>
+        <clip><near>0.3</near><far>10.0</far></clip>
+      </camera>
+      <plugin name="d435_driver" filename="libgazebo_ros_camera.so">
+        <ros><namespace>${ns}</namespace></ros>
+        <camera_name>d435</camera_name>
+        <frame_name>${ns}/camera_optical_frame</frame_name>
+        <min_depth>0.3</min_depth>
+        <max_depth>10.0</max_depth>
+      </plugin>
+    </sensor>
+  </gazebo>
+</robot>

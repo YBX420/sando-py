@@ -28,7 +28,7 @@ from dynus_interfaces.msg import State, Goal
 # sando-py/ros2_bridge/, so the wrapper is at ../python; fall back to a known abs path.
 import os
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.join(_HERE, '..', 'python'), '/home/boxuan/code/sando-py/python'):
+for _p in (os.path.join(_HERE, '..', 'python'), os.path.expanduser('~/code/sando-py/python')):
     if os.path.isdir(_p):
         sys.path.insert(0, _p)
         break
