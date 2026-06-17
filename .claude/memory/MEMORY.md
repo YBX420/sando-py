@@ -1,5 +1,7 @@
 > **⚠️ 2026-06-11 pivot:主论文已转向 planner 无关的认证语义风险安全层(RA-L,~9/15);per-class MINCO 降为 side paper。权威文档 = `docs/safety-layer-spec.md` + `docs/safety-layer-plan.md`(配 dossier.json + UBUNTU22_PORT.md)。下列 sando-py-*(core-idea / conformal-cert / defense-map / sim2real-fakes)与 sando-rgbd-plan 多为 pivot 前记录,framing 已过时(顶部已加横幅);其 conformal 证书数学 / C++ 测试 / 技术结论仍可查。**
 
+- [安全层施工进度](sando-core-safety-layer-progress.md) — safety 包裹进度:第一块砖 DynTraj label-set ABI 已端到端做完+验证(ctest 20/20、ROS2 9/9、5-lens review);下一波=预测器(命门)+监视器
+- [sando-core ROS2 怎么跑](sando-core-ros2-run.md) — C++ 核心在本机 Ubuntu 走 ROS2 闭环(Humble 已装);colcon setup.bash 在 /media 盘失效→手动 export;perclass_demo_cpp 无头走通判据
 - [★ 2026-06 方案 B pivot](sando-py-pivot-2026-06.md) — 主论文转 planner 无关认证语义风险安全层(RA-L ~9/15);per-class MINCO 降 side paper;权威 = docs/safety-layer-spec.md + plan.md;三铁律 + W1 Boyle 签字 gate
 - [说人话](feedback-plain-language.md) — 回答要口语清楚、用词简单,别堆术语和复杂书面句
 - [先穷举 formulation bug 再换算法](feedback-rootcause-first.md) — debug 时先穷举设计层 bug,别一上来贴"算法局部最优"标签跳 paper 方案
