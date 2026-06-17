@@ -1,5 +1,6 @@
 > **⚠️ 2026-06-11 pivot:主论文已转向 planner 无关的认证语义风险安全层(RA-L,~9/15);per-class MINCO 降为 side paper。权威文档 = `docs/safety-layer-spec.md` + `docs/safety-layer-plan.md`(配 dossier.json + UBUNTU22_PORT.md)。下列 sando-py-*(core-idea / conformal-cert / defense-map / sim2real-fakes)与 sando-rgbd-plan 多为 pivot 前记录,framing 已过时(顶部已加横幅);其 conformal 证书数学 / C++ 测试 / 技术结论仍可查。**
 
+- [★ 2026-06 方案 B pivot](sando-py-pivot-2026-06.md) — 主论文转 planner 无关认证语义风险安全层(RA-L ~9/15);per-class MINCO 降 side paper;权威 = docs/safety-layer-spec.md + plan.md;三铁律 + W1 Boyle 签字 gate
 - [说人话](feedback-plain-language.md) — 回答要口语清楚、用词简单,别堆术语和复杂书面句
 - [先穷举 formulation bug 再换算法](feedback-rootcause-first.md) — debug 时先穷举设计层 bug,别一上来贴"算法局部最优"标签跳 paper 方案
 - [要的测试风格](feedback-test-style.md) — 压力测试+真实环境+严格判据(对最优/不变量/回归),不要抽查;标准是"对/最好"不是"和 C++ 一样"
