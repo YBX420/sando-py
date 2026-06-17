@@ -7,6 +7,8 @@ metadata:
   originSessionId: 19193e4c-df5f-40d8-a717-7ec143270399
 ---
 
+> ⚠️ **2026-06-11 已 pivot —— 本文是 pivot 前 planner 论文的防御地图,framing 已过时。** 安全层主论文的竞争地图 / 写作防雷见 `docs/safety-layer-spec.md` §7、open risks 见 §8。本文里的技术结论(per-point 高速假阴性 bug ✅ 已修、relative-trajectory Bernstein 凸包修法等)仍有效。
+
 2026-06-01 两个深度 workflow(算法 novelty `ww8qldyt6` + roast 防御地图 `wqt10g6s8`)收敛结论。**总判:方法数学自洽(密采无泄漏、grad 1e-9~1e-13、三臂可分辨已验),但"自己证给自己看、没证给世界看"。要命的是 claim 吹太大 + 零 benchmark。顺序:管嘴 → 做表 → 上机。**
 
 **两存亡伤(无法话术绕,必须补实验)**:

@@ -7,6 +7,8 @@ metadata:
   originSessionId: 19193e4c-df5f-40d8-a717-7ec143270399
 ---
 
+> ⚠️ **2026-06-11 pivot 后:本文的 sup-norm score / over-interval coverage 定理是主论文的数学前身,被安全层继承** —— 但应用场景从「MINCO 优化器内部」变成 planner 无关监视器里的 **per-detected-track / per-episode** tube(spec §2)。新增的是分类侧 conformal 集合 + Mondrian 类×密度分层 + FN 三分支。读本文取数学,定位/预算/标定铁律以 `docs/safety-layer-spec.md` §2 为准。
+
 **conformal 连续时间安全证书**(核心算法 novelty 升级,2026-06-01 定理推通 + 合成验证 = 命门过了)。为什么要它见 [[sando-py-core-idea]](确定性版交集已被占 2505.11376/2404.16826 + 假装预测精确=最致命洞)。
 
 **定理(推通)**:relative 证书(bug 已修,见 [[sando-py-defense-map]])保证 ||P(s)-c_pred(s)||>=R。接预测误差 e(s)=c_true(s)-c_pred(s):三角不等式 ||P(s)-c_true||>=R-||e(s)||。conformal 从校准集 {e_j} 每条算**标量** R_j=sup_s||e_j(s)||(整段最大误差),取 (1-α) 分位 Q_α。

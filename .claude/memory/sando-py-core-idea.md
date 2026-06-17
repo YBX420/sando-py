@@ -7,6 +7,8 @@ metadata:
   originSessionId: 19193e4c-df5f-40d8-a717-7ec143270399
 ---
 
+> ⚠️ **2026-06-11 已 pivot —— 本文是 pivot 前的核心创新定位,framing 已过时。** conformal 连续时间证书的数学被 pivot 继承,但它从「在 MINCO 优化器**内部**、per-class 为主轴」**外置**成了 planner 无关的独立安全层(现用于 per-detected-track / per-episode 的监视器);per-class 机制选择不再是主 contribution。权威方向以 `docs/safety-layer-spec.md`(尤其 §1 三分支、§2 ε 数学、§3 四贡献)为准。
+
 **★ 真核心突破(里子)vs 故事包装(壳)—— 2026-06-01 workflow `wptoask76` 检验收敛(砍壳+SOTA web+红队三透镜一致,本机重跑测试确认非 vaporware)**:
 - **真突破(审稿人买账的硬通货,paper 重心要押这)**:对**会动的**障碍,在全解析可微 MINCO 优化器**内部**,给出连续时间硬安全证书——每个 Bernstein 控制点锚到**它自己墙上时刻** t_{i,k}=cum[i]+(k/5)T_i 上人的 CA 预测位置,用 supporting-halfspace + 膨胀半径 R=r+d_safe+||v||T_i+0.5||a||T_i^2 证明**整段曲线(非采样点)每个时刻**都清出预测管,**无走廊、无 MIQP、无 SDP**,ALM 端到端解析反传 (q,T),白送 λ 影子价格。
 - **gap = 五元交集空地**:连续时间 ∩ 可微 ∩ 动态 ∩ 无走廊 ∩ 每控制点锚自身时刻的凸包硬证书——各轴单独都被占(GCOPTER 软采样罚/EGO 软场/FASTER 走廊+MIQP/SOS 静态+SDP/Freire-Xu 静态B样条凸包+CBF-QP/CBF 优化器外 QP-filter),凑齐**无单篇重合**。窄而真。

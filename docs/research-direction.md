@@ -1,3 +1,6 @@
+> ⚠️ **2026-06-11 已 pivot —— 本文档为 pivot 前记录,整篇定位已过时。** 当前主论文 = **planner 无关的认证语义风险安全层**(投 RA-L,~9/15);per-class MINCO 规划器降级为 side paper(10-11 月)。权威方向以 `docs/safety-layer-spec.md` + `docs/safety-layer-plan.md` 为准。
+> 本文是 pivot 前 planner-centric 的「computation-invariant safety / anytime-feasible 证书规划器」叙事(止于 2026-06-05);其 H-signature / gatekeeper / anytime-feasible 等技术点归到 side paper,但「博士主线 / 冲 Science Robotics」的定位已被安全层主论文取代。
+
 # 研究方向:Deadline 下硬保证行人裕度的 per-class 实时规划
 
 > 2026-06 定。来自 4 个 deep-research(landscape / NN-gap / NN-vs-确定性决策 / 范式 roast),凡验证器没被限流杀掉的结论都过了 3 票对抗验证。

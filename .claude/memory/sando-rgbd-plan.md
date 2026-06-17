@@ -1,11 +1,13 @@
 ---
 name: sando-rgbd-plan
-description: "sando-rgbd 当前定版计划(2026-05-25):放弃 Gurobi/MIQP/走廊,改 B-spline+梯度的 per-class 软/硬场;按管道顺序分阶段构建+验证。取代 probe 锁定的旧设计。"
+description: "[⚠️ 2026-06-11 已 pivot:正文为 side-paper(per-class MINCO 规划器)的施工记录,『博士主线/顶会』定位过时;主论文转向 planner 无关安全层,权威见 docs/safety-layer-spec.md] sando-rgbd 当前定版计划(2026-05-25):放弃 Gurobi/MIQP/走廊,改 B-spline+梯度的 per-class 软/硬场;按管道顺序分阶段构建+验证。"
 metadata: 
   node_type: memory
   type: project
   originSessionId: 606a95c7-0a2c-44df-8c70-61a6b1f56252
 ---
+
+> ⚠️ **2026-06-11 已 pivot —— 本文正文(per-class MINCO 分阶段计划)是 side-paper 载体的施工记录,仍可查,但「博士主线 / 顶会目标」的定位已过时。** 当前主论文 = **planner 无关的认证语义风险安全层**(RA-L,~9/15)。权威以 `docs/safety-layer-spec.md` + `docs/safety-layer-plan.md` 为准。(本文件末尾若有 PIVOT 节,以末尾 + 上述 spec 为准。)
 
 # sando-rgbd 新架构 + 分阶段计划(定于 2026-05-25)
 

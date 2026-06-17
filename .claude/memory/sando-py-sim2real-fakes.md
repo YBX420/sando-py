@@ -7,6 +7,8 @@ metadata:
   originSessionId: 19193e4c-df5f-40d8-a717-7ec143270399
 ---
 
+> ⚠️ **2026-06-11 pivot 后:三大占位债被重新定位为主论文(安全层)的承重件,不再是「demo 债」。** ① class 源写死 if → 安全层的 **conformal 分类集合**(含 human→硬;真分类器 + DynTraj label ABI,spec §3.2/§5);② 匀速预测 → **学习型预测器**(W4 成败手 gate:3s q95≤0.6-0.7m,spec §2);③ EKF/tracker → 证书在 **tracker 输出**上标定(spec §2 铁律)。权威以 `docs/safety-layer-spec.md` 为准。
+
 sando-py 是 **sim2real 主线**(最终上真无人机 + 真 RGBD 感知,墙一定是任意占据体素、不可能是规整盒子)。规划内核(MINCO + per-class 人硬墙软)已验到机器精度、是真的;要还的债全在「感知 → 规划」之间那段喂数据的接口上。三大占位债(按该先修顺序,均已核代码,塔菲大人 2026-06-01 点名要记):
 
 1. **class 源写死 if**(planner.py:730-731):靠 `id∈[200,300)` 判人/墙。**per-class 整个卖点(人硬墙软)的地基就是这一行 if**;类别判错,硬约束就套到错的物体上。审稿人一眼看穿「你的分类器是个 if」。**头号,必换真分类器 / RGBD 语义标签。**
