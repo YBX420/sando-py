@@ -23,3 +23,4 @@ python/media/_tunnel_W*.csv
 cpp/capi/sando_capi.so
 cpp/build/sando_capi.so
 cpp/capi/sando_capi.dll
+python/sando_capi.dll
