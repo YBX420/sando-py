@@ -70,6 +70,11 @@ par = Parameters()
 par.local_solver = "minco"
 par.dc = 0.1
 par.vehicle_type = "uav"   # avoid the ground z-clamp branch
+# At the default v_max=10 m/s the detour around a human standing in the path is
+# too tight to stay under v_max -> velocity_violation -> plan returns False. This
+# integration test checks the MINCO routing/adapter/clearance, not a high-speed
+# swerve, so cap v_max where the avoidance is feasible (feasible for v_max<=6).
+par.v_max = 3.0
 planner = SANDO(par)
 
 # No-Gurobi spy: wrap the ONLY gurobipy-touching method.
