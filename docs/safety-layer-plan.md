@@ -36,12 +36,12 @@
 
 ## 3. W1 清单（移植完成当天起）
 
-- [ ] **Boyle 一页纸**：headline 改写前后对照 + ε=0.1 预算表 + 三分支图 + 窗口论证（2509.25124 续作风险）——拿到明确同意再写一行代码
-- [ ] 笔记本环境照 `docs/UBUNTU22_PORT.md` 走完（ctest 19/19 + 闭环 PNG 为准）
+- [x] **Boyle 一页纸**：**已签字，Gate 0 通过**
+- [x] 笔记本环境照 `docs/UBUNTU22_PORT.md` 走完（ctest **20/20** + 闭环 PNG 为准）
+- [x] DynTraj label-set ABI（C++ core + capi + bridge + ROS2 端到端，ctest 20/20，ROS2 9/9）
 - [ ] Isaac Sim 安装 + **版本钉死记录在案** + IRA 三档密度 demo（5/15/40）跑通出 GT json
-- [ ] SDD 下载 + 预处理脚本启动（lost 帧清洗、3 类合并、密度 bin 统计复核——验证 dossier 的格子估计）
-- [ ] 飞行笼审批材料提交（长周期项,先点火）
-- [ ] DynTraj label-set ABI 设计稿（types.hpp 字段 + traj_create 签名 + sando_cpp_bridge 编组）
+- [ ] SDD 下载 + 预处理脚本启动（lost 帧清洗、3 类合并、密度 bin 统计复核）
+- [ ] 飞行笼审批材料提交（长周期项，先点火）
 - [ ] arXiv alert：Lindemann / Kantaros / Atanasov / Pappas 四组
 - [ ] （可选）统计 co-author：仅当 Boyle 要求——最终数学是 union bound,不前置阻塞
 
